@@ -82,9 +82,12 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
     col6.metric("Modo procesamiento", resumen.get("modo_procesamiento", "Pendiente"))
 
     col7, col8, col9 = st.columns(3)
-    col7.metric("Resolucion", f"{resumen.get('ancho', 0)} x {resumen.get('alto', 0)}")
+    col7.metric("Resolucion procesada", f"{resumen.get('ancho', 0)} x {resumen.get('alto', 0)}")
     col8.metric("Fuente", resumen.get("fuente", "Pendiente"))
     col9.metric("Velocidad", resumen.get("velocidad_reproduccion", "Pendiente"))
+
+    col10, _, _ = st.columns(3)
+    col10.metric("Rotacion aplicada", resumen.get("rotacion", "Sin rotación"))
 
     st.info(resumen.get("mensaje_estado", "Sin estado disponible."))
     if not resumen.get("modelo_detector_disponible"):
@@ -123,6 +126,31 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
     if ruta_mejor_recorte:
         st.caption(f"Mejor recorte del evento: {ruta_mejor_recorte}")
         st.image(ruta_mejor_recorte, use_container_width=False)
+
+    st.subheader("Velocidad")
+    velocidad = resumen.get("velocidad") or {}
+    estado_velocidad = velocidad.get("estado", "esperando_linea_1")
+    etiquetas_estado = {
+        "esperando_linea_1": "Esperando linea 1",
+        "esperando_linea_2": "Esperando linea 2",
+        "velocidad_calculada": "Calculada",
+    }
+    col_vel1, col_vel2, col_vel3 = st.columns(3)
+    col_vel1.metric("Estado de velocidad", etiquetas_estado.get(estado_velocidad, estado_velocidad))
+    col_vel2.metric("Frame cruce linea 1", velocidad.get("frame_cruce_linea_1") or "Pendiente")
+    col_vel3.metric("Frame cruce linea 2", velocidad.get("frame_cruce_linea_2") or "Pendiente")
+
+    col_vel4, col_vel5, col_vel6 = st.columns(3)
+    tiempo_entre = velocidad.get("tiempo_entre_lineas")
+    velocidad_kmh = velocidad.get("velocidad_kmh")
+    col_vel4.metric("Tiempo entre lineas", f"{tiempo_entre:.3f} s" if tiempo_entre is not None else "Pendiente")
+    col_vel5.metric("Distancia configurada", f"{velocidad.get('distancia_metros', resumen.get('distancia_lineas_m', 0)):.1f} m")
+    col_vel6.metric("Velocidad estimada", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
+
+    col_vel7, col_vel8, col_vel9 = st.columns(3)
+    col_vel7.metric("Posicion Linea 1", f"{resumen.get('posicion_linea_1', 0.45):.2f}")
+    col_vel8.metric("Posicion Linea 2", f"{resumen.get('posicion_linea_2', 0.65):.2f}")
+    col_vel9.metric("Estado de cruce", etiquetas_estado.get(estado_velocidad, estado_velocidad))
 
     ultimo_recorte = resumen.get("ultimo_recorte_placa")
     if ultimo_recorte:
@@ -178,6 +206,12 @@ def pestana_monitoreo(config: dict) -> None:
                 help="0 normalmente corresponde a la camara principal. Si usa camara externa, pruebe 1 o 2.",
             )
 
+        rotacion = st.selectbox(
+            "Rotación de imagen",
+            ["Sin rotación", "Rotar 90° derecha", "Rotar 90° izquierda", "Rotar 180°"],
+            index=0,
+        )
+
         distancia_metros = st.number_input(
             "Distancia real entre lineas (m)",
             min_value=0.1,
@@ -191,6 +225,12 @@ def pestana_monitoreo(config: dict) -> None:
             value=float(config["speed"]["campus_speed_limit_kmh"]),
             step=1.0,
             key="limite_monitoreo",
+        )
+        posicion_linea_1 = st.slider("Posicion Linea 1 (% altura)", 0.05, 0.95, 0.45, 0.01)
+        posicion_linea_2 = st.slider("Posicion Linea 2 (% altura)", 0.05, 0.95, 0.65, 0.01)
+        st.caption(
+            "Ubique las lineas de forma que el centro de la placa cruce primero la Linea 1 y luego la Linea 2. "
+            "Para medir velocidad real, la camara debe estar fija y la distancia fisica entre ambas lineas debe ser conocida."
         )
         frecuencia_deteccion = st.slider(
             "Frecuencia de deteccion",
@@ -230,6 +270,7 @@ def pestana_monitoreo(config: dict) -> None:
         pausar = col_btn1.button("Pausar", use_container_width=True)
         reanudar = col_btn2.button("Reanudar", use_container_width=True)
         detener = st.button("Detener", use_container_width=True)
+        reiniciar_velocidad = st.button("Reiniciar medicion de velocidad", use_container_width=True)
 
         procesar_siguiente = False
         reiniciar_revision = False
@@ -250,6 +291,11 @@ def pestana_monitoreo(config: dict) -> None:
     if detener:
         st.session_state.monitoreo_activo = False
         st.session_state.monitoreo_pausado = False
+    if reiniciar_velocidad:
+        if st.session_state.get("estado_persistencia"):
+            st.session_state.estado_persistencia["speed_tracker"] = None
+        if st.session_state.get("ultimo_resultado"):
+            st.session_state.ultimo_resultado["velocidad"] = {}
     if reiniciar_revision:
         st.session_state.frame_actual = 0
         st.session_state.ultimo_resultado = None
@@ -264,6 +310,9 @@ def pestana_monitoreo(config: dict) -> None:
 
     if fuente_monitoreo == "Video de prueba" and not video:
         st.warning("No se pudo iniciar el monitoreo: primero carga un video.")
+        return
+    if (iniciar or procesar_siguiente) and posicion_linea_2 <= posicion_linea_1:
+        st.warning("La Línea 2 debe estar debajo de la Línea 1 para medir movimiento de arriba hacia abajo.")
         return
 
     if fuente_monitoreo == "Video de prueba" and (iniciar or procesar_siguiente) and not st.session_state.get("ruta_video_monitoreo"):
@@ -315,9 +364,12 @@ def pestana_monitoreo(config: dict) -> None:
                     st.session_state.frame_actual,
                     distancia_lineas_m=distancia_metros,
                     limite_velocidad_kmh=limite_velocidad,
+                    posicion_linea_1=posicion_linea_1,
+                    posicion_linea_2=posicion_linea_2,
                     frecuencia_deteccion=frecuencia_deteccion,
                     conf_min=conf_min,
                     persistencia_frames=persistencia_frames,
+                    rotacion=rotacion,
                     estado_persistencia=st.session_state.estado_persistencia,
                 )
                 if resultado.get("frame_rgb") is not None:
@@ -364,11 +416,14 @@ def pestana_monitoreo(config: dict) -> None:
                 st.session_state.ruta_video_monitoreo,
                 distancia_lineas_m=distancia_metros,
                 limite_velocidad_kmh=limite_velocidad,
+                posicion_linea_1=posicion_linea_1,
+                posicion_linea_2=posicion_linea_2,
                 frecuencia_deteccion=frecuencia_deteccion,
                 max_frames=max_frames,
                 velocidad_reproduccion=velocidad_reproduccion,
                 conf_min=conf_min,
                 persistencia_frames=persistencia_frames,
+                rotacion=rotacion,
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),
@@ -378,11 +433,14 @@ def pestana_monitoreo(config: dict) -> None:
                 indice_camara=int(indice_camara),
                 distancia_lineas_m=distancia_metros,
                 limite_velocidad_kmh=limite_velocidad,
+                posicion_linea_1=posicion_linea_1,
+                posicion_linea_2=posicion_linea_2,
                 frecuencia_deteccion=frecuencia_deteccion,
                 max_frames=max_frames,
                 velocidad_reproduccion=velocidad_reproduccion,
                 conf_min=conf_min,
                 persistencia_frames=persistencia_frames,
+                rotacion=rotacion,
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),

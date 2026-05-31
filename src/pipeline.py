@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 import csv
+import json
 import time
 
 import cv2
@@ -11,7 +12,7 @@ from src.notifier import enviar_notificacion_sancion
 from src.plate_detector import PlateDetector, dibujar_deteccion
 from src.plate_reader import PlateReader
 from src.report_generator import guardar_reporte
-from src.speed_estimator import calcular_velocidad_kmh, estimar_velocidad
+from src.speed_estimator import SpeedTracker, estimar_velocidad
 
 
 EXCLUIR_ZONA_SUPERIOR_PORCENTAJE = 0.20
@@ -89,11 +90,14 @@ def procesar_video_monitoreo(
     ruta_video,
     distancia_lineas_m: float = 10.0,
     limite_velocidad_kmh: float = 30.0,
+    posicion_linea_1: float = 0.45,
+    posicion_linea_2: float = 0.65,
     frecuencia_deteccion: int = 10,
     max_frames: int = 300,
     velocidad_reproduccion: str = "Rapida",
     conf_min: float = 0.30,
     persistencia_frames: int = 10,
+    rotacion: str = "Sin rotación",
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -105,11 +109,14 @@ def procesar_video_monitoreo(
         evidencia_subdir="monitoreo_video",
         distancia_lineas_m=distancia_lineas_m,
         limite_velocidad_kmh=limite_velocidad_kmh,
+        posicion_linea_1=posicion_linea_1,
+        posicion_linea_2=posicion_linea_2,
         frecuencia_deteccion=frecuencia_deteccion,
         max_frames=max_frames,
         velocidad_reproduccion=velocidad_reproduccion,
         conf_min=conf_min,
         persistencia_frames=persistencia_frames,
+        rotacion=rotacion,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
@@ -120,11 +127,14 @@ def procesar_camara_monitoreo(
     indice_camara=0,
     distancia_lineas_m: float = 10.0,
     limite_velocidad_kmh: float = 30.0,
+    posicion_linea_1: float = 0.45,
+    posicion_linea_2: float = 0.65,
     frecuencia_deteccion: int = 10,
     max_frames: int = 300,
     velocidad_reproduccion: str = "Normal",
     conf_min: float = 0.30,
     persistencia_frames: int = 10,
+    rotacion: str = "Sin rotación",
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -136,11 +146,14 @@ def procesar_camara_monitoreo(
         evidencia_subdir="monitoreo_camara",
         distancia_lineas_m=distancia_lineas_m,
         limite_velocidad_kmh=limite_velocidad_kmh,
+        posicion_linea_1=posicion_linea_1,
+        posicion_linea_2=posicion_linea_2,
         frecuencia_deteccion=frecuencia_deteccion,
         max_frames=max_frames,
         velocidad_reproduccion=velocidad_reproduccion,
         conf_min=conf_min,
         persistencia_frames=persistencia_frames,
+        rotacion=rotacion,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
@@ -152,9 +165,12 @@ def procesar_frame_video_monitoreo(
     numero_frame: int,
     distancia_lineas_m: float = 10.0,
     limite_velocidad_kmh: float = 30.0,
+    posicion_linea_1: float = 0.45,
+    posicion_linea_2: float = 0.65,
     frecuencia_deteccion: int = 10,
     conf_min: float = 0.30,
     persistencia_frames: int = 10,
+    rotacion: str = "Sin rotación",
     estado_persistencia: dict | None = None,
 ) -> dict:
     captura = cv2.VideoCapture(ruta_video)
@@ -194,6 +210,8 @@ def procesar_frame_video_monitoreo(
             "mensaje_estado": "No se pudo leer el frame solicitado.",
             "frame_rgb": None,
         }
+    frame = aplicar_rotacion(frame, rotacion)
+    alto_rotado, ancho_rotado = frame.shape[:2]
 
     evidencia_dir = Path("reports") / "evidencias" / "monitoreo_video"
     placas_dir = Path("reports") / "evidencias" / "placas_detectadas"
@@ -206,6 +224,8 @@ def procesar_frame_video_monitoreo(
         numero_frame + 1,
         distancia_lineas_m,
         limite_velocidad_kmh,
+        posicion_linea_1,
+        posicion_linea_2,
         "Video de prueba",
         frecuencia_deteccion,
         evidencia_dir,
@@ -213,6 +233,7 @@ def procesar_frame_video_monitoreo(
         estado_persistencia or _crear_estado_persistencia(),
         conf_min,
         persistencia_frames,
+        fps,
     )
     frame_rgb = cv2.cvtColor(estado_frame["frame_visual"], cv2.COLOR_BGR2RGB)
 
@@ -223,14 +244,17 @@ def procesar_frame_video_monitoreo(
         "frame_actual": numero_frame + 1,
         "frames_procesados": numero_frame + 1,
         "fps": fps,
-        "ancho": ancho,
-        "alto": alto,
+        "ancho": ancho_rotado,
+        "alto": alto_rotado,
         "total_frames": total_frames,
         "duracion_segundos": duracion,
         "segundos_procesados": _calcular_segundos_procesados(numero_frame + 1, fps),
         "modo_procesamiento": "paso a paso",
         "fuente": "Video de prueba",
+        "rotacion": rotacion,
         "distancia_lineas_m": distancia_lineas_m,
+        "posicion_linea_1": posicion_linea_1,
+        "posicion_linea_2": posicion_linea_2,
         "limite_velocidad_kmh": limite_velocidad_kmh,
         "modelo_detector_disponible": detector.model is not None,
         "mensaje_detector": estado_frame["mensaje_detector"],
@@ -246,6 +270,13 @@ def procesar_frame_video_monitoreo(
         "ultimo_recorte_placa": estado_frame["ultimo_recorte_placa"],
         "ultimo_frame_deteccion": estado_frame["ultimo_frame_deteccion"],
         "estado_persistencia": estado_frame["estado_persistencia"],
+        "velocidad": estado_frame["velocidad"],
+        "evento_activo": estado_frame["evento_activo"],
+        "evento_id": estado_frame["evento_id"],
+        "mejor_confianza_evento": estado_frame["mejor_confianza_evento"],
+        "frame_mejor_evento": estado_frame["frame_mejor_evento"],
+        "frames_sin_deteccion": estado_frame["frames_sin_deteccion"],
+        "ruta_mejor_recorte_evento": estado_frame["ruta_mejor_recorte_evento"],
     }
 
 
@@ -256,11 +287,14 @@ def _procesar_fuente_monitoreo(
     evidencia_subdir: str,
     distancia_lineas_m: float,
     limite_velocidad_kmh: float,
+    posicion_linea_1: float,
+    posicion_linea_2: float,
     frecuencia_deteccion: int,
     max_frames: int,
     velocidad_reproduccion: str,
     conf_min: float,
     persistencia_frames: int,
+    rotacion: str,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -281,6 +315,7 @@ def _procesar_fuente_monitoreo(
             "segundos_procesados": 0.0,
             "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
             "fuente": nombre_fuente,
+            "rotacion": rotacion,
             "distancia_lineas_m": distancia_lineas_m,
             "limite_velocidad_kmh": limite_velocidad_kmh,
             "primer_frame_evidencia": None,
@@ -295,6 +330,7 @@ def _procesar_fuente_monitoreo(
             "ultima_deteccion": None,
             "ultimo_recorte_placa": None,
             "ultimo_frame_deteccion": None,
+            "velocidad": _resumen_velocidad_vacio(distancia_lineas_m, 0.0),
         }
 
     fps, ancho, alto, total_frames, duracion = _leer_metadata_video(captura)
@@ -333,6 +369,8 @@ def _procesar_fuente_monitoreo(
         ok, frame = captura.read()
         if not ok:
             break
+        frame = aplicar_rotacion(frame, rotacion)
+        alto_actual, ancho_actual = frame.shape[:2]
 
         frames_procesados += 1
         estado_frame = _procesar_frame_monitoreo(
@@ -341,6 +379,8 @@ def _procesar_fuente_monitoreo(
             frames_procesados,
             distancia_lineas_m,
             limite_velocidad_kmh,
+            posicion_linea_1,
+            posicion_linea_2,
             nombre_fuente,
             frecuencia_deteccion,
             evidencia_dir,
@@ -348,6 +388,7 @@ def _procesar_fuente_monitoreo(
             estado_persistencia,
             conf_min,
             persistencia_frames,
+            fps,
         )
         frame = estado_frame["frame_visual"]
         estado_persistencia = estado_frame["estado_persistencia"]
@@ -376,6 +417,9 @@ def _procesar_fuente_monitoreo(
                 "total_frames": total_frames,
                 "fps": fps,
                 "duracion_segundos": duracion,
+                "rotacion": rotacion,
+                "ancho": ancho_actual,
+                "alto": alto_actual,
                 "segundos_procesados": _calcular_segundos_procesados(frames_procesados, fps),
                 "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
                 "modo_reproduccion": "Automatico",
@@ -395,6 +439,7 @@ def _procesar_fuente_monitoreo(
                 "frame_mejor_evento": estado_frame["frame_mejor_evento"],
                 "frames_sin_deteccion": estado_frame["frames_sin_deteccion"],
                 "ruta_mejor_recorte_evento": estado_frame["ruta_mejor_recorte_evento"],
+                "velocidad": estado_frame["velocidad"],
             }
             try:
                 frame_callback(frame_rgb, frames_procesados, estado_callback)
@@ -428,14 +473,17 @@ def _procesar_fuente_monitoreo(
         "mensaje_estado": f"Monitoreo desde {nombre_fuente.lower()} finalizado. Flujo visual listo; deteccion, OCR y velocidad real quedan para la siguiente etapa.",
         "frames_procesados": frames_procesados,
         "fps": fps,
-        "ancho": ancho,
-        "alto": alto,
+        "ancho": ultimo_frame.shape[1] if ultimo_frame is not None else ancho,
+        "alto": ultimo_frame.shape[0] if ultimo_frame is not None else alto,
         "total_frames": total_frames,
         "duracion_segundos": duracion,
         "segundos_procesados": _calcular_segundos_procesados(frames_procesados, fps),
         "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
         "fuente": nombre_fuente,
+        "rotacion": rotacion,
         "distancia_lineas_m": distancia_lineas_m,
+        "posicion_linea_1": posicion_linea_1,
+        "posicion_linea_2": posicion_linea_2,
         "limite_velocidad_kmh": limite_velocidad_kmh,
         "frecuencia_deteccion": frecuencia_deteccion,
         "primer_frame_evidencia": str(primer_frame_evidencia) if frames_procesados else None,
@@ -459,6 +507,7 @@ def _procesar_fuente_monitoreo(
         "frame_mejor_evento": estado_persistencia["frame_mejor_evento"] or frame_mejor_evento,
         "frames_sin_deteccion": estado_persistencia["frames_sin_deteccion"],
         "ruta_mejor_recorte_evento": ruta_mejor_recorte_evento,
+        "velocidad": estado_persistencia.get("speed_tracker").resumen() if estado_persistencia.get("speed_tracker") else _resumen_velocidad_vacio(distancia_lineas_m, fps),
     }
 
 
@@ -484,6 +533,7 @@ def _crear_estado_persistencia() -> dict:
         "frames_sin_deteccion": 0,
         "ruta_mejor_frame_evento": None,
         "ruta_mejor_recorte_evento": None,
+        "speed_tracker": None,
     }
 
 
@@ -520,12 +570,25 @@ def _calcular_delay_reproduccion(fps: float, velocidad_reproduccion: str) -> flo
     return delay_base * factores.get(velocidad_reproduccion, 0)
 
 
+def aplicar_rotacion(frame, rotacion: str):
+    opcion = (rotacion or "Sin rotación").strip().lower()
+    if "90" in opcion and "derecha" in opcion:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if "90" in opcion and "izquierda" in opcion:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if "180" in opcion:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    return frame
+
+
 def _procesar_frame_monitoreo(
     frame_original,
     detector: PlateDetector,
     numero_frame: int,
     distancia_lineas_m: float,
     limite_velocidad_kmh: float,
+    posicion_linea_1: float,
+    posicion_linea_2: float,
     nombre_fuente: str,
     frecuencia_deteccion: int,
     evidencia_dir: Path,
@@ -533,6 +596,7 @@ def _procesar_frame_monitoreo(
     estado_persistencia: dict,
     conf_min: float,
     persistencia_frames: int,
+    fps: float,
 ) -> dict:
     frame_limpio = frame_original.copy()
     frame_visual = frame_original.copy()
@@ -547,6 +611,14 @@ def _procesar_frame_monitoreo(
     estado_placa = "Pendiente"
 
     detecciones_validas = []
+    velocidad = _obtener_speed_tracker(
+        estado_persistencia,
+        frame_visual.shape[0],
+        distancia_lineas_m,
+        fps,
+        posicion_linea_1,
+        posicion_linea_2,
+    ).resumen()
     if frecuencia_deteccion > 0 and numero_frame % frecuencia_deteccion == 0:
         resultado_detector = detector.detectar_en_frame(frame_limpio, conf_min=conf_min)
         mensaje_detector = resultado_detector["mensaje"]
@@ -558,7 +630,7 @@ def _procesar_frame_monitoreo(
             frame_limpio.shape[0],
         )
 
-    _dibujar_marcas_monitoreo(frame_visual, distancia_lineas_m, limite_velocidad_kmh, nombre_fuente)
+    _dibujar_marcas_monitoreo(frame_visual, distancia_lineas_m, limite_velocidad_kmh, nombre_fuente, posicion_linea_1, posicion_linea_2)
 
     if detecciones_validas:
         detecciones_frame = len(detecciones_validas)
@@ -592,6 +664,9 @@ def _procesar_frame_monitoreo(
             deteccion["recorte_placa"],
             numero_frame,
         )
+        velocidad = estado_persistencia["speed_tracker"].actualizar(bbox_suavizada, numero_frame)
+        _dibujar_centro_placa(frame_visual, bbox_suavizada)
+        _guardar_evidencia_velocidad(frame_visual, velocidad)
 
         if numero_frame - estado_persistencia["ultimo_frame_recorte"] >= GUARDAR_RECORTE_CADA_N_FRAMES:
             recorte_path = placas_dir / f"placa_{numero_frame:06d}_{eventos_placa:03d}.jpg"
@@ -643,6 +718,8 @@ def _procesar_frame_monitoreo(
             if frecuencia_deteccion > 0 and numero_frame % frecuencia_deteccion == 0 and detector.model is not None:
                 mensaje_detector = "No se detecto placa valida fuera de la zona superior excluida."
 
+    _dibujar_info_velocidad(frame_visual, velocidad)
+
     return {
         "frame_visual": frame_visual,
         "mensaje_detector": mensaje_detector,
@@ -664,6 +741,7 @@ def _procesar_frame_monitoreo(
         "frame_mejor_evento": estado_persistencia["frame_mejor_evento"],
         "frames_sin_deteccion": estado_persistencia["frames_sin_deteccion"],
         "ruta_mejor_recorte_evento": estado_persistencia["ruta_mejor_recorte_evento"],
+        "velocidad": velocidad,
     }
 
 
@@ -766,6 +844,96 @@ def _dibujar_bbox_placa(frame, bbox: list[int], etiqueta: str, color: tuple[int,
     cv2.putText(frame, etiqueta, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
 
+def _obtener_speed_tracker(
+    estado: dict,
+    alto_frame: int,
+    distancia_metros: float,
+    fps: float,
+    posicion_linea_1: float,
+    posicion_linea_2: float,
+) -> SpeedTracker:
+    linea_1_y = int(alto_frame * posicion_linea_1)
+    linea_2_y = int(alto_frame * posicion_linea_2)
+    tracker = estado.get("speed_tracker")
+    if tracker is None:
+        _limpiar_evidencia_velocidad()
+        tracker = SpeedTracker(linea_1_y, linea_2_y, distancia_metros, fps)
+        estado["speed_tracker"] = tracker
+    return tracker
+
+
+def _resumen_velocidad_vacio(distancia_metros: float, fps: float) -> dict:
+    return {
+        "estado": "esperando_linea_1",
+        "frame_cruce_linea_1": None,
+        "frame_cruce_linea_2": None,
+        "tiempo_cruce_linea_1": None,
+        "tiempo_cruce_linea_2": None,
+        "tiempo_entre_lineas": None,
+        "distancia_metros": distancia_metros,
+        "fps": fps,
+        "velocidad_kmh": None,
+        "centro_x": None,
+        "centro_y": None,
+    }
+
+
+def _dibujar_centro_placa(frame, bbox: list[int]) -> None:
+    x1, y1, x2, y2 = bbox
+    centro_x = int((x1 + x2) / 2)
+    centro_y = int((y1 + y2) / 2)
+    cv2.circle(frame, (centro_x, centro_y), 5, (255, 255, 255), -1)
+    cv2.circle(frame, (centro_x, centro_y), 7, (0, 0, 0), 1)
+
+
+def _dibujar_info_velocidad(frame, velocidad: dict) -> None:
+    velocidad_kmh = velocidad.get("velocidad_kmh")
+    texto = "Velocidad: Pendiente" if velocidad_kmh is None else f"Velocidad: {velocidad_kmh:.2f} km/h"
+    cv2.putText(frame, texto, (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame, f"Estado velocidad: {velocidad.get('estado', 'pendiente')}", (20, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+
+def _guardar_evidencia_velocidad(frame, velocidad: dict) -> None:
+    velocidad_dir = Path("reports") / "evidencias" / "velocidad"
+    velocidad_dir.mkdir(parents=True, exist_ok=True)
+
+    if velocidad.get("frame_cruce_linea_1") is not None and not (velocidad_dir / "frame_cruce_linea_1.jpg").exists():
+        cv2.imwrite(str(velocidad_dir / "frame_cruce_linea_1.jpg"), frame)
+
+    if velocidad.get("frame_cruce_linea_2") is not None and not (velocidad_dir / "frame_cruce_linea_2.jpg").exists():
+        cv2.imwrite(str(velocidad_dir / "frame_cruce_linea_2.jpg"), frame)
+
+    if velocidad.get("velocidad_kmh") is not None:
+        cv2.imwrite(str(velocidad_dir / "frame_velocidad_calculada.jpg"), frame)
+        datos = {
+            "distancia_metros": velocidad.get("distancia_metros"),
+            "fps": velocidad.get("fps"),
+            "frame_linea_1": velocidad.get("frame_cruce_linea_1"),
+            "frame_linea_2": velocidad.get("frame_cruce_linea_2"),
+            "tiempo_segundos": velocidad.get("tiempo_entre_lineas"),
+            "velocidad_kmh": velocidad.get("velocidad_kmh"),
+        }
+        with open(velocidad_dir / "velocidad_evento.json", "w", encoding="utf-8") as archivo:
+            json.dump(datos, archivo, ensure_ascii=False, indent=2)
+
+
+def _limpiar_evidencia_velocidad() -> None:
+    velocidad_dir = Path("reports") / "evidencias" / "velocidad"
+    velocidad_dir.mkdir(parents=True, exist_ok=True)
+    for nombre in [
+        "frame_cruce_linea_1.jpg",
+        "frame_cruce_linea_2.jpg",
+        "frame_velocidad_calculada.jpg",
+        "velocidad_evento.json",
+    ]:
+        ruta = velocidad_dir / nombre
+        if ruta.exists():
+            try:
+                ruta.unlink()
+            except PermissionError:
+                pass
+
+
 def _guardar_debug_evento_detecciones(numero_frame: int, debug_detecciones: list[dict]) -> None:
     if not debug_detecciones:
         return
@@ -811,10 +979,12 @@ def _dibujar_marcas_monitoreo(
     distancia_lineas_m: float,
     limite_velocidad_kmh: float,
     nombre_fuente: str,
+    posicion_linea_1: float = 0.45,
+    posicion_linea_2: float = 0.65,
 ) -> None:
     alto_frame, ancho_frame = frame.shape[:2]
-    linea_1_y = int(alto_frame * 0.45)
-    linea_2_y = int(alto_frame * 0.65)
+    linea_1_y = int(alto_frame * posicion_linea_1)
+    linea_2_y = int(alto_frame * posicion_linea_2)
 
     cv2.line(frame, (0, linea_1_y), (ancho_frame, linea_1_y), (0, 255, 255), 2)
     cv2.line(frame, (0, linea_2_y), (ancho_frame, linea_2_y), (0, 80, 255), 2)
