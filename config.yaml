@@ -1,0 +1,40 @@
+models:
+  plate_detector_path: models/plate_detector/plate_detector.pt
+  character_reader_path: models/character_reader/character_reader.keras
+
+paths:
+  input_dir: data/input
+  output_dir: data/output
+  reports_dir: reports/evidencias
+
+database:
+  path: data/database/fotorradar.sqlite3
+
+speed:
+  default_distance_meters: 10.0
+  default_time_seconds: 1.5
+  campus_speed_limit_kmh: 30.0
+
+ocr:
+  default_mode: manual_controlado
+  manual_test_plate: PBC1234
+
+fuzzy:
+  seguro_hasta: 20
+  permitido_hasta: 30
+  precaucion_hasta: 35
+  exceso_leve_hasta: 40
+  exceso_medio_hasta: 50
+  suspension_horas:
+    seguro: 0
+    permitido: 0
+    precaucion: 0
+    exceso_leve: 2
+    exceso_medio: 6
+    exceso_alto: 12
+
+email:
+  simulation_mode: true
+  sender: fotorradar@example.com
+  smtp_host: smtp.example.com
+  smtp_port: 587

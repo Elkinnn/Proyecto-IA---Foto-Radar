@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+runs/
+reports/evidencias/
+models/**/*.pt
+models/**/*.keras
+datasets/**/images/
+datasets/**/labels/
+data/output/
+.env
