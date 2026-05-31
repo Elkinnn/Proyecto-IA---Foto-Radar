@@ -27,7 +27,7 @@ class PlateDetector:
             self.estado = f"error_cargando_modelo: {exc}"
             self.model = None
 
-    def detectar_en_frame(self, frame, conf: float = 0.25) -> dict:
+    def detectar_en_frame(self, frame, conf_min: float = 0.25) -> dict:
         if self.model is None:
             return {
                 "detectada": False,
@@ -36,7 +36,7 @@ class PlateDetector:
                 "mensaje": "Modelo de placa no encontrado. Entrene primero el detector.",
             }
 
-        resultados = self.model.predict(source=frame, conf=conf, verbose=False)
+        resultados = self.model.predict(source=frame, conf=conf_min, verbose=False)
         cajas = resultados[0].boxes if resultados else []
         frame_procesado = frame.copy()
         detecciones = []
@@ -44,6 +44,9 @@ class PlateDetector:
         for caja in cajas:
             x1, y1, x2, y2 = [int(valor) for valor in caja.xyxy[0].tolist()]
             confianza = float(caja.conf[0])
+            if confianza < conf_min:
+                continue
+
             alto, ancho = frame.shape[:2]
             x1 = max(0, min(x1, ancho - 1))
             x2 = max(0, min(x2, ancho - 1))

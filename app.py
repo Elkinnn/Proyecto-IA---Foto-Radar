@@ -94,9 +94,13 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
     ultima_deteccion = resumen.get("ultima_deteccion") or {}
     confianza = float(ultima_deteccion.get("confianza", 0.0))
     col_det1, col_det2, col_det3 = st.columns(3)
-    col_det1.metric("Placa detectada", "Detectada" if resumen.get("placas_detectadas", 0) else "Pendiente")
+    col_det1.metric("Estado de placa", resumen.get("estado_placa", "Pendiente"))
     col_det2.metric("Confianza", f"{confianza:.2f}" if ultima_deteccion else "Pendiente")
-    col_det3.metric("Placas detectadas", resumen.get("placas_detectadas", 0))
+    col_det3.metric("Detecciones instantaneas", resumen.get("detecciones_frame", 0))
+
+    col_det4, col_det5 = st.columns(2)
+    col_det4.metric("Eventos de placa", resumen.get("eventos_placa", resumen.get("placas_detectadas", 0)))
+    col_det5.metric("Frames desde ultima deteccion", resumen.get("frames_desde_ultima_deteccion", 0))
 
     ultimo_recorte = resumen.get("ultimo_recorte_placa")
     if ultimo_recorte:
@@ -124,6 +128,7 @@ def _inicializar_estado_monitoreo() -> None:
         "ultima_imagen_procesada": None,
         "ruta_video_monitoreo": None,
         "placas_detectadas_acumuladas": 0,
+        "estado_persistencia": None,
     }
     for clave, valor in valores_iniciales.items():
         if clave not in st.session_state:
@@ -172,6 +177,8 @@ def pestana_monitoreo(config: dict) -> None:
             10,
             help="Cada cuantos frames se ejecuta el detector YOLO de placas si el modelo ya fue entrenado.",
         )
+        conf_min = st.slider("Confianza minima de placa", 0.10, 0.90, 0.30, 0.05)
+        persistencia_frames = st.slider("Persistencia de deteccion (frames)", 0, 30, 10, 1)
         max_frames = st.number_input("Frames maximos a procesar (0 = video completo)", min_value=0, value=300, step=30)
         modo_revision = st.radio("Modo de revision", ["Automatico", "Paso a paso"])
 
@@ -219,6 +226,7 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultimo_resultado = None
         st.session_state.ultima_imagen_procesada = None
         st.session_state.placas_detectadas_acumuladas = 0
+        st.session_state.estado_persistencia = None
 
     if not iniciar and not procesar_siguiente and not st.session_state.get("ultimo_resultado"):
         with resumen_placeholder:
@@ -240,6 +248,7 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultimo_resultado = None
         st.session_state.ultima_imagen_procesada = None
         st.session_state.placas_detectadas_acumuladas = 0
+        st.session_state.estado_persistencia = None
 
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
         frame_placeholder.image(frame_rgb, channels="RGB", width=ancho_px)
@@ -252,7 +261,8 @@ def pestana_monitoreo(config: dict) -> None:
                 f"FPS {estado_frame.get('fps', 0):.2f} | "
                 f"Modo {estado_frame.get('modo_reproduccion')} | "
                 f"Velocidad {estado_frame.get('velocidad_reproduccion')} | "
-                f"Detecciones {estado_frame.get('placas_detectadas', 0)} | "
+                f"Estado placa {estado_frame.get('estado_placa', 'Pendiente')} | "
+                f"Eventos {estado_frame.get('eventos_placa', 0)} | "
                 f"Confianza {texto_confianza}"
             )
         else:
@@ -272,11 +282,13 @@ def pestana_monitoreo(config: dict) -> None:
                     distancia_lineas_m=distancia_metros,
                     limite_velocidad_kmh=limite_velocidad,
                     frecuencia_deteccion=frecuencia_deteccion,
+                    conf_min=conf_min,
+                    persistencia_frames=persistencia_frames,
+                    estado_persistencia=st.session_state.estado_persistencia,
                 )
                 if resultado.get("frame_rgb") is not None:
                     st.session_state.frame_actual = resultado.get("frame_actual", st.session_state.frame_actual + 1)
-                    st.session_state.placas_detectadas_acumuladas += resultado.get("placas_detectadas", 0)
-                    resultado["placas_detectadas"] = st.session_state.placas_detectadas_acumuladas
+                    st.session_state.estado_persistencia = resultado.get("estado_persistencia")
                     resultado["modo_reproduccion"] = "Paso a paso"
                     resultado["velocidad_reproduccion"] = "Manual"
                     st.session_state.ultimo_resultado = resultado
@@ -321,6 +333,8 @@ def pestana_monitoreo(config: dict) -> None:
                 frecuencia_deteccion=frecuencia_deteccion,
                 max_frames=max_frames,
                 velocidad_reproduccion=velocidad_reproduccion,
+                conf_min=conf_min,
+                persistencia_frames=persistencia_frames,
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
             )
@@ -332,6 +346,8 @@ def pestana_monitoreo(config: dict) -> None:
                 frecuencia_deteccion=frecuencia_deteccion,
                 max_frames=max_frames,
                 velocidad_reproduccion=velocidad_reproduccion,
+                conf_min=conf_min,
+                persistencia_frames=persistencia_frames,
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
             )

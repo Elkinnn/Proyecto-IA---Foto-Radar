@@ -14,6 +14,8 @@ from src.speed_estimator import calcular_velocidad_kmh, estimar_velocidad
 
 
 EXCLUIR_ZONA_SUPERIOR_PORCENTAJE = 0.20
+GUARDAR_RECORTE_CADA_N_FRAMES = 15
+BBOX_SUAVIZADO_ALPHA = 0.6
 
 
 def _registrar_resultado(resultado: dict, config: dict) -> dict:
@@ -89,6 +91,8 @@ def procesar_video_monitoreo(
     frecuencia_deteccion: int = 10,
     max_frames: int = 300,
     velocidad_reproduccion: str = "Rapida",
+    conf_min: float = 0.30,
+    persistencia_frames: int = 10,
     frame_callback=None,
     progreso_callback=None,
 ) -> dict:
@@ -102,6 +106,8 @@ def procesar_video_monitoreo(
         frecuencia_deteccion=frecuencia_deteccion,
         max_frames=max_frames,
         velocidad_reproduccion=velocidad_reproduccion,
+        conf_min=conf_min,
+        persistencia_frames=persistencia_frames,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
     )
@@ -114,6 +120,8 @@ def procesar_camara_monitoreo(
     frecuencia_deteccion: int = 10,
     max_frames: int = 300,
     velocidad_reproduccion: str = "Normal",
+    conf_min: float = 0.30,
+    persistencia_frames: int = 10,
     frame_callback=None,
     progreso_callback=None,
 ) -> dict:
@@ -127,6 +135,8 @@ def procesar_camara_monitoreo(
         frecuencia_deteccion=frecuencia_deteccion,
         max_frames=max_frames,
         velocidad_reproduccion=velocidad_reproduccion,
+        conf_min=conf_min,
+        persistencia_frames=persistencia_frames,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
     )
@@ -138,6 +148,9 @@ def procesar_frame_video_monitoreo(
     distancia_lineas_m: float = 10.0,
     limite_velocidad_kmh: float = 30.0,
     frecuencia_deteccion: int = 10,
+    conf_min: float = 0.30,
+    persistencia_frames: int = 10,
+    estado_persistencia: dict | None = None,
 ) -> dict:
     captura = cv2.VideoCapture(ruta_video)
     detector = PlateDetector()
@@ -190,7 +203,9 @@ def procesar_frame_video_monitoreo(
         frecuencia_deteccion,
         evidencia_dir,
         placas_dir,
-        0,
+        estado_persistencia or _crear_estado_persistencia(),
+        conf_min,
+        persistencia_frames,
     )
     frame_rgb = cv2.cvtColor(estado_frame["frame_visual"], cv2.COLOR_BGR2RGB)
 
@@ -210,10 +225,15 @@ def procesar_frame_video_monitoreo(
         "limite_velocidad_kmh": limite_velocidad_kmh,
         "modelo_detector_disponible": detector.model is not None,
         "mensaje_detector": estado_frame["mensaje_detector"],
-        "placas_detectadas": estado_frame["placas_detectadas"],
+        "estado_placa": estado_frame["estado_placa"],
+        "detecciones_frame": estado_frame["detecciones_frame"],
+        "eventos_placa": estado_frame["eventos_placa"],
+        "placas_detectadas": estado_frame["eventos_placa"],
+        "frames_desde_ultima_deteccion": estado_frame["frames_desde_ultima_deteccion"],
         "ultima_deteccion": estado_frame["ultima_deteccion"],
         "ultimo_recorte_placa": estado_frame["ultimo_recorte_placa"],
         "ultimo_frame_deteccion": estado_frame["ultimo_frame_deteccion"],
+        "estado_persistencia": estado_frame["estado_persistencia"],
     }
 
 
@@ -227,6 +247,8 @@ def _procesar_fuente_monitoreo(
     frecuencia_deteccion: int,
     max_frames: int,
     velocidad_reproduccion: str,
+    conf_min: float,
+    persistencia_frames: int,
     frame_callback=None,
     progreso_callback=None,
 ) -> dict:
@@ -250,6 +272,10 @@ def _procesar_fuente_monitoreo(
             "modelo_detector_disponible": detector.model is not None,
             "mensaje_detector": detector.estado,
             "placas_detectadas": 0,
+            "detecciones_frame": 0,
+            "eventos_placa": 0,
+            "estado_placa": "Pendiente",
+            "frames_desde_ultima_deteccion": 0,
             "ultima_deteccion": None,
             "ultimo_recorte_placa": None,
             "ultimo_frame_deteccion": None,
@@ -265,7 +291,10 @@ def _procesar_fuente_monitoreo(
     ultimo_frame_evidencia = evidencia_dir / "ultimo_frame_procesado.jpg"
     placas_dir = Path("reports") / "evidencias" / "placas_detectadas"
     placas_dir.mkdir(parents=True, exist_ok=True)
-    placas_detectadas = 0
+    estado_persistencia = _crear_estado_persistencia()
+    detecciones_frame = 0
+    eventos_placa = 0
+    estado_placa = "Pendiente"
     ultima_deteccion = None
     ultimo_recorte_placa = None
     ultimo_frame_deteccion = None
@@ -294,10 +323,15 @@ def _procesar_fuente_monitoreo(
             frecuencia_deteccion,
             evidencia_dir,
             placas_dir,
-            placas_detectadas,
+            estado_persistencia,
+            conf_min,
+            persistencia_frames,
         )
         frame = estado_frame["frame_visual"]
-        placas_detectadas = estado_frame["placas_detectadas"]
+        estado_persistencia = estado_frame["estado_persistencia"]
+        detecciones_frame = estado_frame["detecciones_frame"]
+        eventos_placa = estado_frame["eventos_placa"]
+        estado_placa = estado_frame["estado_placa"]
         mensaje_detector = estado_frame["mensaje_detector"]
         ultima_deteccion = estado_frame["ultima_deteccion"] or ultima_deteccion
         ultimo_recorte_placa = estado_frame["ultimo_recorte_placa"] or ultimo_recorte_placa
@@ -316,7 +350,11 @@ def _procesar_fuente_monitoreo(
                 "duracion_segundos": duracion,
                 "modo_reproduccion": "Automatico",
                 "velocidad_reproduccion": velocidad_reproduccion,
-                "placas_detectadas": placas_detectadas,
+                "detecciones_frame": detecciones_frame,
+                "eventos_placa": eventos_placa,
+                "placas_detectadas": eventos_placa,
+                "estado_placa": estado_placa,
+                "frames_desde_ultima_deteccion": estado_persistencia["frames_desde_ultima_deteccion"],
                 "ultima_confianza": ultima_deteccion["confianza"] if ultima_deteccion else None,
             }
             try:
@@ -356,10 +394,27 @@ def _procesar_fuente_monitoreo(
         "ultimo_frame_evidencia": str(ultimo_frame_evidencia) if frames_procesados else None,
         "modelo_detector_disponible": detector.model is not None,
         "mensaje_detector": mensaje_detector,
-        "placas_detectadas": placas_detectadas,
+        "estado_placa": estado_placa,
+        "detecciones_frame": detecciones_frame,
+        "eventos_placa": eventos_placa,
+        "placas_detectadas": eventos_placa,
+        "frames_desde_ultima_deteccion": estado_persistencia["frames_desde_ultima_deteccion"],
         "ultima_deteccion": ultima_deteccion,
         "ultimo_recorte_placa": ultimo_recorte_placa,
         "ultimo_frame_deteccion": ultimo_frame_deteccion,
+    }
+
+
+def _crear_estado_persistencia() -> dict:
+    return {
+        "ultima_bbox_valida": None,
+        "ultima_confianza_valida": None,
+        "frames_desde_ultima_deteccion": 0,
+        "ultimo_recorte_placa": None,
+        "ultimo_frame_deteccion": None,
+        "eventos_placa": 0,
+        "bbox_persistente_activa": False,
+        "ultimo_frame_recorte": -GUARDAR_RECORTE_CADA_N_FRAMES,
     }
 
 
@@ -398,7 +453,9 @@ def _procesar_frame_monitoreo(
     frecuencia_deteccion: int,
     evidencia_dir: Path,
     placas_dir: Path,
-    placas_detectadas_actuales: int,
+    estado_persistencia: dict,
+    conf_min: float,
+    persistencia_frames: int,
 ) -> dict:
     frame_limpio = frame_original.copy()
     frame_visual = frame_original.copy()
@@ -406,11 +463,13 @@ def _procesar_frame_monitoreo(
     ultima_deteccion = None
     ultimo_recorte_placa = None
     ultimo_frame_deteccion = None
-    placas_detectadas = placas_detectadas_actuales
+    detecciones_frame = 0
+    eventos_placa = estado_persistencia["eventos_placa"]
+    estado_placa = "Pendiente"
 
     detecciones_validas = []
     if frecuencia_deteccion > 0 and numero_frame % frecuencia_deteccion == 0:
-        resultado_detector = detector.detectar_en_frame(frame_limpio)
+        resultado_detector = detector.detectar_en_frame(frame_limpio, conf_min=conf_min)
         mensaje_detector = resultado_detector["mensaje"]
         detecciones_validas = _filtrar_detecciones_zona_superior(
             resultado_detector["detecciones"],
@@ -420,40 +479,102 @@ def _procesar_frame_monitoreo(
     _dibujar_marcas_monitoreo(frame_visual, distancia_lineas_m, limite_velocidad_kmh, nombre_fuente)
 
     if detecciones_validas:
+        detecciones_frame = len(detecciones_validas)
         frame_deteccion_path = placas_dir / f"frame_deteccion_{numero_frame:06d}.jpg"
+        deteccion = max(detecciones_validas, key=lambda item: item["confianza"])
+        bbox_nueva = deteccion["bbox"]
+        bbox_anterior = estado_persistencia["ultima_bbox_valida"]
+        bbox_suavizada = _suavizar_bbox(bbox_nueva, bbox_anterior)
 
-        for deteccion in detecciones_validas:
-            placas_detectadas += 1
-            x1, y1, x2, y2 = deteccion["bbox"]
-            confianza = float(deteccion["confianza"])
-            etiqueta = f"placa {confianza:.2f}"
-            cv2.rectangle(frame_visual, (x1, y1), (x2, y2), (0, 180, 0), 2)
-            cv2.putText(frame_visual, etiqueta, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 0), 2)
+        if not estado_persistencia["bbox_persistente_activa"]:
+            eventos_placa += 1
 
-            recorte_path = placas_dir / f"placa_{numero_frame:06d}_{placas_detectadas:03d}.jpg"
+        estado_persistencia["ultima_bbox_valida"] = bbox_suavizada
+        estado_persistencia["ultima_confianza_valida"] = float(deteccion["confianza"])
+        estado_persistencia["frames_desde_ultima_deteccion"] = 0
+        estado_persistencia["eventos_placa"] = eventos_placa
+        estado_persistencia["bbox_persistente_activa"] = True
+        estado_placa = "Detectada"
+
+        x1, y1, x2, y2 = bbox_suavizada
+        confianza = float(deteccion["confianza"])
+        _dibujar_bbox_placa(frame_visual, bbox_suavizada, f"placa {confianza:.2f}", (0, 180, 0))
+
+        if numero_frame - estado_persistencia["ultimo_frame_recorte"] >= GUARDAR_RECORTE_CADA_N_FRAMES:
+            recorte_path = placas_dir / f"placa_{numero_frame:06d}_{eventos_placa:03d}.jpg"
             cv2.imwrite(str(recorte_path), deteccion["recorte_placa"])
             ultimo_recorte_placa = str(recorte_path)
-            ultima_deteccion = {
-                "bbox": deteccion["bbox"],
-                "confianza": confianza,
-                "recorte_placa": str(recorte_path),
-                "frame_deteccion": str(frame_deteccion_path),
-            }
+            estado_persistencia["ultimo_recorte_placa"] = str(recorte_path)
+            estado_persistencia["ultimo_frame_recorte"] = numero_frame
+        else:
+            ultimo_recorte_placa = estado_persistencia["ultimo_recorte_placa"]
+
+        ultima_deteccion = {
+            "bbox": bbox_suavizada,
+            "confianza": confianza,
+            "recorte_placa": ultimo_recorte_placa,
+            "frame_deteccion": str(frame_deteccion_path),
+        }
 
         cv2.imwrite(str(frame_deteccion_path), frame_visual)
         ultimo_frame_deteccion = str(frame_deteccion_path)
+        estado_persistencia["ultimo_frame_deteccion"] = ultimo_frame_deteccion
         cv2.imwrite(str(evidencia_dir / "ultimo_frame_con_deteccion.jpg"), frame_visual)
-    elif frecuencia_deteccion > 0 and numero_frame % frecuencia_deteccion == 0 and detector.model is not None:
-        mensaje_detector = "No se detecto placa valida fuera de la zona superior excluida."
+    else:
+        estado_persistencia["frames_desde_ultima_deteccion"] += 1
+        if (
+            estado_persistencia["ultima_bbox_valida"] is not None
+            and estado_persistencia["frames_desde_ultima_deteccion"] <= persistencia_frames
+        ):
+            estado_placa = "Mantenida"
+            confianza = estado_persistencia["ultima_confianza_valida"] or 0.0
+            _dibujar_bbox_placa(
+                frame_visual,
+                estado_persistencia["ultima_bbox_valida"],
+                f"placa mantenida {confianza:.2f}",
+                (0, 220, 220),
+            )
+            ultima_deteccion = {
+                "bbox": estado_persistencia["ultima_bbox_valida"],
+                "confianza": confianza,
+                "recorte_placa": estado_persistencia["ultimo_recorte_placa"],
+                "frame_deteccion": estado_persistencia["ultimo_frame_deteccion"],
+            }
+            ultimo_recorte_placa = estado_persistencia["ultimo_recorte_placa"]
+            ultimo_frame_deteccion = estado_persistencia["ultimo_frame_deteccion"]
+        else:
+            estado_persistencia["bbox_persistente_activa"] = False
+            if frecuencia_deteccion > 0 and numero_frame % frecuencia_deteccion == 0 and detector.model is not None:
+                mensaje_detector = "No se detecto placa valida fuera de la zona superior excluida."
 
     return {
         "frame_visual": frame_visual,
         "mensaje_detector": mensaje_detector,
-        "placas_detectadas": placas_detectadas,
+        "estado_placa": estado_placa,
+        "detecciones_frame": detecciones_frame,
+        "eventos_placa": eventos_placa,
+        "placas_detectadas": eventos_placa,
+        "frames_desde_ultima_deteccion": estado_persistencia["frames_desde_ultima_deteccion"],
         "ultima_deteccion": ultima_deteccion,
         "ultimo_recorte_placa": ultimo_recorte_placa,
         "ultimo_frame_deteccion": ultimo_frame_deteccion,
+        "estado_persistencia": estado_persistencia,
     }
+
+
+def _suavizar_bbox(bbox_nueva: list[int], bbox_anterior: list[int] | None) -> list[int]:
+    if bbox_anterior is None:
+        return [int(valor) for valor in bbox_nueva]
+    return [
+        int(BBOX_SUAVIZADO_ALPHA * nuevo + (1 - BBOX_SUAVIZADO_ALPHA) * anterior)
+        for nuevo, anterior in zip(bbox_nueva, bbox_anterior)
+    ]
+
+
+def _dibujar_bbox_placa(frame, bbox: list[int], etiqueta: str, color: tuple[int, int, int]) -> None:
+    x1, y1, x2, y2 = bbox
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.putText(frame, etiqueta, (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
 
 def _filtrar_detecciones_zona_superior(detecciones: list[dict], alto_frame: int) -> list[dict]:
