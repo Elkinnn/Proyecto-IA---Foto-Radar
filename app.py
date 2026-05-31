@@ -73,17 +73,17 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
     st.subheader("Resumen del monitoreo")
     col1, col2, col3 = st.columns(3)
     col1.metric("FPS original", f"{resumen.get('fps', 0):.2f}")
-    col2.metric("Resolucion", f"{resumen.get('ancho', 0)} x {resumen.get('alto', 0)}")
-    col3.metric("Frame actual", f"{resumen.get('frames_procesados', 0)} / {resumen.get('total_frames', 0)}")
+    col2.metric("Frames totales", resumen.get("total_frames", 0) or "No disponible")
+    col3.metric("Duracion total", f"{resumen.get('duracion_segundos', 0):.1f} s")
 
     col4, col5, col6 = st.columns(3)
-    col4.metric("Distancia entre lineas", f"{resumen.get('distancia_lineas_m', 0):.1f} m")
-    col5.metric("Limite de velocidad", f"{resumen.get('limite_velocidad_kmh', 0):.1f} km/h")
-    col6.metric("Fuente", resumen.get("fuente", "Pendiente"))
+    col4.metric("Frames procesados", resumen.get("frames_procesados", 0))
+    col5.metric("Segundos procesados", f"{resumen.get('segundos_procesados', 0):.1f} s")
+    col6.metric("Modo procesamiento", resumen.get("modo_procesamiento", "Pendiente"))
 
     col7, col8, col9 = st.columns(3)
-    col7.metric("Duracion aprox.", f"{resumen.get('duracion_segundos', 0):.1f} s")
-    col8.metric("Modo", resumen.get("modo_reproduccion", "Automatico"))
+    col7.metric("Resolucion", f"{resumen.get('ancho', 0)} x {resumen.get('alto', 0)}")
+    col8.metric("Fuente", resumen.get("fuente", "Pendiente"))
     col9.metric("Velocidad", resumen.get("velocidad_reproduccion", "Pendiente"))
 
     st.info(resumen.get("mensaje_estado", "Sin estado disponible."))
@@ -179,7 +179,14 @@ def pestana_monitoreo(config: dict) -> None:
         )
         conf_min = st.slider("Confianza minima de placa", 0.10, 0.90, 0.30, 0.05)
         persistencia_frames = st.slider("Persistencia de deteccion (frames)", 0, 30, 10, 1)
-        max_frames = st.number_input("Frames maximos a procesar (0 = video completo)", min_value=0, value=300, step=30)
+        max_frames = st.number_input(
+            "Frames maximos a procesar (0 = video completo)",
+            min_value=0,
+            max_value=10000,
+            value=0,
+            step=100,
+            help="Use 0 para procesar el video completo. Si desea limitar la prueba, use valores como 900 para 30 segundos a 30 FPS.",
+        )
         modo_revision = st.radio("Modo de revision", ["Automatico", "Paso a paso"])
 
         opciones_velocidad = ["Normal (1x)", "Rapida (sin espera)"] if fuente_monitoreo == "Camara en vivo" else [
@@ -249,6 +256,11 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultima_imagen_procesada = None
         st.session_state.placas_detectadas_acumuladas = 0
         st.session_state.estado_persistencia = None
+    elif iniciar:
+        st.session_state.monitoreo_activo = True
+        st.session_state.monitoreo_pausado = False
+        st.session_state.ultimo_resultado = None
+        st.session_state.ultima_imagen_procesada = None
 
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
         frame_placeholder.image(frame_rgb, channels="RGB", width=ancho_px)
@@ -337,6 +349,7 @@ def pestana_monitoreo(config: dict) -> None:
                 persistencia_frames=persistencia_frames,
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
+                detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),
             )
         else:
             resumen = procesar_camara_monitoreo(
@@ -350,6 +363,7 @@ def pestana_monitoreo(config: dict) -> None:
                 persistencia_frames=persistencia_frames,
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
+                detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),
             )
 
     if resumen.get("estado") == "error":

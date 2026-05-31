@@ -95,6 +95,7 @@ def procesar_video_monitoreo(
     persistencia_frames: int = 10,
     frame_callback=None,
     progreso_callback=None,
+    detener_callback=None,
 ) -> dict:
     return _procesar_fuente_monitoreo(
         fuente=ruta_video,
@@ -110,6 +111,7 @@ def procesar_video_monitoreo(
         persistencia_frames=persistencia_frames,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
+        detener_callback=detener_callback,
     )
 
 
@@ -124,6 +126,7 @@ def procesar_camara_monitoreo(
     persistencia_frames: int = 10,
     frame_callback=None,
     progreso_callback=None,
+    detener_callback=None,
 ) -> dict:
     return _procesar_fuente_monitoreo(
         fuente=int(indice_camara),
@@ -139,6 +142,7 @@ def procesar_camara_monitoreo(
         persistencia_frames=persistencia_frames,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
+        detener_callback=detener_callback,
     )
 
 
@@ -175,6 +179,8 @@ def procesar_frame_video_monitoreo(
             "ancho": ancho,
             "alto": alto,
             "duracion_segundos": duracion,
+            "segundos_procesados": _calcular_segundos_procesados(total_frames, fps),
+            "modo_procesamiento": "video completo",
         }
 
     captura.set(cv2.CAP_PROP_POS_FRAMES, max(numero_frame, 0))
@@ -220,6 +226,8 @@ def procesar_frame_video_monitoreo(
         "alto": alto,
         "total_frames": total_frames,
         "duracion_segundos": duracion,
+        "segundos_procesados": _calcular_segundos_procesados(numero_frame + 1, fps),
+        "modo_procesamiento": "paso a paso",
         "fuente": "Video de prueba",
         "distancia_lineas_m": distancia_lineas_m,
         "limite_velocidad_kmh": limite_velocidad_kmh,
@@ -251,6 +259,7 @@ def _procesar_fuente_monitoreo(
     persistencia_frames: int,
     frame_callback=None,
     progreso_callback=None,
+    detener_callback=None,
 ) -> dict:
     captura = cv2.VideoCapture(fuente)
     detector = PlateDetector()
@@ -264,6 +273,9 @@ def _procesar_fuente_monitoreo(
             "ancho": 0,
             "alto": 0,
             "total_frames": 0,
+            "duracion_segundos": 0.0,
+            "segundos_procesados": 0.0,
+            "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
             "fuente": nombre_fuente,
             "distancia_lineas_m": distancia_lineas_m,
             "limite_velocidad_kmh": limite_velocidad_kmh,
@@ -300,14 +312,14 @@ def _procesar_fuente_monitoreo(
     ultimo_frame_deteccion = None
     mensaje_detector = detector.estado
 
-    if max_frames == 0 and total_frames == 0:
-        max_frames = 300
-
     objetivo_frames = max_frames if max_frames > 0 else total_frames
     if total_frames > 0 and max_frames > 0:
         objetivo_frames = min(max_frames, total_frames)
 
     while captura.isOpened():
+        if detener_callback and detener_callback():
+            break
+
         ok, frame = captura.read()
         if not ok:
             break
@@ -348,6 +360,8 @@ def _procesar_fuente_monitoreo(
                 "total_frames": total_frames,
                 "fps": fps,
                 "duracion_segundos": duracion,
+                "segundos_procesados": _calcular_segundos_procesados(frames_procesados, fps),
+                "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
                 "modo_reproduccion": "Automatico",
                 "velocidad_reproduccion": velocidad_reproduccion,
                 "detecciones_frame": detecciones_frame,
@@ -363,7 +377,10 @@ def _procesar_fuente_monitoreo(
                 frame_callback(frame_rgb, frames_procesados)
 
         if progreso_callback:
-            progreso_callback(min(frames_procesados / max(objetivo_frames, 1), 1.0))
+            if objetivo_frames and objetivo_frames > 0:
+                progreso_callback(min(frames_procesados / objetivo_frames, 1.0))
+            else:
+                progreso_callback(0.0)
 
         delay = _calcular_delay_reproduccion(fps, velocidad_reproduccion)
         if delay > 0:
@@ -386,6 +403,8 @@ def _procesar_fuente_monitoreo(
         "alto": alto,
         "total_frames": total_frames,
         "duracion_segundos": duracion,
+        "segundos_procesados": _calcular_segundos_procesados(frames_procesados, fps),
+        "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
         "fuente": nombre_fuente,
         "distancia_lineas_m": distancia_lineas_m,
         "limite_velocidad_kmh": limite_velocidad_kmh,
@@ -425,6 +444,14 @@ def _leer_metadata_video(captura) -> tuple[float, int, int, int, float]:
     total_frames = int(captura.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duracion = total_frames / fps if fps > 0 and total_frames > 0 else 0.0
     return fps, ancho, alto, total_frames, duracion
+
+
+def _calcular_segundos_procesados(frames_procesados: int, fps: float) -> float:
+    return frames_procesados / fps if fps > 0 else 0.0
+
+
+def _obtener_modo_procesamiento(max_frames: int) -> str:
+    return "video completo" if max_frames == 0 else "limitado por max_frames"
 
 
 def _calcular_delay_reproduccion(fps: float, velocidad_reproduccion: str) -> float:
