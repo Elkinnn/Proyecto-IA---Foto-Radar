@@ -4,7 +4,12 @@ import pandas as pd
 import streamlit as st
 
 from src.database import inicializar_bd, listar_eventos, listar_vehiculos
-from src.pipeline import procesar_imagen_prueba, procesar_video_monitoreo
+from src.pipeline import (
+    procesar_camara_monitoreo,
+    procesar_frame_video_monitoreo,
+    procesar_imagen_prueba,
+    procesar_video_monitoreo,
+)
 from src.utils import cargar_config, guardar_archivo_subido
 
 
@@ -23,7 +28,7 @@ def panel_resultados(evento: dict | None) -> None:
         col1.metric("Placa detectada", "Pendiente")
         col2.metric("Velocidad", "Pendiente")
         col3.metric("Estado", "Sin evento")
-        st.info("El sistema mostrara eventos cuando exista deteccion, OCR y cruce entre lineas virtuales.")
+        st.info("La deteccion de placa, OCR, velocidad real y sanciones se integraran despues del flujo de video.")
         return
 
     vehiculo = evento.get("vehiculo") or {}
@@ -64,19 +69,87 @@ def mostrar_resultado_prueba(resultado: dict) -> None:
         panel_resultados(resultado)
 
 
-def pestaña_monitoreo(config: dict) -> None:
-    st.header("Monitoreo por video/camara")
+def mostrar_resumen_monitoreo(resumen: dict) -> None:
+    st.subheader("Resumen del monitoreo")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("FPS original", f"{resumen.get('fps', 0):.2f}")
+    col2.metric("Resolucion", f"{resumen.get('ancho', 0)} x {resumen.get('alto', 0)}")
+    col3.metric("Frame actual", f"{resumen.get('frames_procesados', 0)} / {resumen.get('total_frames', 0)}")
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Distancia entre lineas", f"{resumen.get('distancia_lineas_m', 0):.1f} m")
+    col5.metric("Limite de velocidad", f"{resumen.get('limite_velocidad_kmh', 0):.1f} km/h")
+    col6.metric("Fuente", resumen.get("fuente", "Pendiente"))
+
+    col7, col8, col9 = st.columns(3)
+    col7.metric("Duracion aprox.", f"{resumen.get('duracion_segundos', 0):.1f} s")
+    col8.metric("Modo", resumen.get("modo_reproduccion", "Automatico"))
+    col9.metric("Velocidad", resumen.get("velocidad_reproduccion", "Pendiente"))
+
+    st.info(resumen.get("mensaje_estado", "Sin estado disponible."))
+    if not resumen.get("modelo_detector_disponible"):
+        st.warning(resumen.get("mensaje_detector", "Modelo de placa no encontrado. Entrene primero el detector."))
+
+    st.subheader("Deteccion de placas")
+    ultima_deteccion = resumen.get("ultima_deteccion") or {}
+    confianza = float(ultima_deteccion.get("confianza", 0.0))
+    col_det1, col_det2, col_det3 = st.columns(3)
+    col_det1.metric("Placa detectada", "Detectada" if resumen.get("placas_detectadas", 0) else "Pendiente")
+    col_det2.metric("Confianza", f"{confianza:.2f}" if ultima_deteccion else "Pendiente")
+    col_det3.metric("Placas detectadas", resumen.get("placas_detectadas", 0))
+
+    ultimo_recorte = resumen.get("ultimo_recorte_placa")
+    if ultimo_recorte:
+        st.caption(f"Ultimo recorte de placa: {ultimo_recorte}")
+        st.image(ultimo_recorte, use_container_width=False)
+
+    primer_frame = resumen.get("primer_frame_evidencia")
+    ultimo_frame = resumen.get("ultimo_frame_evidencia")
+    if primer_frame or ultimo_frame:
+        ev1, ev2 = st.columns(2)
+        if primer_frame:
+            ev1.caption(f"Primer frame: {primer_frame}")
+            ev1.image(primer_frame, use_container_width=True)
+        if ultimo_frame:
+            ev2.caption(f"Ultimo frame: {ultimo_frame}")
+            ev2.image(ultimo_frame, use_container_width=True)
+
+
+def _inicializar_estado_monitoreo() -> None:
+    valores_iniciales = {
+        "monitoreo_activo": False,
+        "monitoreo_pausado": False,
+        "frame_actual": 0,
+        "ultimo_resultado": None,
+        "ultima_imagen_procesada": None,
+        "ruta_video_monitoreo": None,
+        "placas_detectadas_acumuladas": 0,
+    }
+    for clave, valor in valores_iniciales.items():
+        if clave not in st.session_state:
+            st.session_state[clave] = valor
+
+
+def pestana_monitoreo(config: dict) -> None:
+    st.header("Monitoreo")
+    _inicializar_estado_monitoreo()
 
     control, visor = st.columns([0.32, 0.68])
     with control:
-        fuente = st.radio("Fuente principal", ["Video de prueba", "Camara en vivo"])
+        fuente_monitoreo = st.selectbox("Fuente de monitoreo", ["Video de prueba", "Camara en vivo"])
         video = None
         indice_camara = 0
 
-        if fuente == "Video de prueba":
-            video = st.file_uploader("Cargar video", type=["mp4", "avi", "mov", "mkv"], key="video_monitoreo")
+        if fuente_monitoreo == "Video de prueba":
+            video = st.file_uploader("Cargar video de prueba", type=["mp4", "avi", "mov", "mkv"], key="video_monitoreo")
         else:
-            indice_camara = st.number_input("Indice de camara", min_value=0, value=0, step=1)
+            indice_camara = st.number_input(
+                "Indice de camara",
+                min_value=0,
+                value=0,
+                step=1,
+                help="0 normalmente corresponde a la camara principal. Si usa camara externa, pruebe 1 o 2.",
+            )
 
         distancia_metros = st.number_input(
             "Distancia real entre lineas (m)",
@@ -92,59 +165,190 @@ def pestaña_monitoreo(config: dict) -> None:
             step=1.0,
             key="limite_monitoreo",
         )
-        cada_n_frames = st.slider("Frecuencia de deteccion", 5, 60, 15, help="Frames entre llamadas al detector.")
-        max_frames = st.slider("Frames maximos por ejecucion", 30, 900, 240)
+        frecuencia_deteccion = st.slider(
+            "Frecuencia de deteccion",
+            1,
+            60,
+            10,
+            help="Cada cuantos frames se ejecuta el detector YOLO de placas si el modelo ya fue entrenado.",
+        )
+        max_frames = st.number_input("Frames maximos a procesar (0 = video completo)", min_value=0, value=300, step=30)
+        modo_revision = st.radio("Modo de revision", ["Automatico", "Paso a paso"])
+
+        opciones_velocidad = ["Normal (1x)", "Rapida (sin espera)"] if fuente_monitoreo == "Camara en vivo" else [
+            "Lenta (0.25x)",
+            "Media (0.5x)",
+            "Normal (1x)",
+            "Rapida (sin espera)",
+        ]
+        velocidad_reproduccion = st.selectbox("Velocidad de reproduccion", opciones_velocidad, index=2 if fuente_monitoreo == "Video de prueba" else 0)
+        ancho_visualizacion = st.selectbox(
+            "Ancho de visualizacion",
+            ["Pequeno: 640 px", "Mediano: 800 px", "Grande: 1000 px"],
+            index=1,
+        )
+        ancho_px = {"Pequeno: 640 px": 640, "Mediano: 800 px": 800, "Grande: 1000 px": 1000}[ancho_visualizacion]
 
         iniciar = st.button("Iniciar monitoreo", type="primary", use_container_width=True)
-        detener = st.button("Detener monitoreo", use_container_width=True)
+        col_btn1, col_btn2 = st.columns(2)
+        pausar = col_btn1.button("Pausar", use_container_width=True)
+        reanudar = col_btn2.button("Reanudar", use_container_width=True)
+        detener = st.button("Detener", use_container_width=True)
 
-    if detener:
-        st.session_state["detener_monitoreo"] = True
+        procesar_siguiente = False
+        reiniciar_revision = False
+        if modo_revision == "Paso a paso":
+            procesar_siguiente = st.button("Procesar siguiente frame", use_container_width=True)
+            reiniciar_revision = st.button("Reiniciar revision", use_container_width=True)
 
     with visor:
         frame_placeholder = st.empty()
+        progreso = st.progress(0)
         estado_placeholder = st.empty()
-        st.caption("Las lineas virtuales se dibujan sobre el frame procesado.")
-        resultado_placeholder = st.container()
+        resumen_placeholder = st.container()
 
-    if iniciar:
-        st.session_state["detener_monitoreo"] = False
-        config["speed"]["default_distance_meters"] = distancia_metros
-        config["speed"]["campus_speed_limit_kmh"] = limite_velocidad
+    if pausar:
+        st.session_state.monitoreo_pausado = True
+    if reanudar:
+        st.session_state.monitoreo_pausado = False
+    if detener:
+        st.session_state.monitoreo_activo = False
+        st.session_state.monitoreo_pausado = False
+    if reiniciar_revision:
+        st.session_state.frame_actual = 0
+        st.session_state.ultimo_resultado = None
+        st.session_state.ultima_imagen_procesada = None
+        st.session_state.placas_detectadas_acumuladas = 0
 
-        if fuente == "Video de prueba":
-            if not video:
-                st.warning("Carga un video de prueba para iniciar el monitoreo.")
-                return
-            fuente_video = guardar_archivo_subido(video, config["paths"]["input_dir"])
+    if not iniciar and not procesar_siguiente and not st.session_state.get("ultimo_resultado"):
+        with resumen_placeholder:
+            st.info("Selecciona una fuente y presiona 'Iniciar monitoreo' para ver el procesamiento frame por frame.")
+        return
+
+    if fuente_monitoreo == "Video de prueba" and not video:
+        st.warning("No se pudo iniciar el monitoreo: primero carga un video.")
+        return
+
+    if fuente_monitoreo == "Video de prueba" and (iniciar or procesar_siguiente) and not st.session_state.get("ruta_video_monitoreo"):
+        st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
+
+    if iniciar and fuente_monitoreo == "Video de prueba":
+        st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
+        st.session_state.frame_actual = 0
+        st.session_state.monitoreo_activo = True
+        st.session_state.monitoreo_pausado = False
+        st.session_state.ultimo_resultado = None
+        st.session_state.ultima_imagen_procesada = None
+        st.session_state.placas_detectadas_acumuladas = 0
+
+    def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
+        frame_placeholder.image(frame_rgb, channels="RGB", width=ancho_px)
+        st.session_state.ultima_imagen_procesada = frame_rgb
+        if estado_frame:
+            ultima_confianza = estado_frame.get("ultima_confianza")
+            texto_confianza = f"{ultima_confianza:.2f}" if ultima_confianza is not None else "Pendiente"
+            estado_placeholder.info(
+                f"Frame {estado_frame.get('frame_actual', numero_frame)} / {estado_frame.get('total_frames', 0)} | "
+                f"FPS {estado_frame.get('fps', 0):.2f} | "
+                f"Modo {estado_frame.get('modo_reproduccion')} | "
+                f"Velocidad {estado_frame.get('velocidad_reproduccion')} | "
+                f"Detecciones {estado_frame.get('placas_detectadas', 0)} | "
+                f"Confianza {texto_confianza}"
+            )
         else:
-            fuente_video = int(indice_camara)
+            estado_placeholder.info(f"Procesando frame {numero_frame}")
 
-        def actualizar_frame(frame_rgb, numero_frame: int, mensaje: str) -> None:
-            frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-            estado_placeholder.info(f"Frame {numero_frame} | {mensaje}")
+    def actualizar_progreso(valor: float) -> None:
+        progreso.progress(valor)
 
-        with st.spinner("Monitoreo en ejecucion..."):
+    if modo_revision == "Paso a paso" and fuente_monitoreo == "Video de prueba":
+        if iniciar or procesar_siguiente:
+            if st.session_state.monitoreo_pausado:
+                st.info("La revision esta pausada. Presiona Reanudar para continuar.")
+            else:
+                resultado = procesar_frame_video_monitoreo(
+                    st.session_state.ruta_video_monitoreo,
+                    st.session_state.frame_actual,
+                    distancia_lineas_m=distancia_metros,
+                    limite_velocidad_kmh=limite_velocidad,
+                    frecuencia_deteccion=frecuencia_deteccion,
+                )
+                if resultado.get("frame_rgb") is not None:
+                    st.session_state.frame_actual = resultado.get("frame_actual", st.session_state.frame_actual + 1)
+                    st.session_state.placas_detectadas_acumuladas += resultado.get("placas_detectadas", 0)
+                    resultado["placas_detectadas"] = st.session_state.placas_detectadas_acumuladas
+                    resultado["modo_reproduccion"] = "Paso a paso"
+                    resultado["velocidad_reproduccion"] = "Manual"
+                    st.session_state.ultimo_resultado = resultado
+                    st.session_state.ultima_imagen_procesada = resultado["frame_rgb"]
+                else:
+                    st.session_state.ultimo_resultado = resultado
+
+        resultado = st.session_state.get("ultimo_resultado")
+        if resultado and resultado.get("frame_rgb") is not None:
+            frame_placeholder.image(resultado["frame_rgb"], channels="RGB", width=ancho_px)
+            total = max(resultado.get("total_frames", 1), 1)
+            progreso.progress(min(resultado.get("frame_actual", 0) / total, 1.0))
+            estado_placeholder.info(f"Frame actual: {resultado.get('frame_actual', 0)} / {resultado.get('total_frames', 0)}")
+            with resumen_placeholder:
+                mostrar_resumen_monitoreo(resultado)
+        elif resultado:
+            st.info(resultado.get("mensaje_estado", "Revision finalizada."))
+        return
+
+    if st.session_state.monitoreo_pausado and st.session_state.get("ultima_imagen_procesada") is not None:
+        frame_placeholder.image(st.session_state.ultima_imagen_procesada, channels="RGB", width=ancho_px)
+        st.info("Monitoreo pausado. Presiona Reanudar para continuar.")
+        if st.session_state.get("ultimo_resultado"):
+            with resumen_placeholder:
+                mostrar_resumen_monitoreo(st.session_state.ultimo_resultado)
+        return
+
+    if not iniciar:
+        if st.session_state.get("ultimo_resultado"):
+            if st.session_state.get("ultima_imagen_procesada") is not None:
+                frame_placeholder.image(st.session_state.ultima_imagen_procesada, channels="RGB", width=ancho_px)
+            with resumen_placeholder:
+                mostrar_resumen_monitoreo(st.session_state.ultimo_resultado)
+        return
+
+    with st.spinner("Procesando monitoreo..."):
+        if fuente_monitoreo == "Video de prueba":
             resumen = procesar_video_monitoreo(
-                fuente_video,
-                config,
-                frame_callback=actualizar_frame,
-                detener_callback=lambda: st.session_state.get("detener_monitoreo", False),
-                cada_n_frames=cada_n_frames,
+                st.session_state.ruta_video_monitoreo,
+                distancia_lineas_m=distancia_metros,
+                limite_velocidad_kmh=limite_velocidad,
+                frecuencia_deteccion=frecuencia_deteccion,
                 max_frames=max_frames,
+                velocidad_reproduccion=velocidad_reproduccion,
+                frame_callback=actualizar_frame,
+                progreso_callback=actualizar_progreso,
+            )
+        else:
+            resumen = procesar_camara_monitoreo(
+                indice_camara=int(indice_camara),
+                distancia_lineas_m=distancia_metros,
+                limite_velocidad_kmh=limite_velocidad,
+                frecuencia_deteccion=frecuencia_deteccion,
+                max_frames=max_frames,
+                velocidad_reproduccion=velocidad_reproduccion,
+                frame_callback=actualizar_frame,
+                progreso_callback=actualizar_progreso,
             )
 
-        eventos = resumen.get("eventos", [])
-        estado_placeholder.info(f"{resumen['mensaje']} | Frames procesados: {resumen['frames_procesados']}")
-        with resultado_placeholder:
-            panel_resultados(eventos[-1] if eventos else None)
+    if resumen.get("estado") == "error":
+        st.error(resumen["mensaje_estado"])
+        return
 
-    else:
-        with resultado_placeholder:
-            panel_resultados(None)
+    progreso.progress(1.0)
+    resumen["modo_reproduccion"] = modo_revision
+    resumen["velocidad_reproduccion"] = velocidad_reproduccion
+    st.session_state.ultimo_resultado = resumen
+    with resumen_placeholder:
+        mostrar_resumen_monitoreo(resumen)
 
 
-def pestaña_pruebas(config: dict) -> None:
+def pestana_pruebas(config: dict) -> None:
     st.header("Pruebas")
 
     with st.expander("Pruebas con imagen", expanded=True):
@@ -196,7 +400,7 @@ def pestaña_pruebas(config: dict) -> None:
         mostrar_resultado_prueba(resultado)
 
 
-def pestaña_base_datos(config: dict) -> None:
+def pestana_base_datos(config: dict) -> None:
     st.header("Base de datos")
     ruta_bd = config["database"]["path"]
 
@@ -210,21 +414,35 @@ def pestaña_base_datos(config: dict) -> None:
     st.dataframe(pd.DataFrame(eventos), use_container_width=True, hide_index=True)
 
 
-def pestaña_evidencias(config: dict) -> None:
+def pestana_evidencias(config: dict) -> None:
     st.header("Evidencias")
     reports_dir = Path(config["paths"]["reports_dir"])
     reports_dir.mkdir(parents=True, exist_ok=True)
     archivos = sorted(reports_dir.glob("*.json"), key=lambda ruta: ruta.stat().st_mtime, reverse=True)
 
+    for titulo, subdir in [
+        ("Monitoreo de video", "monitoreo_video"),
+        ("Monitoreo de camara", "monitoreo_camara"),
+    ]:
+        monitoreo_dir = reports_dir / subdir
+        frames = sorted(monitoreo_dir.glob("*.jpg")) if monitoreo_dir.exists() else []
+        if frames:
+            st.subheader(titulo)
+            cols = st.columns(min(len(frames), 2))
+            for idx, frame in enumerate(frames[:2]):
+                cols[idx].caption(frame.name)
+                cols[idx].image(str(frame), use_container_width=True)
+
+    st.subheader("Reportes JSON")
     if not archivos:
-        st.info("Aun no existen evidencias guardadas.")
+        st.info("Aun no existen reportes JSON guardados.")
         return
 
     seleccionado = st.selectbox("Evidencia", archivos, format_func=lambda ruta: ruta.name)
     st.code(seleccionado.read_text(encoding="utf-8"), language="json")
 
 
-def pestaña_configuracion(config: dict) -> None:
+def pestana_configuracion(config: dict) -> None:
     st.header("Configuracion")
     st.json(config)
     st.caption("Los cambios persistentes se realizan editando config.yaml.")
@@ -235,19 +453,19 @@ def main() -> None:
     inicializar_bd(config["database"]["path"])
 
     st.title("Fotorradar Ecuador IA")
-    st.caption("Consola de monitoreo por video/camara para placas ecuatorianas.")
+    st.caption("Consola de monitoreo por video para placas ecuatorianas.")
 
     tabs = st.tabs(["Monitoreo", "Pruebas", "Base de datos", "Evidencias", "Configuracion"])
     with tabs[0]:
-        pestaña_monitoreo(config)
+        pestana_monitoreo(config)
     with tabs[1]:
-        pestaña_pruebas(config)
+        pestana_pruebas(config)
     with tabs[2]:
-        pestaña_base_datos(config)
+        pestana_base_datos(config)
     with tabs[3]:
-        pestaña_evidencias(config)
+        pestana_evidencias(config)
     with tabs[4]:
-        pestaña_configuracion(config)
+        pestana_configuracion(config)
 
 
 if __name__ == "__main__":
