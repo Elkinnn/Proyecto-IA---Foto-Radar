@@ -102,6 +102,28 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
     col_det4.metric("Eventos de placa", resumen.get("eventos_placa", resumen.get("placas_detectadas", 0)))
     col_det5.metric("Frames desde ultima deteccion", resumen.get("frames_desde_ultima_deteccion", 0))
 
+    col_det6, col_det7, col_det8 = st.columns(3)
+    col_det6.metric("Detecciones brutas YOLO", resumen.get("detecciones_brutas", 0))
+    col_det7.metric("Detecciones validas", resumen.get("detecciones_validas", 0))
+    col_det8.metric("Motivo rechazo", resumen.get("motivos_rechazo") or "Ninguno")
+
+    st.subheader("Evento de placa")
+    mejor_confianza = resumen.get("mejor_confianza_evento")
+    col_evt1, col_evt2, col_evt3 = st.columns(3)
+    col_evt1.metric("Evento activo", "Si" if resumen.get("evento_activo") else "No")
+    col_evt2.metric("ID evento actual", resumen.get("evento_id", "Pendiente"))
+    col_evt3.metric("Confianza actual", f"{confianza:.2f}" if ultima_deteccion else "Pendiente")
+
+    col_evt4, col_evt5, col_evt6 = st.columns(3)
+    col_evt4.metric("Mejor confianza evento", f"{mejor_confianza:.2f}" if mejor_confianza is not None else "Pendiente")
+    col_evt5.metric("Frame mejor deteccion", resumen.get("frame_mejor_evento") or "Pendiente")
+    col_evt6.metric("Frames sin deteccion", resumen.get("frames_sin_deteccion", 0))
+
+    ruta_mejor_recorte = resumen.get("ruta_mejor_recorte_evento")
+    if ruta_mejor_recorte:
+        st.caption(f"Mejor recorte del evento: {ruta_mejor_recorte}")
+        st.image(ruta_mejor_recorte, use_container_width=False)
+
     ultimo_recorte = resumen.get("ultimo_recorte_placa")
     if ultimo_recorte:
         st.caption(f"Ultimo recorte de placa: {ultimo_recorte}")

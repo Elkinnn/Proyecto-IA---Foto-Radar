@@ -4,6 +4,8 @@ import cv2
 
 
 DEFAULT_MODEL_PATH = "models/plate_detector/placas_ecuador.pt"
+MARGEN_BORDE_MIN_PX = 5
+AREA_MAX_RELATIVA = 0.25
 
 
 class PlateDetector:
@@ -32,6 +34,8 @@ class PlateDetector:
             return {
                 "detectada": False,
                 "detecciones": [],
+                "detecciones_brutas": 0,
+                "debug_detecciones": [],
                 "frame_procesado": frame,
                 "mensaje": "Modelo de placa no encontrado. Entrene primero el detector.",
             }
@@ -40,11 +44,13 @@ class PlateDetector:
         cajas = resultados[0].boxes if resultados else []
         frame_procesado = frame.copy()
         detecciones = []
+        debug_detecciones = []
 
         for caja in cajas:
             x1, y1, x2, y2 = [int(valor) for valor in caja.xyxy[0].tolist()]
             confianza = float(caja.conf[0])
             if confianza < conf_min:
+                debug_detecciones.append(_crear_debug(confianza, [x1, y1, x2, y2], False, "baja confianza"))
                 continue
 
             alto, ancho = frame.shape[:2]
@@ -54,6 +60,20 @@ class PlateDetector:
             y2 = max(0, min(y2, alto - 1))
 
             if x2 <= x1 or y2 <= y1:
+                debug_detecciones.append(_crear_debug(confianza, [x1, y1, x2, y2], False, "bbox invalida"))
+                continue
+
+            ancho_bbox = x2 - x1
+            alto_bbox = y2 - y1
+            area_relativa = (ancho_bbox * alto_bbox) / max(alto * ancho, 1)
+            toca_borde = (
+                x1 <= MARGEN_BORDE_MIN_PX
+                or y1 <= MARGEN_BORDE_MIN_PX
+                or x2 >= ancho - MARGEN_BORDE_MIN_PX
+                or y2 >= alto - MARGEN_BORDE_MIN_PX
+            )
+            if toca_borde or area_relativa > AREA_MAX_RELATIVA:
+                debug_detecciones.append(_crear_debug(confianza, [x1, y1, x2, y2], False, "placa demasiado cerca o recortada"))
                 continue
 
             recorte = frame[y1:y2, x1:x2].copy()
@@ -74,12 +94,16 @@ class PlateDetector:
                     "bbox": [x1, y1, x2, y2],
                     "confianza": confianza,
                     "recorte_placa": recorte,
+                    "area_relativa": area_relativa,
                 }
             )
+            debug_detecciones.append(_crear_debug(confianza, [x1, y1, x2, y2], True, ""))
 
         return {
             "detectada": bool(detecciones),
             "detecciones": detecciones,
+            "detecciones_brutas": len(cajas),
+            "debug_detecciones": debug_detecciones,
             "frame_procesado": frame_procesado,
             "mensaje": "Placa detectada." if detecciones else "No se detecto placa.",
         }
@@ -141,3 +165,12 @@ def dibujar_deteccion(ruta_archivo: str, deteccion: dict, output_dir: str) -> st
     salida = Path(output_dir) / f"{ruta.stem}_procesado{ruta.suffix}"
     cv2.imwrite(str(salida), imagen)
     return str(salida)
+
+
+def _crear_debug(confianza: float, bbox: list[int], aceptada: bool, motivo_rechazo: str) -> dict:
+    return {
+        "confianza": confianza,
+        "bbox": bbox,
+        "aceptada": aceptada,
+        "motivo_rechazo": motivo_rechazo,
+    }
