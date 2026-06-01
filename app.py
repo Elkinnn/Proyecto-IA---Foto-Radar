@@ -1,15 +1,22 @@
+from datetime import datetime
 from pathlib import Path
+import json
 
+import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from src.database import inicializar_bd, listar_eventos, listar_vehiculos
+from src.database import buscar_vehiculo_por_placa, guardar_evento, inicializar_bd, listar_eventos, listar_vehiculos
 from src.pipeline import (
     procesar_camara_monitoreo,
     procesar_frame_video_monitoreo,
     procesar_imagen_prueba,
     procesar_video_monitoreo,
 )
+from src.fuzzy_system import clasificar_velocidad
+from src.notifier import generar_notificacion_simulada, guardar_notificacion_simulada
+from src.speed_estimator import SpeedTracker
 from src.utils import cargar_config, guardar_archivo_subido
 
 
@@ -18,6 +25,46 @@ st.set_page_config(
     page_icon=":vertical_traffic_light:",
     layout="wide",
 )
+
+
+def _guardar_evento_velocidad(
+    placa: str,
+    velocidad_kmh: float,
+    limite_kmh: float,
+    difuso: dict,
+    vehiculo: dict | None,
+    evidencia_frame: str | None,
+    evidencia_placa: str | None,
+    fuente: str,
+    ruta_bd: str,
+) -> tuple[int, dict]:
+    vehiculo = vehiculo or {}
+    evento = {
+        "fecha_hora": datetime.now().isoformat(timespec="seconds"),
+        "placa": placa,
+        "vehiculo": vehiculo,
+        "velocidad_kmh": velocidad_kmh,
+        "limite_kmh": limite_kmh,
+        "estado_difuso": difuso["estado"],
+        "nivel_infraccion": difuso["nivel_infraccion"],
+        "sancion": difuso["sancion"],
+        "horas_suspension": difuso["horas_suspension"],
+        "mensaje": difuso["mensaje"],
+        "evidencia_frame": evidencia_frame,
+        "evidencia_placa": evidencia_placa,
+        "fuente": fuente,
+    }
+    evento_id = guardar_evento(evento, ruta_bd)
+    return evento_id, evento
+
+
+def _generar_notificacion_para_evento(evento_id: int, evento: dict, vehiculo: dict | None, difuso: dict) -> dict | None:
+    notificacion = generar_notificacion_simulada(evento, vehiculo, difuso)
+    if not notificacion:
+        return None
+    rutas = guardar_notificacion_simulada(notificacion, evento_id)
+    notificacion.update(rutas)
+    return notificacion
 
 
 def panel_resultados(evento: dict | None) -> None:
@@ -67,6 +114,313 @@ def mostrar_resultado_prueba(resultado: dict) -> None:
 
     with col_info:
         panel_resultados(resultado)
+
+
+def _etiqueta_estado_flujo(estado: str) -> str:
+    etiquetas = {
+        "completado": "Completado",
+        "pendiente": "Pendiente",
+        "no_aplica": "No aplica",
+        "advertencia": "Error / advertencia",
+    }
+    return etiquetas.get(estado, estado)
+
+
+def _mostrar_estado_flujo(resumen: dict, velocidad: dict, velocidad_kmh: float | None) -> None:
+    st.subheader("Estado del flujo")
+
+    ultima_deteccion = resumen.get("ultima_deteccion") or {}
+    placa_detectada = bool(ultima_deteccion) or resumen.get("estado_placa") in {"Detectada", "Mantenida"}
+    frame_linea_1 = velocidad.get("frame_cruce_linea_1")
+    frame_linea_2 = velocidad.get("frame_cruce_linea_2")
+    difuso = resumen.get("clasificacion_difusa")
+    evento_id = resumen.get("evento_bd_id")
+    notificacion = resumen.get("notificacion_simulada")
+
+    estado_bd = "no_aplica"
+    if evento_id:
+        estado_bd = "completado" if resumen.get("vehiculo_encontrado") else "advertencia"
+    elif velocidad_kmh is not None:
+        estado_bd = "pendiente"
+
+    estados = [
+        ("Detección de placa", "completado" if placa_detectada else "pendiente"),
+        ("Cruce Línea 1", "completado" if frame_linea_1 else "pendiente"),
+        ("Cruce Línea 2", "completado" if frame_linea_2 else "pendiente"),
+        ("Velocidad calculada", "completado" if velocidad_kmh is not None else "pendiente"),
+        ("Clasificación difusa", "completado" if difuso else ("pendiente" if velocidad_kmh is not None else "no_aplica")),
+        ("Consulta en base de datos", estado_bd),
+        (
+            "Notificación simulada",
+            "completado"
+            if notificacion
+            else ("no_aplica" if difuso and difuso.get("nivel_infraccion") == "Sin infracción" else ("pendiente" if difuso else "no_aplica")),
+        ),
+    ]
+
+    columnas = st.columns(4)
+    for idx, (nombre, estado) in enumerate(estados):
+        columnas[idx % 4].metric(nombre, _etiqueta_estado_flujo(estado))
+
+    col_det1, col_det2, col_det3 = st.columns(3)
+    col_det1.metric("Placa detectada", "Sí" if placa_detectada else "No")
+    confianza = ultima_deteccion.get("confianza")
+    col_det2.metric("Confianza", f"{float(confianza):.2f}" if confianza is not None else "Pendiente")
+    mejor_confianza = resumen.get("mejor_confianza_evento")
+    col_det3.metric("Mejor confianza evento", f"{mejor_confianza:.2f}" if mejor_confianza is not None else "Pendiente")
+
+    ruta_mejor_recorte = resumen.get("ruta_mejor_recorte_evento") or resumen.get("ultimo_recorte_placa")
+    if ruta_mejor_recorte:
+        st.caption(f"Mejor recorte de placa: {ruta_mejor_recorte}")
+        st.image(ruta_mejor_recorte, use_container_width=False)
+
+    col_cruce1, col_cruce2 = st.columns(2)
+    col_cruce1.metric("Cruce Línea 1", "Sí" if frame_linea_1 else "No")
+    col_cruce1.caption(f"Frame Línea 1: {frame_linea_1 or 'Pendiente'}")
+    col_cruce2.metric("Cruce Línea 2", "Sí" if frame_linea_2 else "No")
+    col_cruce2.caption(f"Frame Línea 2: {frame_linea_2 or 'Pendiente'}")
+
+    if frame_linea_1 and not frame_linea_2:
+        st.warning("La placa cruzó la Línea 1, pero no cruzó la Línea 2. No se puede calcular velocidad hasta completar el cruce entre ambas líneas.")
+        st.info("Esperando cruce de Línea 2.")
+    elif not frame_linea_1:
+        st.info("Esperando que el centro de la placa cruce la Línea 1.")
+
+
+def _mostrar_diagnostico_monitoreo(resumen: dict, velocidad: dict, velocidad_kmh: float | None) -> None:
+    st.subheader("Diagnóstico del monitoreo")
+
+    placa_detectada = bool(resumen.get("ultima_deteccion")) or resumen.get("estado_placa") in {"Detectada", "Mantenida"}
+    frame_linea_1 = velocidad.get("frame_cruce_linea_1")
+    frame_linea_2 = velocidad.get("frame_cruce_linea_2")
+
+    if velocidad_kmh is not None:
+        motivo = "La medición de velocidad se completó correctamente."
+        recomendacion = "Revise el resultado difuso, la consulta en base de datos y la notificación si corresponde."
+    elif not placa_detectada:
+        motivo = "No se detectó placa válida."
+        recomendacion = "Ajuste confianza mínima, iluminación, enfoque, rotación, zona de cámara o posición del vehículo."
+    elif not frame_linea_1:
+        motivo = "La placa fue detectada, pero el centro de la placa todavía no cruzó la Línea 1."
+        recomendacion = "Ubique la Línea 1 sobre la trayectoria real de la placa o use un video donde el vehículo avance hacia ambas líneas."
+    elif frame_linea_1 and not frame_linea_2:
+        motivo = "La placa no cruzó Línea 2."
+        recomendacion = "Use un video donde el vehículo pase completamente entre ambas líneas o ajuste la posición de Línea 2."
+    else:
+        motivo = "La detección fue válida, pero no hubo movimiento suficiente para medir velocidad."
+        recomendacion = "Verifique que la cámara esté fija, que la placa se desplace de arriba hacia abajo y que las líneas estén separadas correctamente."
+
+    col_diag1, col_diag2 = st.columns(2)
+    col_diag1.info(f"Motivo: {motivo}")
+    col_diag2.info(f"Recomendación: {recomendacion}")
+
+    mensaje_detector = resumen.get("mensaje_detector")
+    if mensaje_detector:
+        st.caption(f"Detector: {mensaje_detector}")
+
+
+def _centro_y_simulado(
+    numero_frame: int,
+    frame_inicial: int,
+    frame_linea_1: int,
+    frame_linea_2: int,
+    total_frames: int,
+    linea_1_y: int,
+    linea_2_y: int,
+    alto_frame: int,
+) -> float:
+    margen_superior = 90
+    margen_inferior = alto_frame - 90
+    inicio_y = max(20, linea_1_y - 180)
+    fin_y = min(margen_inferior, linea_2_y + 180)
+
+    if numero_frame <= frame_linea_1:
+        denom = max(frame_linea_1 - frame_inicial, 1)
+        avance = max(numero_frame - frame_inicial, 0) / denom
+        return inicio_y + avance * (linea_1_y - inicio_y)
+
+    if numero_frame <= frame_linea_2:
+        denom = max(frame_linea_2 - frame_linea_1, 1)
+        avance = (numero_frame - frame_linea_1) / denom
+        return linea_1_y + avance * (linea_2_y - linea_1_y)
+
+    denom = max(total_frames - frame_linea_2, 1)
+    avance = min((numero_frame - frame_linea_2) / denom, 1.0)
+    return linea_2_y + avance * (fin_y - linea_2_y)
+
+
+def _crear_frame_simulacion_velocidad(
+    numero_frame: int,
+    bbox: list[int],
+    linea_1_y: int,
+    linea_2_y: int,
+    distancia_metros: float,
+    velocidad: dict,
+) -> np.ndarray:
+    ancho_frame = 640
+    alto_frame = 900
+    frame = np.full((alto_frame, ancho_frame, 3), 38, dtype=np.uint8)
+
+    cv2.line(frame, (0, linea_1_y), (ancho_frame, linea_1_y), (255, 170, 0), 3)
+    cv2.line(frame, (0, linea_2_y), (ancho_frame, linea_2_y), (0, 80, 255), 3)
+    cv2.putText(frame, "Linea 1", (20, linea_1_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 170, 0), 2)
+    cv2.putText(frame, "Linea 2", (20, linea_2_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 80, 255), 2)
+
+    x1, y1, x2, y2 = bbox
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 3)
+    centro_x = int((x1 + x2) / 2)
+    centro_y = int((y1 + y2) / 2)
+    cv2.circle(frame, (centro_x, centro_y), 7, (255, 255, 255), -1)
+    cv2.circle(frame, (centro_x, centro_y), 9, (0, 0, 0), 1)
+
+    velocidad_kmh = velocidad.get("velocidad_kmh")
+    texto_velocidad = "Pendiente" if velocidad_kmh is None else f"{velocidad_kmh:.2f} km/h"
+    cv2.putText(frame, f"Frame: {numero_frame}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
+    cv2.putText(frame, f"Estado: {velocidad.get('estado')}", (20, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
+    cv2.putText(frame, f"Distancia: {distancia_metros:.1f} m", (20, 119), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
+    cv2.putText(frame, f"Velocidad: {texto_velocidad}", (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
+    return frame
+
+
+def ejecutar_simulacion_velocidad(
+    fps: float,
+    distancia_metros: float,
+    limite_kmh: float,
+    placa_manual: str,
+    ruta_bd: str,
+    posicion_linea_1: float,
+    posicion_linea_2: float,
+    frame_inicial: int,
+    frame_linea_1: int,
+    frame_linea_2: int,
+    total_frames: int,
+) -> dict:
+    ancho_frame = 640
+    alto_frame = 900
+    linea_1_y = int(alto_frame * posicion_linea_1)
+    linea_2_y = int(alto_frame * posicion_linea_2)
+    tracker = SpeedTracker(linea_1_y, linea_2_y, distancia_metros, fps)
+
+    evidencia_dir = Path("reports") / "evidencias" / "simulacion_velocidad"
+    evidencia_dir.mkdir(parents=True, exist_ok=True)
+    rutas = {
+        "linea_1": evidencia_dir / "frame_cruce_linea_1.jpg",
+        "linea_2": evidencia_dir / "frame_cruce_linea_2.jpg",
+        "calculada": evidencia_dir / "frame_velocidad_calculada.jpg",
+        "json": evidencia_dir / "simulacion_velocidad.json",
+    }
+
+    for ruta in rutas.values():
+        if ruta.exists():
+            try:
+                ruta.unlink()
+            except PermissionError:
+                pass
+
+    ultimo_frame = None
+    resumen = tracker.resumen()
+    guardo_linea_1 = False
+    guardo_linea_2 = False
+    guardo_calculada = False
+
+    for numero_frame in range(max(frame_inicial, 0), total_frames + 1):
+        centro_y = _centro_y_simulado(
+            numero_frame,
+            frame_inicial,
+            frame_linea_1,
+            frame_linea_2,
+            total_frames,
+            linea_1_y,
+            linea_2_y,
+            alto_frame,
+        )
+        centro_x = ancho_frame // 2
+        bbox = [
+            int(centro_x - 95),
+            int(centro_y - 28),
+            int(centro_x + 95),
+            int(centro_y + 28),
+        ]
+        resumen = tracker.actualizar(bbox, numero_frame)
+        frame = _crear_frame_simulacion_velocidad(numero_frame, bbox, linea_1_y, linea_2_y, distancia_metros, resumen)
+
+        if resumen.get("frame_cruce_linea_1") == numero_frame and not guardo_linea_1:
+            cv2.imwrite(str(rutas["linea_1"]), frame)
+            guardo_linea_1 = True
+        if resumen.get("frame_cruce_linea_2") == numero_frame and not guardo_linea_2:
+            cv2.imwrite(str(rutas["linea_2"]), frame)
+            guardo_linea_2 = True
+        if resumen.get("velocidad_kmh") is not None and not guardo_calculada:
+            cv2.imwrite(str(rutas["calculada"]), frame)
+            guardo_calculada = True
+
+        ultimo_frame = frame
+
+    datos = {
+        "placa": placa_manual,
+        "fps": fps,
+        "distancia_metros": distancia_metros,
+        "limite_kmh": limite_kmh,
+        "posicion_linea_1": posicion_linea_1,
+        "posicion_linea_2": posicion_linea_2,
+        "frame_cruce_linea_1": resumen.get("frame_cruce_linea_1"),
+        "frame_cruce_linea_2": resumen.get("frame_cruce_linea_2"),
+        "tiempo_segundos": resumen.get("tiempo_entre_lineas"),
+        "velocidad_kmh": resumen.get("velocidad_kmh"),
+        "estado": resumen.get("estado"),
+        "ruta_frame_cruce_linea_1": str(rutas["linea_1"]) if guardo_linea_1 else None,
+        "ruta_frame_cruce_linea_2": str(rutas["linea_2"]) if guardo_linea_2 else None,
+        "ruta_frame_velocidad_calculada": str(rutas["calculada"]) if guardo_calculada else None,
+    }
+    if resumen.get("velocidad_kmh") is not None:
+        difuso = clasificar_velocidad(resumen["velocidad_kmh"], limite_kmh)
+        vehiculo = buscar_vehiculo_por_placa(placa_manual, ruta_bd)
+        evento_id, evento = _guardar_evento_velocidad(
+            placa=placa_manual,
+            velocidad_kmh=resumen["velocidad_kmh"],
+            limite_kmh=limite_kmh,
+            difuso=difuso,
+            vehiculo=vehiculo,
+            evidencia_frame=str(rutas["calculada"]) if guardo_calculada else None,
+            evidencia_placa=None,
+            fuente="Simulación de velocidad",
+            ruta_bd=ruta_bd,
+        )
+        notificacion = _generar_notificacion_para_evento(evento_id, evento, vehiculo, difuso)
+        datos.update(
+            {
+                "datos_vehiculo": vehiculo,
+                "evento_id": evento_id,
+                "velocidad": resumen["velocidad_kmh"],
+                "resultado_difuso": difuso,
+                "notificacion_simulada": notificacion,
+                "estado_difuso": difuso["estado"],
+                "nivel_infraccion": difuso["nivel_infraccion"],
+                "sancion": difuso["sancion"],
+                "horas_suspension": difuso["horas_suspension"],
+                "mensaje_difuso": difuso["mensaje"],
+                "grados_pertenencia": difuso["grados"],
+            }
+        )
+    else:
+        difuso = None
+        vehiculo = None
+        evento_id = None
+        notificacion = None
+
+    with open(rutas["json"], "w", encoding="utf-8") as archivo:
+        json.dump(datos, archivo, ensure_ascii=False, indent=2)
+
+    return {
+        "resumen": resumen,
+        "difuso": difuso,
+        "vehiculo": vehiculo,
+        "evento_id": evento_id,
+        "notificacion": notificacion,
+        "datos": datos,
+        "frame_final_rgb": cv2.cvtColor(ultimo_frame, cv2.COLOR_BGR2RGB) if ultimo_frame is not None else None,
+        "ruta_json": str(rutas["json"]),
+    }
 
 
 def mostrar_resumen_monitoreo(resumen: dict) -> None:
@@ -152,6 +506,73 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
     col_vel8.metric("Posicion Linea 2", f"{resumen.get('posicion_linea_2', 0.65):.2f}")
     col_vel9.metric("Estado de cruce", etiquetas_estado.get(estado_velocidad, estado_velocidad))
 
+    _mostrar_estado_flujo(resumen, velocidad, velocidad_kmh)
+
+    st.subheader("Clasificación difusa")
+    if velocidad_kmh is not None:
+        difuso = resumen.get("clasificacion_difusa") or clasificar_velocidad(velocidad_kmh, resumen.get("limite_velocidad_kmh", 30.0))
+        col_dif1, col_dif2, col_dif3 = st.columns(3)
+        col_dif1.metric("Estado difuso", difuso["estado"])
+        col_dif2.metric("Nivel de infracción", difuso["nivel_infraccion"])
+        col_dif3.metric("Horas de suspensión", difuso["horas_suspension"])
+
+        col_dif4, col_dif5 = st.columns(2)
+        col_dif4.metric("Sanción", difuso["sancion"])
+        col_dif5.metric("Límite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
+        st.info(difuso["mensaje"])
+    else:
+        col_dif1, col_dif2, col_dif3 = st.columns(3)
+        col_dif1.metric("Estado difuso", "Pendiente")
+        col_dif2.metric("Nivel de infracción", "Pendiente")
+        col_dif3.metric("Sanción", "Pendiente")
+
+    if resumen.get("placa_controlada") or resumen.get("evento_bd_id"):
+        st.subheader("Resultado del evento")
+        vehiculo = resumen.get("vehiculo") or {}
+        difuso_evento = resumen.get("clasificacion_difusa") or {}
+        notificacion = resumen.get("notificacion_simulada")
+        vehiculo_encontrado = "Sí" if resumen.get("vehiculo_encontrado") else "No"
+
+        if resumen.get("vehiculo_encontrado") is False:
+            st.warning("Placa no encontrada en la base de datos.")
+
+        col_evt_res1, col_evt_res2, col_evt_res3 = st.columns(3)
+        col_evt_res1.metric("Placa usada", resumen.get("placa_controlada", "Pendiente"))
+        col_evt_res2.metric("Vehículo encontrado", vehiculo_encontrado)
+        col_evt_res3.metric("Evento ID", resumen.get("evento_bd_id", "Pendiente"))
+
+        col_evt_res4, col_evt_res5, col_evt_res6 = st.columns(3)
+        col_evt_res4.metric("Marca", vehiculo.get("marca", "No registrado"))
+        col_evt_res5.metric("Modelo", vehiculo.get("modelo", "No registrado"))
+        col_evt_res6.metric("Color", vehiculo.get("color", "No registrado"))
+
+        col_evt_res7, col_evt_res8, col_evt_res9 = st.columns(3)
+        col_evt_res7.metric("Propietario", vehiculo.get("propietario", "No registrado"))
+        col_evt_res8.metric("Correo", vehiculo.get("correo", "No registrado"))
+        col_evt_res9.metric("Velocidad calculada", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
+
+        col_evt_res10, col_evt_res11, col_evt_res12 = st.columns(3)
+        col_evt_res10.metric("Límite de velocidad", f"{resumen.get('limite_velocidad_kmh', 0):.1f} km/h")
+        col_evt_res11.metric("Estado difuso", difuso_evento.get("estado", "Pendiente"))
+        col_evt_res12.metric("Nivel de infracción", difuso_evento.get("nivel_infraccion", "Pendiente"))
+
+        col_evt_res13, col_evt_res14, col_evt_res15 = st.columns(3)
+        col_evt_res13.metric("Sanción", difuso_evento.get("sancion", "Pendiente"))
+        col_evt_res14.metric("Horas de suspensión", difuso_evento.get("horas_suspension", "Pendiente"))
+        col_evt_res15.metric("Notificación generada", "Sí" if notificacion else "No")
+
+        if notificacion:
+            col_not1, col_not2 = st.columns(2)
+            col_not1.metric("Destinatario", notificacion.get("destinatario") or "Sin correo")
+            col_not2.metric("Asunto", notificacion.get("asunto") or "Pendiente")
+            col_not3, col_not4 = st.columns(2)
+            col_not3.metric("Ruta TXT notificación", notificacion.get("ruta_txt") or "Pendiente")
+            col_not4.metric("Ruta JSON notificación", notificacion.get("ruta_json") or "Pendiente")
+        elif resumen.get("evento_bd_id"):
+            st.info("No se generó notificación porque no existe infracción.")
+
+    _mostrar_diagnostico_monitoreo(resumen, velocidad, velocidad_kmh)
+
     ultimo_recorte = resumen.get("ultimo_recorte_placa")
     if ultimo_recorte:
         st.caption(f"Ultimo recorte de placa: {ultimo_recorte}")
@@ -169,6 +590,52 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
             ev2.image(ultimo_frame, use_container_width=True)
 
 
+def registrar_evento_monitoreo_si_corresponde(resumen: dict, placa_controlada: str, ruta_bd: str) -> dict:
+    velocidad = resumen.get("velocidad") or {}
+    velocidad_kmh = velocidad.get("velocidad_kmh")
+    if velocidad_kmh is None:
+        return resumen
+
+    frame_linea_2 = velocidad.get("frame_cruce_linea_2")
+    clave_evento = f"{placa_controlada}-{resumen.get('fuente')}-{frame_linea_2}-{velocidad_kmh:.3f}"
+    if st.session_state.get("evento_velocidad_guardado_clave") == clave_evento:
+        resumen.update(st.session_state.get("evento_monitoreo_actual") or {})
+        return resumen
+
+    limite_kmh = float(resumen.get("limite_velocidad_kmh", 30.0))
+    difuso = clasificar_velocidad(velocidad_kmh, limite_kmh)
+    vehiculo = buscar_vehiculo_por_placa(placa_controlada, ruta_bd)
+    evento_id, evento = _guardar_evento_velocidad(
+        placa=placa_controlada,
+        velocidad_kmh=velocidad_kmh,
+        limite_kmh=limite_kmh,
+        difuso=difuso,
+        vehiculo=vehiculo,
+        evidencia_frame=resumen.get("ultimo_frame_deteccion") or resumen.get("ultimo_frame_evidencia"),
+        evidencia_placa=resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento"),
+        fuente=resumen.get("fuente", "Monitoreo"),
+        ruta_bd=ruta_bd,
+    )
+    notificacion = _generar_notificacion_para_evento(evento_id, evento, vehiculo, difuso)
+
+    resumen["placa_controlada"] = placa_controlada
+    resumen["vehiculo"] = vehiculo
+    resumen["vehiculo_encontrado"] = vehiculo is not None
+    resumen["clasificacion_difusa"] = difuso
+    resumen["evento_bd_id"] = evento_id
+    resumen["notificacion_simulada"] = notificacion
+    st.session_state.evento_monitoreo_actual = {
+        "placa_controlada": placa_controlada,
+        "vehiculo": vehiculo,
+        "vehiculo_encontrado": vehiculo is not None,
+        "clasificacion_difusa": difuso,
+        "evento_bd_id": evento_id,
+        "notificacion_simulada": notificacion,
+    }
+    st.session_state.evento_velocidad_guardado_clave = clave_evento
+    return resumen
+
+
 def _inicializar_estado_monitoreo() -> None:
     valores_iniciales = {
         "monitoreo_activo": False,
@@ -179,6 +646,8 @@ def _inicializar_estado_monitoreo() -> None:
         "ruta_video_monitoreo": None,
         "placas_detectadas_acumuladas": 0,
         "estado_persistencia": None,
+        "evento_velocidad_guardado_clave": None,
+        "evento_monitoreo_actual": None,
     }
     for clave, valor in valores_iniciales.items():
         if clave not in st.session_state:
@@ -204,6 +673,17 @@ def pestana_monitoreo(config: dict) -> None:
                 value=0,
                 step=1,
                 help="0 normalmente corresponde a la camara principal. Si usa camara externa, pruebe 1 o 2.",
+            )
+
+        with st.expander("Modo OCR pendiente / placa controlada", expanded=False):
+            placa_controlada = st.text_input(
+                "Placa manual/controlada para consulta",
+                value="PBC1234",
+                help=(
+                    "Este campo se usa temporalmente hasta integrar OCR automático. "
+                    "El detector ubica visualmente la placa, pero el texto se ingresa de forma controlada "
+                    "para probar BD, fuzzy, eventos y notificaciones."
+                ),
             )
 
         rotacion = st.selectbox(
@@ -271,6 +751,7 @@ def pestana_monitoreo(config: dict) -> None:
         reanudar = col_btn2.button("Reanudar", use_container_width=True)
         detener = st.button("Detener", use_container_width=True)
         reiniciar_velocidad = st.button("Reiniciar medicion de velocidad", use_container_width=True)
+        reiniciar_evento = st.button("Reiniciar evento", use_container_width=True)
 
         procesar_siguiente = False
         reiniciar_revision = False
@@ -296,12 +777,32 @@ def pestana_monitoreo(config: dict) -> None:
             st.session_state.estado_persistencia["speed_tracker"] = None
         if st.session_state.get("ultimo_resultado"):
             st.session_state.ultimo_resultado["velocidad"] = {}
+        st.session_state.evento_velocidad_guardado_clave = None
+        st.session_state.evento_monitoreo_actual = None
+    if reiniciar_evento:
+        if st.session_state.get("estado_persistencia"):
+            st.session_state.estado_persistencia["speed_tracker"] = None
+        if st.session_state.get("ultimo_resultado"):
+            for clave in [
+                "velocidad",
+                "clasificacion_difusa",
+                "vehiculo",
+                "vehiculo_encontrado",
+                "evento_bd_id",
+                "notificacion_simulada",
+                "placa_controlada",
+            ]:
+                st.session_state.ultimo_resultado.pop(clave, None)
+        st.session_state.evento_velocidad_guardado_clave = None
+        st.session_state.evento_monitoreo_actual = None
     if reiniciar_revision:
         st.session_state.frame_actual = 0
         st.session_state.ultimo_resultado = None
         st.session_state.ultima_imagen_procesada = None
         st.session_state.placas_detectadas_acumuladas = 0
         st.session_state.estado_persistencia = None
+        st.session_state.evento_velocidad_guardado_clave = None
+        st.session_state.evento_monitoreo_actual = None
 
     if not iniciar and not procesar_siguiente and not st.session_state.get("ultimo_resultado"):
         with resumen_placeholder:
@@ -327,11 +828,15 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultima_imagen_procesada = None
         st.session_state.placas_detectadas_acumuladas = 0
         st.session_state.estado_persistencia = None
+        st.session_state.evento_velocidad_guardado_clave = None
+        st.session_state.evento_monitoreo_actual = None
     elif iniciar:
         st.session_state.monitoreo_activo = True
         st.session_state.monitoreo_pausado = False
         st.session_state.ultimo_resultado = None
         st.session_state.ultima_imagen_procesada = None
+        st.session_state.evento_velocidad_guardado_clave = None
+        st.session_state.evento_monitoreo_actual = None
 
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
         frame_placeholder.image(frame_rgb, channels="RGB", width=ancho_px)
@@ -377,6 +882,11 @@ def pestana_monitoreo(config: dict) -> None:
                     st.session_state.estado_persistencia = resultado.get("estado_persistencia")
                     resultado["modo_reproduccion"] = "Paso a paso"
                     resultado["velocidad_reproduccion"] = "Manual"
+                    resultado = registrar_evento_monitoreo_si_corresponde(
+                        resultado,
+                        placa_controlada,
+                        config["database"]["path"],
+                    )
                     st.session_state.ultimo_resultado = resultado
                     st.session_state.ultima_imagen_procesada = resultado["frame_rgb"]
                 else:
@@ -450,6 +960,11 @@ def pestana_monitoreo(config: dict) -> None:
         st.error(resumen["mensaje_estado"])
         return
 
+    resumen = registrar_evento_monitoreo_si_corresponde(
+        resumen,
+        placa_controlada,
+        config["database"]["path"],
+    )
     progreso.progress(1.0)
     resumen["modo_reproduccion"] = modo_revision
     resumen["velocidad_reproduccion"] = velocidad_reproduccion
@@ -468,6 +983,125 @@ def pestana_pruebas(config: dict) -> None:
             st.image(ruta_imagen, use_container_width=True)
         else:
             ruta_imagen = None
+
+    with st.expander("Simulación de velocidad", expanded=True):
+        col_sim1, col_sim2 = st.columns(2)
+        with col_sim1:
+            fps_simulado = st.number_input("FPS simulado", min_value=1.0, value=30.0, step=1.0)
+            placa_simulada = st.text_input(
+                "Placa manual/controlada",
+                value="PBC1234",
+                help="Valor temporal para probar base de datos y eventos hasta integrar OCR automático.",
+            )
+            distancia_simulada = st.number_input(
+                "Distancia real entre líneas en metros",
+                min_value=0.1,
+                value=10.0,
+                step=0.5,
+                key="distancia_simulacion_velocidad",
+            )
+            limite_simulado = st.number_input(
+                "Límite de velocidad del campus (km/h)",
+                min_value=1.0,
+                value=30.0,
+                step=1.0,
+                key="limite_simulacion_velocidad",
+            )
+            posicion_sim_linea_1 = st.slider("Posición Línea 1 (% altura)", 0.05, 0.95, 0.35, 0.01)
+            posicion_sim_linea_2 = st.slider("Posición Línea 2 (% altura)", 0.05, 0.95, 0.75, 0.01)
+        with col_sim2:
+            frame_inicial_sim = st.number_input("Frame inicial de la placa", min_value=0, value=0, step=1)
+            frame_cruce_linea_1_sim = st.number_input("Frame en que cruza Línea 1", min_value=0, value=30, step=1)
+            frame_cruce_linea_2_sim = st.number_input("Frame en que cruza Línea 2", min_value=0, value=75, step=1)
+            total_frames_sim = st.number_input("Total de frames simulados", min_value=1, value=120, step=1)
+
+        ejecutar_simulacion = st.button("Ejecutar simulación de velocidad", type="primary")
+
+        if ejecutar_simulacion:
+            if posicion_sim_linea_2 <= posicion_sim_linea_1:
+                st.warning("La Línea 2 debe estar debajo de la Línea 1 para simular movimiento de arriba hacia abajo.")
+            elif frame_cruce_linea_2_sim <= frame_cruce_linea_1_sim:
+                st.warning("El frame de cruce de Línea 2 debe ser mayor que el frame de cruce de Línea 1.")
+            elif total_frames_sim <= frame_cruce_linea_2_sim:
+                st.warning("El total de frames simulados debe ser mayor que el frame de cruce de Línea 2.")
+            else:
+                resultado_simulacion = ejecutar_simulacion_velocidad(
+                    fps=float(fps_simulado),
+                    distancia_metros=float(distancia_simulada),
+                    limite_kmh=float(limite_simulado),
+                    placa_manual=placa_simulada,
+                    ruta_bd=config["database"]["path"],
+                    posicion_linea_1=float(posicion_sim_linea_1),
+                    posicion_linea_2=float(posicion_sim_linea_2),
+                    frame_inicial=int(frame_inicial_sim),
+                    frame_linea_1=int(frame_cruce_linea_1_sim),
+                    frame_linea_2=int(frame_cruce_linea_2_sim),
+                    total_frames=int(total_frames_sim),
+                )
+                resumen_velocidad = resultado_simulacion["resumen"]
+                datos_simulacion = resultado_simulacion["datos"]
+                difuso = resultado_simulacion.get("difuso")
+
+                col_res1, col_res2, col_res3 = st.columns(3)
+                col_res1.metric("Frame cruce Línea 1", resumen_velocidad.get("frame_cruce_linea_1") or "Pendiente")
+                col_res2.metric("Frame cruce Línea 2", resumen_velocidad.get("frame_cruce_linea_2") or "Pendiente")
+                col_res3.metric("Estado tracker", resumen_velocidad.get("estado", "Pendiente"))
+
+                col_res4, col_res5, col_res6 = st.columns(3)
+                tiempo_entre = resumen_velocidad.get("tiempo_entre_lineas")
+                velocidad_kmh = resumen_velocidad.get("velocidad_kmh")
+                col_res4.metric("Tiempo entre líneas", f"{tiempo_entre:.3f} s" if tiempo_entre is not None else "Pendiente")
+                col_res5.metric("Distancia configurada", f"{distancia_simulada:.1f} m")
+                col_res6.metric("Velocidad calculada", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
+
+                if difuso:
+                    st.subheader("Clasificación difusa de la simulación")
+                    col_dif1, col_dif2, col_dif3 = st.columns(3)
+                    col_dif1.metric("Estado", difuso["estado"])
+                    col_dif2.metric("Nivel de infracción", difuso["nivel_infraccion"])
+                    col_dif3.metric("Horas de suspensión", difuso["horas_suspension"])
+
+                    col_dif4, col_dif5 = st.columns(2)
+                    col_dif4.metric("Sanción", difuso["sancion"])
+                    col_dif5.metric("Límite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
+                    st.info(difuso["mensaje"])
+                    st.json(difuso["grados"])
+
+                vehiculo = resultado_simulacion.get("vehiculo")
+                st.subheader("Vehículo consultado")
+                if vehiculo:
+                    col_veh1, col_veh2, col_veh3 = st.columns(3)
+                    col_veh1.metric("Marca", vehiculo.get("marca", "Sin registro"))
+                    col_veh2.metric("Modelo", vehiculo.get("modelo", "Sin registro"))
+                    col_veh3.metric("Color", vehiculo.get("color", "Sin registro"))
+
+                    col_veh4, col_veh5, col_veh6 = st.columns(3)
+                    col_veh4.metric("Propietario", vehiculo.get("propietario", "Sin registro"))
+                    col_veh5.metric("Correo", vehiculo.get("correo", "Sin registro"))
+                    col_veh6.metric("Estado", vehiculo.get("estado", "Sin registro"))
+                else:
+                    st.warning("La placa no existe en la base de datos de vehículos.")
+
+                st.success(f"Evento guardado en base de datos con ID: {resultado_simulacion.get('evento_id')}")
+
+                notificacion = resultado_simulacion.get("notificacion")
+                if notificacion:
+                    st.subheader("Notificación simulada")
+                    st.metric("Destinatario", notificacion.get("destinatario") or "Sin correo")
+                    st.caption(f"Asunto: {notificacion.get('asunto')}")
+                    st.text_area("Mensaje", notificacion.get("mensaje", ""), height=260)
+                    st.caption(f"TXT: {notificacion.get('ruta_txt')}")
+                    st.caption(f"JSON: {notificacion.get('ruta_json')}")
+                else:
+                    st.info("No se generó notificación porque no existe infracción.")
+
+                frame_final_rgb = resultado_simulacion.get("frame_final_rgb")
+                if frame_final_rgb is not None:
+                    st.image(frame_final_rgb, channels="RGB", caption="Frame final de la simulación", width=640)
+
+                st.caption(f"Evidencias guardadas en: reports/evidencias/simulacion_velocidad/")
+                st.caption(f"Resumen JSON: {resultado_simulacion['ruta_json']}")
+                st.json(datos_simulacion)
 
     with st.expander("Modo desarrollo / pruebas internas", expanded=False):
         placa_manual = st.text_input("Placa manual", value=config["ocr"]["manual_test_plate"])
@@ -514,6 +1148,19 @@ def pestana_base_datos(config: dict) -> None:
     st.header("Base de datos")
     ruta_bd = config["database"]["path"]
 
+    if st.button("Inicializar base de datos", type="primary"):
+        inicializar_bd(ruta_bd)
+        st.success(f"Base de datos inicializada en: {ruta_bd}")
+
+    placa_busqueda = st.text_input("Buscar placa", value="PBC1234")
+    if placa_busqueda:
+        vehiculo = buscar_vehiculo_por_placa(placa_busqueda, ruta_bd)
+        if vehiculo:
+            st.success("Vehículo encontrado")
+            st.json(vehiculo)
+        else:
+            st.warning("No existe un vehículo registrado con esa placa.")
+
     vehiculos = listar_vehiculos(ruta_bd)
     eventos = listar_eventos(ruta_bd)
 
@@ -542,6 +1189,28 @@ def pestana_evidencias(config: dict) -> None:
             for idx, frame in enumerate(frames[:2]):
                 cols[idx].caption(frame.name)
                 cols[idx].image(str(frame), use_container_width=True)
+
+    st.subheader("Notificaciones simuladas")
+    notificaciones_dir = reports_dir / "notificaciones"
+    notificaciones = sorted(notificaciones_dir.glob("*.txt"), key=lambda ruta: ruta.stat().st_mtime, reverse=True) if notificaciones_dir.exists() else []
+    if notificaciones:
+        datos_notificaciones = [
+            {
+                "archivo": ruta.name,
+                "fecha_modificacion": datetime.fromtimestamp(ruta.stat().st_mtime).isoformat(timespec="seconds"),
+                "ruta": str(ruta),
+            }
+            for ruta in notificaciones[:20]
+        ]
+        st.dataframe(pd.DataFrame(datos_notificaciones), use_container_width=True, hide_index=True)
+        seleccionado_notificacion = st.selectbox(
+            "Ver notificación simulada",
+            notificaciones,
+            format_func=lambda ruta: ruta.name,
+        )
+        st.code(seleccionado_notificacion.read_text(encoding="utf-8"), language="text")
+    else:
+        st.info("Aun no existen notificaciones simuladas guardadas.")
 
     st.subheader("Reportes JSON")
     if not archivos:

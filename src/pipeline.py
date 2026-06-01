@@ -24,7 +24,9 @@ def _registrar_resultado(resultado: dict, config: dict) -> dict:
     ruta_bd = config["database"]["path"]
     clasificacion = resultado["clasificacion_difusa"]
 
-    if clasificacion["sancion"]:
+    sancion_aplica = bool(clasificacion.get("sancion_aplica"))
+
+    if sancion_aplica:
         resultado["notificacion"] = enviar_notificacion_sancion(resultado.get("vehiculo"), resultado, config)
 
     ruta_reporte = guardar_reporte(resultado, config["paths"]["reports_dir"])
@@ -35,7 +37,7 @@ def _registrar_resultado(resultado: dict, config: dict) -> dict:
         "placa": resultado["texto_placa"],
         "velocidad": resultado["velocidad_kmh"],
         "estado": clasificacion["estado"],
-        "sancion": "SI" if clasificacion["sancion"] else "NO",
+        "sancion": "SI" if sancion_aplica else "NO",
         "evidencia": ruta_reporte,
     }
     resultado["id_evento"] = guardar_evento(evento, ruta_bd)
@@ -77,7 +79,7 @@ def procesar_imagen_prueba(
         "velocidad_kmh": velocidad_kmh,
         "clasificacion_difusa": clasificacion,
         "vehiculo": vehiculo,
-        "sancion_generada": clasificacion["sancion"],
+        "sancion_generada": bool(clasificacion.get("sancion_aplica")),
         "notificacion": None,
         "ruta_reporte": None,
         "id_evento": None,

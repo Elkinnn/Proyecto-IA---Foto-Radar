@@ -8,7 +8,7 @@ paths:
   reports_dir: reports/evidencias
 
 database:
-  path: data/database/fotorradar.sqlite3
+  path: data/database/fotorradar.db
 
 speed:
   default_distance_meters: 10.0
