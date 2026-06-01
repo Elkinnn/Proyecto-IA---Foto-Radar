@@ -16,6 +16,7 @@ from src.pipeline import (
 )
 from src.fuzzy_system import clasificar_velocidad
 from src.notifier import generar_notificacion_simulada, guardar_notificacion_simulada
+from src.plate_reader import leer_placa_desde_recorte, registrar_reporte_ocr
 from src.speed_estimator import SpeedTracker
 from src.utils import cargar_config, guardar_archivo_subido
 
@@ -421,6 +422,24 @@ def ejecutar_simulacion_velocidad(
         "frame_final_rgb": cv2.cvtColor(ultimo_frame, cv2.COLOR_BGR2RGB) if ultimo_frame is not None else None,
         "ruta_json": str(rutas["json"]),
     }
+
+
+def _buscar_recortes_ocr() -> tuple[list[Path], str]:
+    eventos_dir = Path("reports") / "evidencias" / "eventos_placa"
+    placas_dir = Path("reports") / "evidencias" / "placas_detectadas"
+    extensiones = ["*.jpg", "*.jpeg", "*.png", "*.bmp"]
+
+    recortes_eventos = []
+    for patron in extensiones:
+        recortes_eventos.extend(eventos_dir.glob(patron) if eventos_dir.exists() else [])
+    recortes_eventos = [ruta for ruta in recortes_eventos if "recorte" in ruta.name.lower()]
+    if recortes_eventos:
+        return sorted(recortes_eventos, key=lambda ruta: ruta.stat().st_mtime, reverse=True), "eventos_placa"
+
+    recortes_placas = []
+    for patron in extensiones:
+        recortes_placas.extend(placas_dir.glob(patron) if placas_dir.exists() else [])
+    return sorted(recortes_placas, key=lambda ruta: ruta.stat().st_mtime, reverse=True), "placas_detectadas"
 
 
 def mostrar_resumen_monitoreo(resumen: dict) -> None:
@@ -1102,6 +1121,106 @@ def pestana_pruebas(config: dict) -> None:
                 st.caption(f"Evidencias guardadas en: reports/evidencias/simulacion_velocidad/")
                 st.caption(f"Resumen JSON: {resultado_simulacion['ruta_json']}")
                 st.json(datos_simulacion)
+
+    with st.expander("OCR experimental sobre recortes", expanded=False):
+        recortes, fuente_recorte = _buscar_recortes_ocr()
+        modo_ocr_exp = st.radio(
+            "Fuente de recorte OCR",
+            ["Recorte generado por el sistema", "Carga manual"],
+            horizontal=True,
+        )
+        placa_esperada_ocr = st.text_input("Placa esperada", value="", key="placa_esperada_ocr")
+        metodo_segmentacion_ocr = st.selectbox(
+            "Método de segmentación",
+            ["v2_banda_caracteres", "v1_contornos_globales"],
+            index=0,
+        )
+        ruta_ocr = None
+        fuente_ocr = fuente_recorte
+
+        if modo_ocr_exp == "Recorte generado por el sistema":
+            if recortes:
+                seleccionado = st.selectbox(
+                    "Seleccionar recorte",
+                    recortes,
+                    format_func=lambda ruta: f"{ruta.name} ({fuente_recorte})",
+                )
+                ruta_ocr = str(seleccionado)
+                st.image(ruta_ocr, caption="Recorte original", use_container_width=False)
+            else:
+                st.info("Aun no hay recortes en eventos_placa ni placas_detectadas.")
+        else:
+            imagen_ocr = st.file_uploader(
+                "Cargar imagen de placa para OCR experimental",
+                type=["jpg", "jpeg", "png", "bmp"],
+                key="imagen_ocr_experimental",
+            )
+            if imagen_ocr:
+                ruta_ocr = guardar_archivo_subido(imagen_ocr, config["paths"]["input_dir"])
+                fuente_ocr = "carga_manual"
+                st.image(ruta_ocr, caption="Imagen cargada", use_container_width=False)
+
+        ejecutar_ocr = st.button("Ejecutar OCR experimental", type="primary")
+        if ejecutar_ocr:
+            if not ruta_ocr:
+                st.warning("Selecciona o carga un recorte de placa antes de ejecutar OCR experimental.")
+            else:
+                resultado_ocr = leer_placa_desde_recorte(
+                    ruta_ocr,
+                    placa_esperada=placa_esperada_ocr,
+                    metodo_segmentacion=metodo_segmentacion_ocr,
+                )
+                reporte_ocr = registrar_reporte_ocr(resultado_ocr, fuente_ocr, placa_esperada_ocr)
+
+                col_ocr1, col_ocr2, col_ocr3 = st.columns(3)
+                col_ocr1.metric("Texto detectado", resultado_ocr["texto_detectado"])
+                col_ocr2.metric("Texto normalizado", resultado_ocr["texto_normalizado"] or "Pendiente")
+                col_ocr3.metric("Confianza", f"{resultado_ocr['confianza']:.2f}")
+
+                formato = resultado_ocr.get("formato", {})
+                comparacion = resultado_ocr.get("comparacion", {})
+                col_ocr4, col_ocr5, col_ocr6 = st.columns(3)
+                col_ocr4.metric("Formato válido", "Sí" if formato.get("valido") else "No")
+                col_ocr5.metric("Acierto", "Sí" if comparacion.get("coincide") else "No")
+                col_ocr6.metric("Caracteres aceptados", resultado_ocr["cantidad_caracteres_segmentados"])
+
+                col_ocr7, col_ocr8 = st.columns(2)
+                col_ocr7.metric("Contornos rechazados", resultado_ocr.get("cantidad_contornos_rechazados", 0))
+                col_ocr8.metric("Método", resultado_ocr.get("metodo_segmentacion", metodo_segmentacion_ocr))
+
+                st.caption(f"Estado: {resultado_ocr['estado']}")
+                st.info(resultado_ocr["mensaje"])
+                st.caption(comparacion.get("mensaje", "Sin comparación."))
+
+                preprocesamiento = resultado_ocr.get("preprocesamiento", {})
+                ruta_preprocesada = preprocesamiento.get("ruta_imagen_procesada")
+                if ruta_preprocesada:
+                    st.image(ruta_preprocesada, caption="Imagen preprocesada final", use_container_width=False)
+
+                ruta_banda = resultado_ocr.get("ruta_banda")
+                if ruta_banda:
+                    st.image(ruta_banda, caption="Banda principal de caracteres", use_container_width=False)
+
+                ruta_debug = resultado_ocr.get("ruta_debug_segmentacion")
+                if ruta_debug:
+                    st.image(ruta_debug, caption="Debug segmentación: verde aceptado, rojo rechazado", use_container_width=False)
+
+                motivos_rechazo = resultado_ocr.get("motivos_rechazo") or {}
+                if motivos_rechazo:
+                    st.caption("Motivos de rechazo")
+                    st.json(motivos_rechazo)
+
+                caracteres = resultado_ocr.get("caracteres", [])
+                if caracteres:
+                    st.subheader("Caracteres aceptados")
+                    columnas = st.columns(min(len(caracteres), 8))
+                    for idx, caracter in enumerate(caracteres[:16]):
+                        columnas[idx % len(columnas)].image(caracter["ruta_caracter"], caption=f"Char {idx + 1}", use_container_width=True)
+                else:
+                    st.warning("No se segmentaron caracteres con los filtros actuales.")
+
+                st.caption(f"Reporte JSON: {reporte_ocr['ruta_json']}")
+                st.caption(f"Reporte CSV: {reporte_ocr['ruta_csv']}")
 
     with st.expander("Modo desarrollo / pruebas internas", expanded=False):
         placa_manual = st.text_input("Placa manual", value=config["ocr"]["manual_test_plate"])
