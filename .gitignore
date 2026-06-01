@@ -1,4 +1,5 @@
 venv/
+venv*/
 __pycache__/
 *.pyc
 runs/
@@ -11,6 +12,8 @@ models/**/*.keras
 yolo*.pt
 data/database/*.sqlite3
 data/database/*.sqlite3-journal
+data/database/*.db
+data/database/*.db-journal
 data/input/
 datasets/
 datasets/**/images/

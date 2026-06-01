@@ -15,7 +15,8 @@ PREPROCESADAS_DIR = OCR_DIR / "placas_preprocesadas"
 CARACTERES_DIR = OCR_DIR / "caracteres_segmentados"
 BANDAS_DIR = OCR_DIR / "bandas_caracteres"
 DEBUG_SEGMENTACION_DIR = OCR_DIR / "debug_segmentacion"
-MODELO_CARACTERES_PATH = Path("models") / "character_reader" / "character_reader.keras"
+MODELO_CARACTERES_PATH = Path("models") / "character_reader" / "character_cnn.keras"
+CLASS_NAMES_PATH = Path("models") / "character_reader" / "class_names.json"
 
 Y_INICIO_BANDA = 0.30
 Y_FIN_BANDA = 0.95
@@ -55,7 +56,99 @@ def cargar_modelo_caracteres():
     MODELO_CARACTERES_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not MODELO_CARACTERES_PATH.exists():
         return None, "No existe un modelo propio de caracteres. Entrene primero el clasificador de caracteres."
-    return None, "Carga de modelo de caracteres pendiente de implementar para el modelo propio."
+    if not CLASS_NAMES_PATH.exists():
+        return None, "No existe class_names.json para interpretar las salidas del modelo de caracteres."
+    try:
+        import tensorflow as tf
+
+        modelo = tf.keras.models.load_model(MODELO_CARACTERES_PATH)
+    except ImportError:
+        try:
+            import keras
+
+            modelo = keras.models.load_model(MODELO_CARACTERES_PATH)
+        except ImportError:
+            return None, "No esta instalado TensorFlow ni Keras en este entorno. No se puede cargar la CNN de caracteres."
+        except Exception as exc:
+            return None, f"No se pudo cargar el modelo propio de caracteres con Keras: {exc}"
+    except Exception as exc:
+        return None, f"No se pudo cargar el modelo propio de caracteres con TensorFlow: {exc}"
+
+    try:
+        class_names = json.loads(CLASS_NAMES_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"No se pudo cargar class_names.json: {exc}"
+    return (modelo, class_names), "Modelo propio de caracteres cargado correctamente."
+
+
+def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
+    imagen = cv2.imread(str(ruta_caracter), cv2.IMREAD_GRAYSCALE)
+    if imagen is None:
+        return {
+            "caracter_predicho": "",
+            "confianza": 0.0,
+            "top3_predicciones": [],
+            "mensaje": "No se pudo cargar el caracter segmentado.",
+        }
+
+    imagen = cv2.resize(imagen, (32, 32), interpolation=cv2.INTER_AREA)
+    if cv2.countNonZero(imagen) > imagen.shape[0] * imagen.shape[1] * 0.5:
+        imagen = cv2.bitwise_not(imagen)
+    entrada = imagen.astype("float32") / 255.0
+    entrada = entrada.reshape(1, 32, 32, 1)
+    prediccion = modelo.predict(entrada, verbose=0)[0]
+    indices_top = np.argsort(prediccion)[-3:][::-1]
+    top3 = [
+        {
+            "caracter": str(class_names[int(idx)]),
+            "confianza": float(prediccion[int(idx)]),
+        }
+        for idx in indices_top
+    ]
+    mejor = top3[0] if top3 else {"caracter": "", "confianza": 0.0}
+    return {
+        "caracter_predicho": mejor["caracter"],
+        "confianza": float(mejor["confianza"]),
+        "top3_predicciones": top3,
+        "mensaje": "Caracter predicho con CNN propia.",
+    }
+
+
+def reconstruir_placa_desde_caracteres(caracteres_segmentados: list, modelo, class_names: list) -> dict:
+    predicciones = []
+    texto = ""
+    confianzas = []
+    for indice, caracter in enumerate(caracteres_segmentados, start=1):
+        prediccion = predecir_caracter(caracter.get("ruta_caracter", ""), modelo, class_names)
+        prediccion["indice"] = indice
+        prediccion["ruta_caracter"] = caracter.get("ruta_caracter")
+        prediccion["bbox"] = caracter.get("bbox")
+        predicciones.append(prediccion)
+        texto += prediccion.get("caracter_predicho", "")
+        confianzas.append(float(prediccion.get("confianza", 0.0)))
+
+    confianza_promedio = sum(confianzas) / len(confianzas) if confianzas else 0.0
+    return {
+        "texto_detectado": texto,
+        "confianza_promedio": confianza_promedio,
+        "predicciones_caracteres": predicciones,
+    }
+
+
+def postprocesar_texto_placa(texto: str) -> dict:
+    crudo = normalizar_placa((texto or "").replace("-", ""))
+    letras = {"0": "O", "1": "I", "5": "S", "2": "Z", "8": "B"}
+    numeros = {"O": "0", "I": "1", "S": "5", "Z": "2", "B": "8"}
+    corregido = []
+    for idx, caracter in enumerate(crudo):
+        if idx < 3:
+            corregido.append(letras.get(caracter, caracter))
+        else:
+            corregido.append(numeros.get(caracter, caracter))
+    return {
+        "texto_detectado_crudo": crudo,
+        "texto_postprocesado": "".join(corregido),
+    }
 
 
 def _nombre_seguro(ruta_imagen: str, nombre_base: str) -> str:
@@ -379,11 +472,11 @@ def _iou_bbox(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> flo
 
 def validar_formato_placa_ecuador(texto: str) -> dict:
     normalizada = normalizar_placa((texto or "").replace("-", ""))
-    valido = bool(re.fullmatch(r"[A-Z]{3}[0-9]{4}", normalizada))
+    valido = bool(re.fullmatch(r"[A-Z]{3}[0-9]{3,4}", normalizada))
     return {
         "texto_normalizado": normalizada if valido else normalizada,
         "valido": valido,
-        "mensaje": "Formato ecuatoriano valido." if valido else "Formato no valido para placa ecuatoriana ABC1234.",
+        "mensaje": "Formato ecuatoriano valido." if valido else "Formato no valido para placa ecuatoriana ABC123 o ABC1234.",
     }
 
 
@@ -440,18 +533,36 @@ def leer_placa_desde_recorte(
             segmentacion["metodo"] = "v2_banda_caracteres"
             caracteres = segmentacion.get("caracteres", [])
 
-    modelo, mensaje_modelo = cargar_modelo_caracteres()
+    carga_modelo, mensaje_modelo = cargar_modelo_caracteres()
     texto_detectado = "NO_RECONOCIDO"
+    texto_detectado_crudo = ""
+    texto_postprocesado = ""
     texto_normalizado = ""
+    confianza_promedio = 0.0
+    predicciones_caracteres = []
+
+    if carga_modelo is None:
+        estado = "requiere_modelo_caracteres"
+        mensaje = "La placa fue preprocesada y segmentada, pero aun no existe un modelo propio de caracteres para reconocer el texto."
+    else:
+        modelo, class_names = carga_modelo
+        reconstruccion = reconstruir_placa_desde_caracteres(caracteres, modelo, class_names)
+        texto_detectado_crudo = reconstruccion["texto_detectado"]
+        postprocesado = postprocesar_texto_placa(texto_detectado_crudo)
+        texto_postprocesado = postprocesado["texto_postprocesado"]
+        texto_detectado = texto_detectado_crudo or "NO_RECONOCIDO"
+        texto_normalizado = texto_postprocesado
+        confianza_promedio = reconstruccion["confianza_promedio"]
+        predicciones_caracteres = reconstruccion["predicciones_caracteres"]
+        estado = "ok" if texto_normalizado else "sin_caracteres_segmentados"
+        mensaje = (
+            "OCR experimental ejecutado con CNN propia de caracteres."
+            if texto_normalizado
+            else "No hay caracteres segmentados suficientes para reconstruir texto."
+        )
+
     formato = validar_formato_placa_ecuador(texto_normalizado)
     comparacion = comparar_con_esperada(texto_normalizado, placa_esperada)
-
-    estado = "requiere_modelo_caracteres" if modelo is None else "pendiente_clasificacion"
-    mensaje = (
-        "La placa fue preprocesada y segmentada, pero aun no existe un modelo propio de caracteres para reconocer el texto."
-        if modelo is None
-        else mensaje_modelo
-    )
 
     return {
         "ruta_imagen": str(ruta_imagen),
@@ -465,8 +576,12 @@ def leer_placa_desde_recorte(
         "ruta_banda": segmentacion.get("ruta_banda"),
         "ruta_debug_segmentacion": segmentacion.get("ruta_debug"),
         "texto_detectado": texto_detectado,
+        "texto_detectado_crudo": texto_detectado_crudo,
+        "texto_postprocesado": texto_postprocesado,
         "texto_normalizado": texto_normalizado,
-        "confianza": 0.0,
+        "confianza": confianza_promedio,
+        "confianza_promedio": confianza_promedio,
+        "predicciones_caracteres": predicciones_caracteres,
         "formato": formato,
         "comparacion": comparacion,
         "estado": estado,
@@ -486,9 +601,14 @@ def registrar_reporte_ocr(resultado: dict, fuente_recorte: str, placa_esperada: 
         "metodo_segmentacion": resultado.get("metodo_segmentacion"),
         "placa_esperada": placa_esperada,
         "texto_detectado": resultado.get("texto_detectado"),
+        "texto_detectado_crudo": resultado.get("texto_detectado_crudo"),
+        "texto_postprocesado": resultado.get("texto_postprocesado"),
         "texto_normalizado": resultado.get("texto_normalizado"),
+        "confianza_promedio": resultado.get("confianza_promedio", 0.0),
+        "formato_valido": resultado.get("formato", {}).get("valido"),
         "valida_formato": resultado.get("formato", {}).get("valido"),
         "acierto": resultado.get("comparacion", {}).get("coincide"),
+        "predicciones_caracteres": json.dumps(resultado.get("predicciones_caracteres", []), ensure_ascii=False),
         "cantidad_caracteres_segmentados": resultado.get("cantidad_caracteres_segmentados", 0),
         "estado": resultado.get("estado"),
         "mensaje": resultado.get("mensaje"),

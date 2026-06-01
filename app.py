@@ -1173,9 +1173,9 @@ def pestana_pruebas(config: dict) -> None:
                 reporte_ocr = registrar_reporte_ocr(resultado_ocr, fuente_ocr, placa_esperada_ocr)
 
                 col_ocr1, col_ocr2, col_ocr3 = st.columns(3)
-                col_ocr1.metric("Texto detectado", resultado_ocr["texto_detectado"])
-                col_ocr2.metric("Texto normalizado", resultado_ocr["texto_normalizado"] or "Pendiente")
-                col_ocr3.metric("Confianza", f"{resultado_ocr['confianza']:.2f}")
+                col_ocr1.metric("Texto detectado crudo", resultado_ocr.get("texto_detectado_crudo") or resultado_ocr["texto_detectado"])
+                col_ocr2.metric("Texto postprocesado", resultado_ocr.get("texto_postprocesado") or "Pendiente")
+                col_ocr3.metric("Confianza promedio", f"{resultado_ocr.get('confianza_promedio', 0.0):.2f}")
 
                 formato = resultado_ocr.get("formato", {})
                 comparacion = resultado_ocr.get("comparacion", {})
@@ -1218,6 +1218,26 @@ def pestana_pruebas(config: dict) -> None:
                         columnas[idx % len(columnas)].image(caracter["ruta_caracter"], caption=f"Char {idx + 1}", use_container_width=True)
                 else:
                     st.warning("No se segmentaron caracteres con los filtros actuales.")
+
+                predicciones = resultado_ocr.get("predicciones_caracteres") or []
+                if predicciones:
+                    st.subheader("Predicciones por carácter")
+                    for pred in predicciones:
+                        col_img, col_info = st.columns([0.18, 0.82])
+                        if pred.get("ruta_caracter"):
+                            col_img.image(pred["ruta_caracter"], caption=f"#{pred.get('indice')}", use_container_width=True)
+                        top3 = ", ".join(
+                            f"{item['caracter']} ({item['confianza']:.2f})"
+                            for item in pred.get("top3_predicciones", [])
+                        )
+                        col_info.write(
+                            {
+                                "indice": pred.get("indice"),
+                                "prediccion": pred.get("caracter_predicho"),
+                                "confianza": round(float(pred.get("confianza", 0.0)), 4),
+                                "top3": top3,
+                            }
+                        )
 
                 st.caption(f"Reporte JSON: {reporte_ocr['ruta_json']}")
                 st.caption(f"Reporte CSV: {reporte_ocr['ruta_csv']}")

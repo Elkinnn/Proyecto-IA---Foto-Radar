@@ -7,3 +7,4 @@ pillow
 ultralytics
 scikit-fuzzy
 matplotlib
+tensorflow
