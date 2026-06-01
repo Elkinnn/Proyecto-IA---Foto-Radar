@@ -12,6 +12,7 @@ yolo*.pt
 data/database/*.sqlite3
 data/database/*.sqlite3-journal
 data/input/
+datasets/
 datasets/**/images/
 datasets/**/labels/
 datasets/placas_ecuador/
