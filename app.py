@@ -674,6 +674,224 @@ def registrar_evento_monitoreo_si_corresponde(resumen: dict, placa_controlada: s
     return resumen
 
 
+def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
+    ruta_recorte = resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    if not ruta_recorte:
+        resumen.setdefault("texto_ocr_crudo", "Pendiente")
+        resumen.setdefault("texto_ocr_corregido", "Pendiente")
+        resumen.setdefault("confianza_ocr", None)
+        resumen.setdefault("formato_ocr_valido", False)
+        return resumen
+
+    if st.session_state.get("ultimo_recorte_ocr_procesado") == ruta_recorte:
+        resumen.update(st.session_state.get("ultimo_resultado_ocr_monitoreo") or {})
+        return resumen
+
+    try:
+        resultado_ocr = leer_placa_desde_recorte(str(ruta_recorte), placa_esperada="")
+        datos_ocr = {
+            "texto_ocr_crudo": resultado_ocr.get("texto_detectado_crudo") or "Pendiente",
+            "texto_ocr_corregido": resultado_ocr.get("texto_postprocesado") or "Pendiente",
+            "confianza_ocr": resultado_ocr.get("confianza_promedio"),
+            "formato_ocr_valido": bool((resultado_ocr.get("formato") or {}).get("valido")),
+            "estado_ocr": resultado_ocr.get("estado"),
+            "mensaje_ocr": resultado_ocr.get("mensaje"),
+        }
+    except Exception as exc:
+        datos_ocr = {
+            "texto_ocr_crudo": "Error OCR",
+            "texto_ocr_corregido": "Error OCR",
+            "confianza_ocr": None,
+            "formato_ocr_valido": False,
+            "estado_ocr": "error",
+            "mensaje_ocr": str(exc),
+        }
+
+    st.session_state.ultimo_recorte_ocr_procesado = ruta_recorte
+    st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
+    resumen.update(datos_ocr)
+    return resumen
+
+
+def _obtener_placa_para_evento(resumen: dict, placa_controlada: str) -> str:
+    texto_ocr = (resumen.get("texto_ocr_corregido") or "").strip().upper()
+    if resumen.get("formato_ocr_valido") and texto_ocr and texto_ocr != "PENDIENTE":
+        return texto_ocr
+    return (placa_controlada or "PBC1234").strip().upper()
+
+
+def _accion_monitoreo(resumen: dict) -> str:
+    difuso = resumen.get("clasificacion_difusa") or {}
+    if resumen.get("notificacion_simulada"):
+        return "Notificacion simulada"
+    if difuso.get("nivel_infraccion") == "Sin infraccion":
+        return "Sin infraccion"
+    if resumen.get("evento_bd_id"):
+        return "Evento guardado"
+    if (resumen.get("velocidad") or {}).get("velocidad_kmh") is not None:
+        return "Velocidad calculada"
+    return resumen.get("estado_placa", "Monitoreando")
+
+
+def _actualizar_historial_monitoreo(resumen: dict) -> None:
+    velocidad = resumen.get("velocidad") or {}
+    ultima_deteccion = resumen.get("ultima_deteccion") or {}
+    clave = (
+        resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento"),
+        velocidad.get("frame_cruce_linea_2"),
+        resumen.get("evento_bd_id"),
+        resumen.get("frames_procesados") or resumen.get("frame_actual"),
+    )
+    if st.session_state.get("ultima_clave_historial_monitoreo") == clave:
+        return
+    if not clave[0] and velocidad.get("velocidad_kmh") is None and not resumen.get("evento_bd_id"):
+        return
+
+    fila = {
+        "hora": datetime.now().strftime("%H:%M:%S"),
+        "placa detectada": resumen.get("texto_ocr_crudo") or "Pendiente",
+        "placa corregida": resumen.get("texto_ocr_corregido") or resumen.get("placa_controlada") or "Pendiente",
+        "confianza YOLO": (
+            f"{float(ultima_deteccion.get('confianza')):.2f}"
+            if ultima_deteccion.get("confianza") is not None
+            else "Pendiente"
+        ),
+        "confianza OCR": (
+            f"{float(resumen.get('confianza_ocr')):.2f}"
+            if resumen.get("confianza_ocr") is not None
+            else "Pendiente"
+        ),
+        "velocidad": (
+            f"{velocidad.get('velocidad_kmh'):.2f} km/h"
+            if velocidad.get("velocidad_kmh") is not None
+            else "Pendiente"
+        ),
+        "estado": _accion_monitoreo(resumen),
+        "encontrada en BD": "Si" if resumen.get("vehiculo_encontrado") else "No",
+    }
+    historial = st.session_state.get("historial_detecciones_monitoreo", [])
+    historial.insert(0, fila)
+    st.session_state.historial_detecciones_monitoreo = historial[:12]
+    st.session_state.ultima_clave_historial_monitoreo = clave
+
+
+def _actualizar_recortes_monitoreo(resumen: dict) -> None:
+    ruta_recorte = resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    if not ruta_recorte:
+        return
+    clave = str(ruta_recorte)
+    if st.session_state.get("ultima_clave_recorte_monitoreo") == clave:
+        return
+
+    item = {
+        "ruta": clave,
+        "hora": datetime.now().strftime("%H:%M:%S"),
+        "ocr": resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "Pendiente",
+        "confianza_yolo": (resumen.get("ultima_deteccion") or {}).get("confianza"),
+        "confianza_ocr": resumen.get("confianza_ocr"),
+    }
+    recortes = st.session_state.get("recortes_placas_monitoreo", [])
+    if not any(actual.get("ruta") == clave for actual in recortes):
+        recortes.insert(0, item)
+    st.session_state.recortes_placas_monitoreo = recortes[:12]
+    st.session_state.ultima_clave_recorte_monitoreo = clave
+
+
+def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict) -> None:
+    resumen = _enriquecer_resumen_monitoreo_con_ocr(resumen)
+    _actualizar_historial_monitoreo(resumen)
+    _actualizar_recortes_monitoreo(resumen)
+
+    velocidad = resumen.get("velocidad") or {}
+    ultima_deteccion = resumen.get("ultima_deteccion") or {}
+    difuso = resumen.get("clasificacion_difusa") or {}
+    vehiculo = resumen.get("vehiculo") or {}
+    confianza_yolo = ultima_deteccion.get("confianza") or resumen.get("mejor_confianza_evento")
+    confianza_ocr = resumen.get("confianza_ocr")
+    velocidad_kmh = velocidad.get("velocidad_kmh")
+    ruta_recorte = resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+
+    st.subheader("Ultima placa detectada")
+    col_recorte, col_info = st.columns([0.35, 0.65])
+    with col_recorte:
+        if ruta_recorte:
+            st.image(ruta_recorte, caption="Recorte detectado", use_container_width=True)
+        else:
+            st.info("Esperando deteccion de placa.")
+
+    with col_info:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("OCR crudo", resumen.get("texto_ocr_crudo", "Pendiente"))
+        c2.metric("OCR corregido", resumen.get("texto_ocr_corregido", "Pendiente"))
+        c3.metric("Confianza OCR", f"{confianza_ocr:.2f}" if confianza_ocr is not None else "Pendiente")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Confianza YOLO", f"{float(confianza_yolo):.2f}" if confianza_yolo is not None else "Pendiente")
+        c5.metric("Velocidad", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
+        c6.metric("Estado difuso", difuso.get("estado", "Pendiente"))
+
+        c7, c8, c9 = st.columns(3)
+        c7.metric("Encontrada en BD", "Si" if resumen.get("vehiculo_encontrado") else "No")
+        c8.metric("Fecha/hora", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        c9.metric("Accion", _accion_monitoreo(resumen))
+
+        if resumen.get("vehiculo_encontrado"):
+            st.caption(
+                f"{vehiculo.get('marca', 'Vehiculo')} {vehiculo.get('modelo', '')} | "
+                f"{vehiculo.get('color', 'Sin color')} | {vehiculo.get('propietario', 'Sin propietario')}"
+            )
+
+    st.subheader("Historial reciente")
+    historial = st.session_state.get("historial_detecciones_monitoreo", [])
+    if historial:
+        st.dataframe(pd.DataFrame(historial), use_container_width=True, hide_index=True)
+    else:
+        st.caption("Aun no hay detecciones registradas en esta sesion.")
+
+    recortes = st.session_state.get("recortes_placas_monitoreo", [])
+    if recortes:
+        st.subheader("Placas capturadas")
+        columnas = st.columns(min(4, len(recortes)))
+        for idx, recorte in enumerate(recortes[:8]):
+            with columnas[idx % len(columnas)]:
+                st.image(recorte["ruta"], use_container_width=True)
+                conf_yolo = recorte.get("confianza_yolo")
+                conf_ocr = recorte.get("confianza_ocr")
+                texto_yolo = f"{conf_yolo:.2f}" if conf_yolo is not None else "Pendiente"
+                texto_ocr = f"{conf_ocr:.2f}" if conf_ocr is not None else "Pendiente"
+                st.caption(f"{recorte['hora']} | {recorte['ocr']} | YOLO {texto_yolo} | OCR {texto_ocr}")
+
+    with st.expander("Debug avanzado", expanded=False):
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Modelo YOLO", config["models"].get("plate_detector_model", config["models"].get("plate_detector_path", "No configurado")))
+        d2.metric("Frames procesados", resumen.get("frames_procesados", resumen.get("frame_actual", 0)))
+        d3.metric("Detecciones validas", resumen.get("detecciones_validas", 0))
+
+        d4, d5, d6 = st.columns(3)
+        d4.metric("BBox", str(ultima_deteccion.get("bbox") or "Pendiente"))
+        d5.metric("Frecuencia", resumen.get("frecuencia_deteccion", "Pendiente"))
+        d6.metric("Resolucion", f"{resumen.get('ancho', 0)} x {resumen.get('alto', 0)}")
+
+        st.write(
+            {
+                "character_reader_path": config["models"].get("character_reader_path"),
+                "motivo_rechazo": resumen.get("motivos_rechazo") or "Ninguno",
+                "primer_frame_evidencia": resumen.get("primer_frame_evidencia"),
+                "ultimo_frame_evidencia": resumen.get("ultimo_frame_evidencia"),
+                "ultimo_frame_deteccion": resumen.get("ultimo_frame_deteccion"),
+                "ultimo_recorte_placa": ruta_recorte,
+                "mensaje_detector": resumen.get("mensaje_detector"),
+                "mensaje_ocr": resumen.get("mensaje_ocr"),
+                "parametros": {
+                    "distancia_lineas_m": resumen.get("distancia_lineas_m"),
+                    "limite_velocidad_kmh": resumen.get("limite_velocidad_kmh"),
+                    "posicion_linea_1": resumen.get("posicion_linea_1"),
+                    "posicion_linea_2": resumen.get("posicion_linea_2"),
+                },
+            }
+        )
+
+
 def _inicializar_estado_monitoreo() -> None:
     valores_iniciales = {
         "monitoreo_activo": False,
@@ -686,6 +904,12 @@ def _inicializar_estado_monitoreo() -> None:
         "estado_persistencia": None,
         "evento_velocidad_guardado_clave": None,
         "evento_monitoreo_actual": None,
+        "ultimo_recorte_ocr_procesado": None,
+        "ultimo_resultado_ocr_monitoreo": None,
+        "historial_detecciones_monitoreo": [],
+        "ultima_clave_historial_monitoreo": None,
+        "recortes_placas_monitoreo": [],
+        "ultima_clave_recorte_monitoreo": None,
     }
     for clave, valor in valores_iniciales.items():
         if clave not in st.session_state:
@@ -696,322 +920,270 @@ def pestana_monitoreo(config: dict) -> None:
     st.header("Monitoreo")
     _inicializar_estado_monitoreo()
 
-    control, visor = st.columns([0.32, 0.68])
-    with control:
+    fuente_col, visor_col = st.columns([0.28, 0.72])
+    with fuente_col:
         fuente_monitoreo = st.selectbox("Fuente de monitoreo", ["Video de prueba", "Camara en vivo"])
         video = None
         indice_camara = 0
 
         if fuente_monitoreo == "Video de prueba":
             video = st.file_uploader("Cargar video de prueba", type=["mp4", "avi", "mov", "mkv"], key="video_monitoreo")
+            rotacion = "Sin rotacion"
         else:
             indice_camara = st.number_input(
-                "Indice de camara",
+                "Selector de camara",
                 min_value=0,
                 value=0,
                 step=1,
-                help="0 normalmente corresponde a la camara principal. Si usa camara externa, pruebe 1 o 2.",
+                help="0 normalmente corresponde a la camara principal. Si usa una camara externa o Iriun, pruebe 1 o 2.",
             )
+            rotacion_ui = st.selectbox("Rotacion de camara", ["Sin rotacion", "90 grados", "180 grados", "270 grados"])
+            rotacion = {
+                "Sin rotacion": "Sin rotacion",
+                "90 grados": "Rotar 90 derecha",
+                "180 grados": "Rotar 180",
+                "270 grados": "Rotar 90 izquierda",
+            }[rotacion_ui]
 
-        with st.expander("Modo OCR pendiente / placa controlada", expanded=False):
+        iniciar = st.button(
+            "Reanudar monitoreo" if st.session_state.get("monitoreo_pausado") else "Iniciar monitoreo",
+            type="primary",
+            use_container_width=True,
+        )
+        detener = st.button("Detener / pausar", use_container_width=True)
+        reiniciar = st.button("Reiniciar", use_container_width=True)
+
+        distancia_metros = float(config["speed"].get("default_distance_meters", 10.0))
+        limite_velocidad = float(config["speed"].get("campus_speed_limit_kmh", 30.0))
+        posicion_linea_1 = 0.45
+        posicion_linea_2 = 0.65
+        frecuencia_deteccion = 1
+        conf_min = 0.45
+        persistencia_frames = 3
+        max_frames = 0
+        velocidad_reproduccion = "Normal (1x)"
+        placa_controlada = str(config.get("ocr", {}).get("manual_test_plate", "PBC1234"))
+
+        with st.expander("Configuracion avanzada", expanded=False):
+            if fuente_monitoreo == "Video de prueba":
+                rotacion_video_ui = st.selectbox("Rotacion de video", ["Sin rotacion", "90 grados", "180 grados", "270 grados"])
+                rotacion = {
+                    "Sin rotacion": "Sin rotacion",
+                    "90 grados": "Rotar 90 derecha",
+                    "180 grados": "Rotar 180",
+                    "270 grados": "Rotar 90 izquierda",
+                }[rotacion_video_ui]
+            distancia_metros = st.number_input(
+                "Distancia real entre lineas (m)",
+                min_value=0.1,
+                value=distancia_metros,
+                step=0.5,
+                key="distancia_monitoreo_avanzada",
+            )
+            limite_velocidad = st.number_input(
+                "Limite de velocidad (km/h)",
+                min_value=1.0,
+                value=limite_velocidad,
+                step=1.0,
+                key="limite_monitoreo_avanzada",
+            )
+            posicion_linea_1 = st.slider("Posicion Linea 1", 0.05, 0.95, posicion_linea_1, 0.01)
+            posicion_linea_2 = st.slider("Posicion Linea 2", 0.05, 0.95, posicion_linea_2, 0.01)
+            frecuencia_deteccion = st.slider("Frecuencia YOLO", 1, 60, frecuencia_deteccion)
+            conf_min = st.slider("Confianza minima YOLO", 0.10, 0.90, conf_min, 0.05)
+            persistencia_frames = st.slider("Persistencia de deteccion", 0, 30, persistencia_frames, 1)
+            max_frames = st.number_input(
+                "Frames maximos a procesar (0 = completo)",
+                min_value=0,
+                max_value=10000,
+                value=max_frames,
+                step=100,
+            )
             placa_controlada = st.text_input(
-                "Placa manual/controlada para consulta",
-                value="PBC1234",
-                help=(
-                    "Este campo se usa temporalmente hasta integrar OCR automÃ¡tico. "
-                    "El detector ubica visualmente la placa, pero el texto se ingresa de forma controlada "
-                    "para probar BD, fuzzy, eventos y notificaciones."
-                ),
+                "Placa controlada temporal",
+                value=placa_controlada,
+                help="Se usa solo como respaldo para BD/fuzzy si el OCR automatico aun no entrega una placa valida.",
             )
+            st.caption(f"Modelo YOLO: {config['models'].get('plate_detector_model', config['models'].get('plate_detector_path'))}")
+            st.caption(f"Modelo OCR caracteres: {config['models'].get('character_reader_path')}")
 
-        rotacion = st.selectbox(
-            "RotaciÃ³n de imagen",
-            ["Sin rotaciÃ³n", "Rotar 90Â° derecha", "Rotar 90Â° izquierda", "Rotar 180Â°"],
-            index=0,
-        )
-
-        distancia_metros = st.number_input(
-            "Distancia real entre lineas (m)",
-            min_value=0.1,
-            value=float(config["speed"]["default_distance_meters"]),
-            step=0.5,
-            key="distancia_monitoreo",
-        )
-        limite_velocidad = st.number_input(
-            "Limite de velocidad del campus (km/h)",
-            min_value=1.0,
-            value=float(config["speed"]["campus_speed_limit_kmh"]),
-            step=1.0,
-            key="limite_monitoreo",
-        )
-        posicion_linea_1 = st.slider("Posicion Linea 1 (% altura)", 0.05, 0.95, 0.45, 0.01)
-        posicion_linea_2 = st.slider("Posicion Linea 2 (% altura)", 0.05, 0.95, 0.65, 0.01)
-        st.caption(
-            "Ubique las lineas de forma que el centro de la placa cruce primero la Linea 1 y luego la Linea 2. "
-            "Para medir velocidad real, la camara debe estar fija y la distancia fisica entre ambas lineas debe ser conocida."
-        )
-        frecuencia_deteccion = st.slider(
-            "Frecuencia de deteccion",
-            1,
-            60,
-            10,
-            help="Cada cuantos frames se ejecuta el detector YOLO de placas si el modelo ya fue entrenado.",
-        )
-        conf_min = st.slider("Confianza minima de placa", 0.10, 0.90, 0.30, 0.05)
-        persistencia_frames = st.slider("Persistencia de deteccion (frames)", 0, 30, 10, 1)
-        max_frames = st.number_input(
-            "Frames maximos a procesar (0 = video completo)",
-            min_value=0,
-            max_value=10000,
-            value=0,
-            step=100,
-            help="Use 0 para procesar el video completo. Si desea limitar la prueba, use valores como 900 para 30 segundos a 30 FPS.",
-        )
-        modo_revision = st.radio("Modo de revision", ["Automatico", "Paso a paso"])
-
-        opciones_velocidad = ["Normal (1x)", "Rapida (sin espera)"] if fuente_monitoreo == "Camara en vivo" else [
-            "Lenta (0.25x)",
-            "Media (0.5x)",
-            "Normal (1x)",
-            "Rapida (sin espera)",
-        ]
-        velocidad_reproduccion = st.selectbox("Velocidad de reproduccion", opciones_velocidad, index=2 if fuente_monitoreo == "Video de prueba" else 0)
-        ancho_visualizacion = st.selectbox(
-            "Ancho de visualizacion",
-            ["Pequeno: 640 px", "Mediano: 800 px", "Grande: 1000 px"],
-            index=1,
-        )
-        ancho_px = {"Pequeno: 640 px": 640, "Mediano: 800 px": 800, "Grande: 1000 px": 1000}[ancho_visualizacion]
-
-        iniciar = st.button("Iniciar monitoreo", type="primary", use_container_width=True)
-        col_btn1, col_btn2 = st.columns(2)
-        pausar = col_btn1.button("Pausar", use_container_width=True)
-        reanudar = col_btn2.button("Reanudar", use_container_width=True)
-        detener = st.button("Detener", use_container_width=True)
-        reiniciar_velocidad = st.button("Reiniciar medicion de velocidad", use_container_width=True)
-        reiniciar_evento = st.button("Reiniciar evento", use_container_width=True)
-
-        procesar_siguiente = False
-        reiniciar_revision = False
-        if modo_revision == "Paso a paso":
-            procesar_siguiente = st.button("Procesar siguiente frame", use_container_width=True)
-            reiniciar_revision = st.button("Reiniciar revision", use_container_width=True)
-
-    with visor:
+    with visor_col:
         frame_placeholder = st.empty()
         progreso = st.progress(0)
         estado_placeholder = st.empty()
-        resumen_placeholder = st.container()
+        panel_placeholder = st.empty()
 
-    if pausar:
-        st.session_state.monitoreo_pausado = True
-    if reanudar:
-        st.session_state.monitoreo_pausado = False
     if detener:
         st.session_state.monitoreo_activo = False
+        st.session_state.monitoreo_pausado = True
+
+    if reiniciar:
+        st.session_state.monitoreo_activo = False
         st.session_state.monitoreo_pausado = False
-    if reiniciar_velocidad:
-        if st.session_state.get("estado_persistencia"):
-            st.session_state.estado_persistencia["speed_tracker"] = None
-        if st.session_state.get("ultimo_resultado"):
-            st.session_state.ultimo_resultado["velocidad"] = {}
-        st.session_state.evento_velocidad_guardado_clave = None
-        st.session_state.evento_monitoreo_actual = None
-    if reiniciar_evento:
-        if st.session_state.get("estado_persistencia"):
-            st.session_state.estado_persistencia["speed_tracker"] = None
-        if st.session_state.get("ultimo_resultado"):
-            for clave in [
-                "velocidad",
-                "clasificacion_difusa",
-                "vehiculo",
-                "vehiculo_encontrado",
-                "evento_bd_id",
-                "notificacion_simulada",
-                "placa_controlada",
-            ]:
-                st.session_state.ultimo_resultado.pop(clave, None)
-        st.session_state.evento_velocidad_guardado_clave = None
-        st.session_state.evento_monitoreo_actual = None
-    if reiniciar_revision:
         st.session_state.frame_actual = 0
         st.session_state.ultimo_resultado = None
         st.session_state.ultima_imagen_procesada = None
-        st.session_state.placas_detectadas_acumuladas = 0
+        st.session_state.ruta_video_monitoreo = None
         st.session_state.estado_persistencia = None
         st.session_state.evento_velocidad_guardado_clave = None
         st.session_state.evento_monitoreo_actual = None
+        st.session_state.ultimo_recorte_ocr_procesado = None
+        st.session_state.ultimo_resultado_ocr_monitoreo = None
+        st.session_state.historial_detecciones_monitoreo = []
+        st.session_state.ultima_clave_historial_monitoreo = None
+        st.session_state.recortes_placas_monitoreo = []
+        st.session_state.ultima_clave_recorte_monitoreo = None
 
-    if not iniciar and not procesar_siguiente and not st.session_state.get("ultimo_resultado"):
-        with resumen_placeholder:
-            st.info("Selecciona una fuente y presiona 'Iniciar monitoreo' para ver el procesamiento frame por frame.")
+    if posicion_linea_2 <= posicion_linea_1:
+        st.warning("La Linea 2 debe estar debajo de la Linea 1 para medir movimiento de arriba hacia abajo.")
         return
 
-    if fuente_monitoreo == "Video de prueba" and not video:
-        st.warning("No se pudo iniciar el monitoreo: primero carga un video.")
-        return
-    if (iniciar or procesar_siguiente) and posicion_linea_2 <= posicion_linea_1:
-        st.warning("La LÃ­nea 2 debe estar debajo de la LÃ­nea 1 para medir movimiento de arriba hacia abajo.")
+    continuar_auto = bool(st.session_state.get("monitoreo_activo") and not st.session_state.get("monitoreo_pausado"))
+    ejecutar_monitoreo = bool(iniciar or continuar_auto)
+
+    if not ejecutar_monitoreo and not st.session_state.get("ultimo_resultado") and st.session_state.get("ultima_imagen_procesada") is None:
+        with panel_placeholder.container():
+            st.info("Seleccione video o camara en vivo y presione Iniciar monitoreo.")
         return
 
-    if fuente_monitoreo == "Video de prueba" and (iniciar or procesar_siguiente) and not st.session_state.get("ruta_video_monitoreo"):
-        st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
+    if ejecutar_monitoreo and fuente_monitoreo == "Video de prueba" and not video and not st.session_state.get("ruta_video_monitoreo"):
+        st.warning("Primero cargue un video de prueba.")
+        return
 
-    if iniciar and fuente_monitoreo == "Video de prueba":
-        st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
-        st.session_state.frame_actual = 0
+    if iniciar:
+        reanudar_video = (
+            fuente_monitoreo == "Video de prueba"
+            and st.session_state.get("monitoreo_pausado")
+            and st.session_state.get("ruta_video_monitoreo")
+            and st.session_state.get("frame_actual", 0) > 0
+        )
         st.session_state.monitoreo_activo = True
         st.session_state.monitoreo_pausado = False
-        st.session_state.ultimo_resultado = None
-        st.session_state.ultima_imagen_procesada = None
-        st.session_state.placas_detectadas_acumuladas = 0
-        st.session_state.estado_persistencia = None
-        st.session_state.evento_velocidad_guardado_clave = None
-        st.session_state.evento_monitoreo_actual = None
-    elif iniciar:
-        st.session_state.monitoreo_activo = True
-        st.session_state.monitoreo_pausado = False
-        st.session_state.ultimo_resultado = None
-        st.session_state.ultima_imagen_procesada = None
-        st.session_state.evento_velocidad_guardado_clave = None
-        st.session_state.evento_monitoreo_actual = None
+        if not reanudar_video:
+            st.session_state.frame_actual = 0
+            st.session_state.ultimo_resultado = None
+            st.session_state.ultima_imagen_procesada = None
+            st.session_state.estado_persistencia = None
+            st.session_state.evento_velocidad_guardado_clave = None
+            st.session_state.evento_monitoreo_actual = None
+            st.session_state.ultimo_recorte_ocr_procesado = None
+            st.session_state.ultimo_resultado_ocr_monitoreo = None
+            st.session_state.historial_detecciones_monitoreo = []
+            st.session_state.ultima_clave_historial_monitoreo = None
+            st.session_state.recortes_placas_monitoreo = []
+            st.session_state.ultima_clave_recorte_monitoreo = None
+        if fuente_monitoreo == "Video de prueba":
+            if not reanudar_video:
+                st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
+
+    ruta_modelo_placa = config["models"].get("plate_detector_model", config["models"].get("plate_detector_path"))
+
+    def _actualizar_panel_desde_estado(estado_frame: dict) -> None:
+        resumen_parcial = dict(estado_frame)
+        resumen_parcial.setdefault("frames_procesados", estado_frame.get("frame_actual", 0))
+        resumen_parcial.setdefault("fuente", fuente_monitoreo)
+        resumen_parcial.setdefault("rotacion", rotacion)
+        resumen_parcial.setdefault("modelo_detector_disponible", True)
+        resumen_parcial.setdefault("placa_controlada", placa_controlada)
+        resumen_parcial = _enriquecer_resumen_monitoreo_con_ocr(resumen_parcial)
+        with panel_placeholder.container():
+            mostrar_panel_monitoreo_limpio(resumen_parcial, config)
 
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
-        frame_placeholder.image(frame_rgb, channels="RGB", width=ancho_px)
+        frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
         st.session_state.ultima_imagen_procesada = frame_rgb
         if estado_frame:
-            ultima_confianza = estado_frame.get("ultima_confianza")
-            texto_confianza = f"{ultima_confianza:.2f}" if ultima_confianza is not None else "Pendiente"
+            st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
+            if estado_frame.get("estado_persistencia"):
+                st.session_state.estado_persistencia = estado_frame["estado_persistencia"]
+            confianza = estado_frame.get("ultima_confianza")
+            texto_confianza = f"{confianza:.2f}" if confianza is not None else "Pendiente"
             estado_placeholder.info(
-                f"Frame {estado_frame.get('frame_actual', numero_frame)} / {estado_frame.get('total_frames', 0)} | "
-                f"FPS {estado_frame.get('fps', 0):.2f} | "
-                f"Modo {estado_frame.get('modo_reproduccion')} | "
-                f"Velocidad {estado_frame.get('velocidad_reproduccion')} | "
-                f"Estado placa {estado_frame.get('estado_placa', 'Pendiente')} | "
-                f"Eventos {estado_frame.get('eventos_placa', 0)} | "
-                f"Confianza {texto_confianza}"
+                f"Frame {estado_frame.get('frame_actual', numero_frame)} | "
+                f"Estado placa: {estado_frame.get('estado_placa', 'Pendiente')} | "
+                f"Confianza YOLO: {texto_confianza}"
             )
+            if estado_frame.get("ultimo_recorte_placa") or estado_frame.get("ruta_mejor_recorte_evento"):
+                _actualizar_panel_desde_estado(estado_frame)
         else:
             estado_placeholder.info(f"Procesando frame {numero_frame}")
 
     def actualizar_progreso(valor: float) -> None:
         progreso.progress(valor)
 
-    if modo_revision == "Paso a paso" and fuente_monitoreo == "Video de prueba":
-        if iniciar or procesar_siguiente:
-            if st.session_state.monitoreo_pausado:
-                st.info("La revision esta pausada. Presiona Reanudar para continuar.")
-            else:
-                resultado = procesar_frame_video_monitoreo(
-                    st.session_state.ruta_video_monitoreo,
-                    st.session_state.frame_actual,
-                    distancia_lineas_m=distancia_metros,
-                    limite_velocidad_kmh=limite_velocidad,
-                    posicion_linea_1=posicion_linea_1,
-                    posicion_linea_2=posicion_linea_2,
-                    frecuencia_deteccion=frecuencia_deteccion,
-                    conf_min=conf_min,
-                    persistencia_frames=persistencia_frames,
-                    rotacion=rotacion,
-                    estado_persistencia=st.session_state.estado_persistencia,
-                )
-                if resultado.get("frame_rgb") is not None:
-                    st.session_state.frame_actual = resultado.get("frame_actual", st.session_state.frame_actual + 1)
-                    st.session_state.estado_persistencia = resultado.get("estado_persistencia")
-                    resultado["modo_reproduccion"] = "Paso a paso"
-                    resultado["velocidad_reproduccion"] = "Manual"
-                    resultado = registrar_evento_monitoreo_si_corresponde(
-                        resultado,
-                        placa_controlada,
-                        config["database"]["path"],
-                    )
-                    st.session_state.ultimo_resultado = resultado
-                    st.session_state.ultima_imagen_procesada = resultado["frame_rgb"]
-                else:
-                    st.session_state.ultimo_resultado = resultado
-
-        resultado = st.session_state.get("ultimo_resultado")
-        if resultado and resultado.get("frame_rgb") is not None:
-            frame_placeholder.image(resultado["frame_rgb"], channels="RGB", width=ancho_px)
-            total = max(resultado.get("total_frames", 1), 1)
-            progreso.progress(min(resultado.get("frame_actual", 0) / total, 1.0))
-            estado_placeholder.info(f"Frame actual: {resultado.get('frame_actual', 0)} / {resultado.get('total_frames', 0)}")
-            with resumen_placeholder:
-                mostrar_resumen_monitoreo(resultado)
-        elif resultado:
-            st.info(resultado.get("mensaje_estado", "Revision finalizada."))
-        return
-
-    if st.session_state.monitoreo_pausado and st.session_state.get("ultima_imagen_procesada") is not None:
-        frame_placeholder.image(st.session_state.ultima_imagen_procesada, channels="RGB", width=ancho_px)
-        st.info("Monitoreo pausado. Presiona Reanudar para continuar.")
+    if not ejecutar_monitoreo:
+        if st.session_state.get("ultima_imagen_procesada") is not None:
+            frame_placeholder.image(st.session_state.ultima_imagen_procesada, channels="RGB", use_container_width=True)
+            if st.session_state.get("monitoreo_pausado"):
+                estado_placeholder.info(f"Video pausado en el frame {st.session_state.get('frame_actual', 0)}. Presione Reanudar monitoreo para continuar.")
         if st.session_state.get("ultimo_resultado"):
-            with resumen_placeholder:
-                mostrar_resumen_monitoreo(st.session_state.ultimo_resultado)
+            with panel_placeholder.container():
+                mostrar_panel_monitoreo_limpio(st.session_state.ultimo_resultado, config)
         return
 
-    if not iniciar:
-        if st.session_state.get("ultimo_resultado"):
-            if st.session_state.get("ultima_imagen_procesada") is not None:
-                frame_placeholder.image(st.session_state.ultima_imagen_procesada, channels="RGB", width=ancho_px)
-            with resumen_placeholder:
-                mostrar_resumen_monitoreo(st.session_state.ultimo_resultado)
-        return
+    max_frames_solicitados = int(max_frames)
+    frames_a_procesar = max_frames_solicitados
 
-    with st.spinner("Procesando monitoreo..."):
+    with st.spinner("Monitoreando fuente de video..."):
         if fuente_monitoreo == "Video de prueba":
             resumen = procesar_video_monitoreo(
                 st.session_state.ruta_video_monitoreo,
-                distancia_lineas_m=distancia_metros,
-                limite_velocidad_kmh=limite_velocidad,
-                posicion_linea_1=posicion_linea_1,
-                posicion_linea_2=posicion_linea_2,
-                frecuencia_deteccion=frecuencia_deteccion,
-                max_frames=max_frames,
+                distancia_lineas_m=float(distancia_metros),
+                limite_velocidad_kmh=float(limite_velocidad),
+                posicion_linea_1=float(posicion_linea_1),
+                posicion_linea_2=float(posicion_linea_2),
+                frecuencia_deteccion=int(frecuencia_deteccion),
+                max_frames=int(frames_a_procesar),
                 velocidad_reproduccion=velocidad_reproduccion,
-                conf_min=conf_min,
-                persistencia_frames=persistencia_frames,
+                conf_min=float(conf_min),
+                persistencia_frames=int(persistencia_frames),
                 rotacion=rotacion,
-                model_path=config["models"].get("plate_detector_model", config["models"].get("plate_detector_path")),
+                model_path=ruta_modelo_placa,
+                start_frame=int(st.session_state.get("frame_actual", 0) or 0),
+                estado_persistencia=st.session_state.get("estado_persistencia"),
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
-                detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),
+                detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),
             )
         else:
             resumen = procesar_camara_monitoreo(
                 indice_camara=int(indice_camara),
-                distancia_lineas_m=distancia_metros,
-                limite_velocidad_kmh=limite_velocidad,
-                posicion_linea_1=posicion_linea_1,
-                posicion_linea_2=posicion_linea_2,
-                frecuencia_deteccion=frecuencia_deteccion,
-                max_frames=max_frames,
+                distancia_lineas_m=float(distancia_metros),
+                limite_velocidad_kmh=float(limite_velocidad),
+                posicion_linea_1=float(posicion_linea_1),
+                posicion_linea_2=float(posicion_linea_2),
+                frecuencia_deteccion=int(frecuencia_deteccion),
+                max_frames=int(max_frames),
                 velocidad_reproduccion=velocidad_reproduccion,
-                conf_min=conf_min,
-                persistencia_frames=persistencia_frames,
+                conf_min=float(conf_min),
+                persistencia_frames=int(persistencia_frames),
                 rotacion=rotacion,
-                model_path=config["models"].get("plate_detector_model", config["models"].get("plate_detector_path")),
+                model_path=ruta_modelo_placa,
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
-                detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),
+                detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),
             )
 
     if resumen.get("estado") == "error":
-        st.error(resumen["mensaje_estado"])
+        st.error(resumen.get("mensaje_estado", "No se pudo completar el monitoreo."))
         return
 
-    resumen = registrar_evento_monitoreo_si_corresponde(
-        resumen,
-        placa_controlada,
-        config["database"]["path"],
-    )
-    progreso.progress(1.0)
-    resumen["modo_reproduccion"] = modo_revision
+    resumen = _enriquecer_resumen_monitoreo_con_ocr(resumen)
+    placa_evento = _obtener_placa_para_evento(resumen, placa_controlada)
+    resumen = registrar_evento_monitoreo_si_corresponde(resumen, placa_evento, config["database"]["path"])
     resumen["velocidad_reproduccion"] = velocidad_reproduccion
+    st.session_state.frame_actual = int(resumen.get("frame_actual", st.session_state.get("frame_actual", 0)) or 0)
+    if resumen.get("estado_persistencia"):
+        st.session_state.estado_persistencia = resumen["estado_persistencia"]
     st.session_state.ultimo_resultado = resumen
-    with resumen_placeholder:
-        mostrar_resumen_monitoreo(resumen)
+    progreso.progress(1.0)
+    with panel_placeholder.container():
+        mostrar_panel_monitoreo_limpio(resumen, config)
 
+    if fuente_monitoreo == "Video de prueba":
+        st.session_state.monitoreo_activo = False
+        st.session_state.monitoreo_pausado = False
+        estado_placeholder.success("Video finalizado.")
 
 def pestana_pruebas(config: dict) -> None:
     st.header("Pruebas")

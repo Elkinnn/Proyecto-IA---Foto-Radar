@@ -1,4 +1,5 @@
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 import csv
 import json
@@ -18,6 +19,11 @@ from src.speed_estimator import SpeedTracker, estimar_velocidad
 EXCLUIR_ZONA_SUPERIOR_PORCENTAJE = 0.20
 GUARDAR_RECORTE_CADA_N_FRAMES = 15
 BBOX_SUAVIZADO_ALPHA = 0.6
+
+
+@lru_cache(maxsize=4)
+def _obtener_detector_cache(model_path: str | None) -> PlateDetector:
+    return PlateDetector(model_path) if model_path else PlateDetector()
 
 
 def _registrar_resultado(resultado: dict, config: dict) -> dict:
@@ -101,6 +107,8 @@ def procesar_video_monitoreo(
     persistencia_frames: int = 10,
     rotacion: str = "Sin rotación",
     model_path: str | None = None,
+    start_frame: int = 0,
+    estado_persistencia: dict | None = None,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -121,6 +129,8 @@ def procesar_video_monitoreo(
         persistencia_frames=persistencia_frames,
         rotacion=rotacion,
         model_path=model_path,
+        start_frame=start_frame,
+        estado_persistencia=estado_persistencia,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
@@ -302,12 +312,14 @@ def _procesar_fuente_monitoreo(
     persistencia_frames: int,
     rotacion: str,
     model_path: str | None = None,
+    start_frame: int = 0,
+    estado_persistencia: dict | None = None,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
 ) -> dict:
     captura = cv2.VideoCapture(fuente)
-    detector = PlateDetector(model_path) if model_path else PlateDetector()
+    detector = _obtener_detector_cache(str(model_path) if model_path else None)
 
     if not captura.isOpened():
         return {
@@ -341,6 +353,11 @@ def _procesar_fuente_monitoreo(
         }
 
     fps, ancho, alto, total_frames, duracion = _leer_metadata_video(captura)
+    start_frame = max(int(start_frame or 0), 0)
+    if start_frame > 0 and total_frames > 0:
+        start_frame = min(start_frame, max(total_frames - 1, 0))
+    if start_frame > 0:
+        captura.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     frames_procesados = 0
     ultimo_frame = None
 
@@ -350,7 +367,7 @@ def _procesar_fuente_monitoreo(
     ultimo_frame_evidencia = evidencia_dir / "ultimo_frame_procesado.jpg"
     placas_dir = Path("reports") / "evidencias" / "placas_detectadas"
     placas_dir.mkdir(parents=True, exist_ok=True)
-    estado_persistencia = _crear_estado_persistencia()
+    estado_persistencia = estado_persistencia or _crear_estado_persistencia()
     detecciones_frame = 0
     detecciones_brutas = 0
     detecciones_validas = 0
@@ -380,10 +397,11 @@ def _procesar_fuente_monitoreo(
         alto_actual, ancho_actual = frame.shape[:2]
 
         frames_procesados += 1
+        numero_frame_actual = start_frame + frames_procesados
         estado_frame = _procesar_frame_monitoreo(
             frame,
             detector,
-            frames_procesados,
+            numero_frame_actual,
             distancia_lineas_m,
             limite_velocidad_kmh,
             posicion_linea_1,
@@ -420,7 +438,9 @@ def _procesar_fuente_monitoreo(
         if frame_callback:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             estado_callback = {
-                "frame_actual": frames_procesados,
+                "frame_actual": numero_frame_actual,
+                "frames_procesados": frames_procesados,
+                "start_frame": start_frame,
                 "total_frames": total_frames,
                 "fps": fps,
                 "duracion_segundos": duracion,
@@ -440,6 +460,15 @@ def _procesar_fuente_monitoreo(
                 "estado_placa": estado_placa,
                 "frames_desde_ultima_deteccion": estado_persistencia["frames_desde_ultima_deteccion"],
                 "ultima_confianza": ultima_deteccion["confianza"] if ultima_deteccion else None,
+                "ultima_deteccion": ultima_deteccion,
+                "ultimo_recorte_placa": ultimo_recorte_placa,
+                "ultimo_frame_deteccion": ultimo_frame_deteccion,
+                "distancia_lineas_m": distancia_lineas_m,
+                "limite_velocidad_kmh": limite_velocidad_kmh,
+                "posicion_linea_1": posicion_linea_1,
+                "posicion_linea_2": posicion_linea_2,
+                "frecuencia_deteccion": frecuencia_deteccion,
+                "estado_persistencia": estado_persistencia,
                 "evento_activo": estado_frame["evento_activo"],
                 "evento_id": estado_frame["evento_id"],
                 "mejor_confianza_evento": estado_frame["mejor_confianza_evento"],
@@ -455,7 +484,10 @@ def _procesar_fuente_monitoreo(
 
         if progreso_callback:
             if objetivo_frames and objetivo_frames > 0:
-                progreso_callback(min(frames_procesados / objetivo_frames, 1.0))
+                if total_frames > 0 and max_frames == 0:
+                    progreso_callback(min(numero_frame_actual / total_frames, 1.0))
+                else:
+                    progreso_callback(min(frames_procesados / objetivo_frames, 1.0))
             else:
                 progreso_callback(0.0)
 
@@ -468,8 +500,10 @@ def _procesar_fuente_monitoreo(
 
     captura.release()
 
+    frame_final = start_frame + frames_procesados
+
     if estado_persistencia["evento_activo"]:
-        _cerrar_evento_placa(estado_persistencia, frames_procesados)
+        _cerrar_evento_placa(estado_persistencia, frame_final)
         ruta_mejor_recorte_evento = estado_persistencia["ruta_mejor_recorte_evento"] or ruta_mejor_recorte_evento
 
     if ultimo_frame is not None:
@@ -479,12 +513,15 @@ def _procesar_fuente_monitoreo(
         "estado": "finalizado",
         "mensaje_estado": f"Monitoreo desde {nombre_fuente.lower()} finalizado. Flujo visual listo; deteccion, OCR y velocidad real quedan para la siguiente etapa.",
         "frames_procesados": frames_procesados,
+        "frame_actual": frame_final,
+        "start_frame": start_frame,
+        "estado_persistencia": estado_persistencia,
         "fps": fps,
         "ancho": ultimo_frame.shape[1] if ultimo_frame is not None else ancho,
         "alto": ultimo_frame.shape[0] if ultimo_frame is not None else alto,
         "total_frames": total_frames,
         "duracion_segundos": duracion,
-        "segundos_procesados": _calcular_segundos_procesados(frames_procesados, fps),
+        "segundos_procesados": _calcular_segundos_procesados(frame_final, fps),
         "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
         "fuente": nombre_fuente,
         "rotacion": rotacion,
