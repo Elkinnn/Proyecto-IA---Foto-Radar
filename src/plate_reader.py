@@ -15,6 +15,8 @@ PREPROCESADAS_DIR = OCR_DIR / "placas_preprocesadas"
 CARACTERES_DIR = OCR_DIR / "caracteres_segmentados"
 BANDAS_DIR = OCR_DIR / "bandas_caracteres"
 DEBUG_SEGMENTACION_DIR = OCR_DIR / "debug_segmentacion"
+DEBUG_CNN_INPUTS_DIR = OCR_DIR / "debug_cnn_inputs"
+DIAGNOSTICO_RECORTES_DIR = OCR_DIR / "diagnostico_recortes"
 MODELO_CARACTERES_PATH = Path("models") / "character_reader" / "character_cnn.keras"
 CLASS_NAMES_PATH = Path("models") / "character_reader" / "class_names.json"
 
@@ -81,21 +83,66 @@ def cargar_modelo_caracteres():
     return (modelo, class_names), "Modelo propio de caracteres cargado correctamente."
 
 
-def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
+def normalizar_caracter_para_cnn(ruta_caracter: str) -> dict:
+    DEBUG_CNN_INPUTS_DIR.mkdir(parents=True, exist_ok=True)
     imagen = cv2.imread(str(ruta_caracter), cv2.IMREAD_GRAYSCALE)
     if imagen is None:
+        return {
+            "array": None,
+            "ruta_debug_normalizada": None,
+            "estado": "error",
+            "mensaje": "No se pudo cargar el caracter segmentado.",
+        }
+
+    suavizada = cv2.GaussianBlur(imagen, (3, 3), 0)
+    _, binaria = cv2.threshold(suavizada, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    blancos = cv2.countNonZero(binaria)
+    total = binaria.shape[0] * binaria.shape[1]
+    if blancos > total * 0.5:
+        binaria = cv2.bitwise_not(binaria)
+
+    coords = cv2.findNonZero(binaria)
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        binaria = binaria[y : y + h, x : x + w]
+
+    alto, ancho = binaria.shape[:2]
+    escala = min(26 / max(ancho, 1), 26 / max(alto, 1))
+    nuevo_ancho = max(1, int(ancho * escala))
+    nuevo_alto = max(1, int(alto * escala))
+    redimensionada = cv2.resize(binaria, (nuevo_ancho, nuevo_alto), interpolation=cv2.INTER_AREA)
+
+    lienzo = np.zeros((32, 32), dtype=np.uint8)
+    x0 = (32 - nuevo_ancho) // 2
+    y0 = (32 - nuevo_alto) // 2
+    lienzo[y0 : y0 + nuevo_alto, x0 : x0 + nuevo_ancho] = redimensionada
+
+    nombre = _nombre_seguro(ruta_caracter, "caracter")
+    ruta_debug = DEBUG_CNN_INPUTS_DIR / f"{nombre}_cnn_32x32.png"
+    cv2.imwrite(str(ruta_debug), lienzo)
+
+    entrada = lienzo.astype("float32") / 255.0
+    entrada = entrada.reshape(1, 32, 32, 1)
+    return {
+        "array": entrada,
+        "ruta_debug_normalizada": str(ruta_debug),
+        "estado": "ok",
+        "mensaje": "Caracter normalizado para CNN con proporcion conservada y padding negro.",
+    }
+
+
+def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
+    normalizacion = normalizar_caracter_para_cnn(ruta_caracter)
+    if normalizacion.get("array") is None:
         return {
             "caracter_predicho": "",
             "confianza": 0.0,
             "top3_predicciones": [],
-            "mensaje": "No se pudo cargar el caracter segmentado.",
+            "ruta_debug_normalizada": normalizacion.get("ruta_debug_normalizada"),
+            "mensaje": normalizacion.get("mensaje", "No se pudo normalizar el caracter."),
         }
 
-    imagen = cv2.resize(imagen, (32, 32), interpolation=cv2.INTER_AREA)
-    if cv2.countNonZero(imagen) > imagen.shape[0] * imagen.shape[1] * 0.5:
-        imagen = cv2.bitwise_not(imagen)
-    entrada = imagen.astype("float32") / 255.0
-    entrada = entrada.reshape(1, 32, 32, 1)
+    entrada = normalizacion["array"]
     prediccion = modelo.predict(entrada, verbose=0)[0]
     indices_top = np.argsort(prediccion)[-3:][::-1]
     top3 = [
@@ -110,6 +157,7 @@ def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
         "caracter_predicho": mejor["caracter"],
         "confianza": float(mejor["confianza"]),
         "top3_predicciones": top3,
+        "ruta_debug_normalizada": normalizacion.get("ruta_debug_normalizada"),
         "mensaje": "Caracter predicho con CNN propia.",
     }
 
@@ -149,6 +197,87 @@ def postprocesar_texto_placa(texto: str) -> dict:
         "texto_detectado_crudo": crudo,
         "texto_postprocesado": "".join(corregido),
     }
+
+
+def postprocesar_por_formato_ecuador(texto_crudo: str, predicciones_caracteres: list) -> dict:
+    crudo = normalizar_placa((texto_crudo or "").replace("-", ""))
+    letras_directas = {"0": "O", "1": "I", "5": "S", "2": "Z", "8": "B"}
+    numeros_directos = {"O": "0", "I": "1", "S": "5", "Z": "2", "B": "8", "G": "6"}
+    caracteres = []
+    cambios = []
+
+    for idx, caracter in enumerate(crudo):
+        pred = predicciones_caracteres[idx] if idx < len(predicciones_caracteres) else {}
+        confianza = float(pred.get("confianza", 0.0))
+        top3 = pred.get("top3_predicciones", []) or []
+        top3_map = {str(item.get("caracter")): float(item.get("confianza", 0.0)) for item in top3}
+        esperado = "letra" if idx < 3 else "numero"
+        nuevo = caracter
+        motivo = ""
+
+        if esperado == "letra":
+            if caracter.isalpha():
+                nuevo = caracter
+            else:
+                candidato = letras_directas.get(caracter)
+                if candidato and (candidato in top3_map or confianza < 0.85):
+                    nuevo = candidato
+                    motivo = f"{caracter}->{candidato} por posicion de letra"
+                elif caracter == "6" and "G" in top3_map and confianza < 0.75:
+                    nuevo = "G"
+                    motivo = "6->G respaldado por top3"
+                else:
+                    mejor_letra = _mejor_top3_por_tipo(top3, tipo="letra", confianza_actual=confianza)
+                    if mejor_letra:
+                        nuevo = mejor_letra
+                        motivo = f"{caracter}->{mejor_letra} por top3 en posicion de letra"
+        else:
+            if caracter.isdigit():
+                nuevo = caracter
+            else:
+                candidato = numeros_directos.get(caracter)
+                if candidato and (candidato in top3_map or confianza < 0.85):
+                    nuevo = candidato
+                    motivo = f"{caracter}->{candidato} por posicion numerica"
+                else:
+                    mejor_numero = _mejor_top3_por_tipo(top3, tipo="numero", confianza_actual=confianza)
+                    if mejor_numero:
+                        nuevo = mejor_numero
+                        motivo = f"{caracter}->{mejor_numero} por top3 en posicion numerica"
+
+        caracteres.append(nuevo)
+        if nuevo != caracter:
+            cambios.append(
+                {
+                    "indice": idx + 1,
+                    "original": caracter,
+                    "corregido": nuevo,
+                    "confianza_original": confianza,
+                    "motivo": motivo,
+                }
+            )
+
+    texto = "".join(caracteres)
+    formato = validar_formato_placa_ecuador(texto)
+    return {
+        "texto_detectado_crudo": crudo,
+        "texto_postprocesado": texto,
+        "formato_valido": formato["valido"],
+        "cambios": cambios,
+    }
+
+
+def _mejor_top3_por_tipo(top3: list, tipo: str, confianza_actual: float) -> str:
+    for item in top3:
+        candidato = str(item.get("caracter", ""))
+        confianza = float(item.get("confianza", 0.0))
+        if tipo == "letra" and not candidato.isalpha():
+            continue
+        if tipo == "numero" and not candidato.isdigit():
+            continue
+        if confianza_actual < 0.80 or confianza >= confianza_actual - 0.20:
+            return candidato
+    return ""
 
 
 def _nombre_seguro(ruta_imagen: str, nombre_base: str) -> str:
@@ -497,6 +626,128 @@ def comparar_con_esperada(texto_normalizado: str, placa_esperada: str) -> dict:
     }
 
 
+def diagnosticar_ocr_recorte(
+    placa_esperada: str,
+    texto_crudo: str,
+    texto_postprocesado: str,
+    predicciones_caracteres: list,
+    caracteres_segmentados: list,
+    formato_valido: bool,
+    acierto: bool,
+) -> dict:
+    esperada = validar_formato_placa_ecuador(placa_esperada).get("texto_normalizado", "")
+    cantidad_esperada = len(esperada) if esperada else 0
+    cantidad_detectada = len(predicciones_caracteres)
+    diagnostico_caracteres = []
+
+    if esperada and cantidad_detectada != cantidad_esperada:
+        causa_probable = "mala_segmentacion"
+        mensaje = "Segmentacion incompleta o caracteres descartados: la cantidad detectada no coincide con la esperada."
+    elif not predicciones_caracteres:
+        causa_probable = "mala_segmentacion"
+        mensaje = "No hay caracteres segmentados para diagnosticar."
+    elif esperada and texto_postprocesado != esperada:
+        causa_probable = "mala_prediccion_cnn"
+        mensaje = "La cantidad coincide, pero una o mas predicciones no coinciden con la placa esperada."
+    elif esperada and texto_crudo != esperada and texto_postprocesado == esperada:
+        causa_probable = "postprocesamiento_corrigio"
+        mensaje = "La CNN tuvo confusiones, pero el postprocesamiento por formato corrigio el resultado."
+    elif not formato_valido:
+        causa_probable = "postprocesamiento_insuficiente"
+        mensaje = "El texto no cumple formato ecuatoriano despues del postprocesamiento."
+    else:
+        causa_probable = "sin_error_evidente"
+        mensaje = "No se observa error evidente en segmentacion, normalizacion, CNN o postprocesamiento."
+
+    max_items = max(cantidad_detectada, cantidad_esperada)
+    for idx in range(max_items):
+        pred = predicciones_caracteres[idx] if idx < cantidad_detectada else {}
+        esperado = esperada[idx] if idx < cantidad_esperada else ""
+        crudo = texto_crudo[idx] if idx < len(texto_crudo) else ""
+        post = texto_postprocesado[idx] if idx < len(texto_postprocesado) else ""
+        ruta_caracter = pred.get("ruta_caracter") or (
+            caracteres_segmentados[idx].get("ruta_caracter") if idx < len(caracteres_segmentados) else ""
+        )
+        top3 = pred.get("top3_predicciones", []) or []
+        top3_chars = [str(item.get("caracter", "")) for item in top3]
+        confianza = float(pred.get("confianza", 0.0))
+
+        if not pred:
+            estado = "faltante_por_segmentacion"
+            causa = "mala_segmentacion"
+            observacion = "No existe caracter detectado para esta posicion esperada."
+        elif esperado and pred.get("caracter_predicho") == esperado:
+            estado = "correcto_crudo"
+            causa = "sin_error_evidente"
+            observacion = "La CNN acerto esta posicion."
+        elif esperado and post == esperado:
+            estado = "corregido_postprocesamiento"
+            causa = "postprocesamiento_corrigio"
+            observacion = "La prediccion cruda no coincidio, pero el postprocesamiento llego a la etiqueta esperada."
+        elif esperado and esperado in top3_chars:
+            estado = "esperada_en_top3"
+            causa = "postprocesamiento_insuficiente"
+            observacion = "La etiqueta esperada esta en top3; el postprocesamiento podria elegirla con una regla contextual."
+        elif pred and confianza < 0.60:
+            estado = "baja_confianza"
+            causa = "mala_normalizacion_del_caracter"
+            observacion = "Confianza baja; revisar imagen normalizada 32x32 y segmentacion."
+        elif esperado and pred.get("caracter_predicho") != esperado:
+            estado = "error_cnn"
+            causa = "mala_prediccion_cnn"
+            observacion = "La cantidad coincide, pero la CNN predijo otra clase."
+        else:
+            estado = "sin_etiqueta_esperada"
+            causa = "diagnostico_limitado"
+            observacion = "No hay etiqueta esperada para comparar esta posicion."
+
+        diagnostico_caracteres.append(
+            {
+                "indice": idx + 1,
+                "etiqueta_esperada": esperado,
+                "caracter_crudo": crudo,
+                "caracter_postprocesado": post,
+                "prediccion": pred.get("caracter_predicho", ""),
+                "confianza": confianza,
+                "top3": top3,
+                "ruta_caracter": ruta_caracter,
+                "ruta_debug_normalizada": pred.get("ruta_debug_normalizada", ""),
+                "estado": estado,
+                "causa_probable": causa,
+                "observacion": observacion,
+            }
+        )
+
+    if esperada and cantidad_detectada == cantidad_esperada and not acierto:
+        causas = {item.get("causa_probable") for item in diagnostico_caracteres}
+        if "mala_normalizacion_del_caracter" in causas:
+            causa_probable = "mala_normalizacion_del_caracter"
+            mensaje = "La cantidad coincide, pero hay caracteres con baja confianza; revise la imagen normalizada 32x32."
+        elif "postprocesamiento_insuficiente" in causas:
+            causa_probable = "postprocesamiento_insuficiente"
+            mensaje = "La etiqueta esperada aparece en top3 para algun caracter; falta una regla de postprocesamiento mas contextual."
+        elif "mala_prediccion_cnn" in causas:
+            causa_probable = "mala_prediccion_cnn"
+            mensaje = "La segmentacion coincide en longitud, pero la CNN no ubica la etiqueta esperada como mejor clase."
+
+    if not esperada:
+        mensaje = "Ingrese placa esperada para diagnostico para comparar caracter por caracter."
+        causa_probable = "diagnostico_limitado"
+
+    return {
+        "placa_esperada_normalizada": esperada,
+        "cantidad_esperada": cantidad_esperada,
+        "cantidad_detectada": cantidad_detectada,
+        "caracteres_esperados": list(esperada),
+        "caracteres_detectados": list(texto_crudo),
+        "causa_probable": causa_probable,
+        "mensaje": mensaje,
+        "diagnostico_caracteres": diagnostico_caracteres,
+        "formato_valido": formato_valido,
+        "acierto": acierto,
+    }
+
+
 def leer_placa_desde_recorte(
     ruta_imagen: str,
     placa_esperada: str = "",
@@ -540,6 +791,7 @@ def leer_placa_desde_recorte(
     texto_normalizado = ""
     confianza_promedio = 0.0
     predicciones_caracteres = []
+    cambios_postprocesamiento = []
 
     if carga_modelo is None:
         estado = "requiere_modelo_caracteres"
@@ -548,12 +800,13 @@ def leer_placa_desde_recorte(
         modelo, class_names = carga_modelo
         reconstruccion = reconstruir_placa_desde_caracteres(caracteres, modelo, class_names)
         texto_detectado_crudo = reconstruccion["texto_detectado"]
-        postprocesado = postprocesar_texto_placa(texto_detectado_crudo)
+        postprocesado = postprocesar_por_formato_ecuador(texto_detectado_crudo, reconstruccion["predicciones_caracteres"])
         texto_postprocesado = postprocesado["texto_postprocesado"]
         texto_detectado = texto_detectado_crudo or "NO_RECONOCIDO"
         texto_normalizado = texto_postprocesado
         confianza_promedio = reconstruccion["confianza_promedio"]
         predicciones_caracteres = reconstruccion["predicciones_caracteres"]
+        cambios_postprocesamiento = postprocesado.get("cambios", [])
         estado = "ok" if texto_normalizado else "sin_caracteres_segmentados"
         mensaje = (
             "OCR experimental ejecutado con CNN propia de caracteres."
@@ -563,6 +816,15 @@ def leer_placa_desde_recorte(
 
     formato = validar_formato_placa_ecuador(texto_normalizado)
     comparacion = comparar_con_esperada(texto_normalizado, placa_esperada)
+    diagnostico = diagnosticar_ocr_recorte(
+        placa_esperada=placa_esperada,
+        texto_crudo=texto_detectado_crudo,
+        texto_postprocesado=texto_postprocesado,
+        predicciones_caracteres=predicciones_caracteres,
+        caracteres_segmentados=caracteres,
+        formato_valido=bool(formato.get("valido")),
+        acierto=bool(comparacion.get("coincide")),
+    )
 
     return {
         "ruta_imagen": str(ruta_imagen),
@@ -582,11 +844,96 @@ def leer_placa_desde_recorte(
         "confianza": confianza_promedio,
         "confianza_promedio": confianza_promedio,
         "predicciones_caracteres": predicciones_caracteres,
+        "cambios_postprocesamiento": cambios_postprocesamiento,
         "formato": formato,
         "comparacion": comparacion,
+        "diagnostico": diagnostico,
         "estado": estado,
         "mensaje": mensaje,
         "mensaje_modelo": mensaje_modelo,
+    }
+
+
+def registrar_diagnostico_recorte(resultado: dict, placa_esperada: str = "") -> dict:
+    DIAGNOSTICO_RECORTES_DIR.mkdir(parents=True, exist_ok=True)
+    ruta_json = DIAGNOSTICO_RECORTES_DIR / "diagnostico_recortes.json"
+    ruta_csv = DIAGNOSTICO_RECORTES_DIR / "diagnostico_recortes.csv"
+    diagnostico = resultado.get("diagnostico", {})
+    predicciones = resultado.get("predicciones_caracteres", [])
+    filas_caracteres = []
+    for item in diagnostico.get("diagnostico_caracteres", []):
+        filas_caracteres.append(
+            {
+                "indice": item.get("indice"),
+                "etiqueta_esperada": item.get("etiqueta_esperada"),
+                "prediccion": item.get("prediccion"),
+                "confianza": item.get("confianza"),
+                "top3": item.get("top3"),
+                "caracter_crudo": item.get("caracter_crudo"),
+                "caracter_postprocesado": item.get("caracter_postprocesado"),
+                "ruta_caracter": item.get("ruta_caracter"),
+                "ruta_debug_normalizada": item.get("ruta_debug_normalizada"),
+                "estado": item.get("estado"),
+                "causa_probable": item.get("causa_probable"),
+                "observacion": item.get("observacion"),
+            }
+        )
+
+    registro = {
+        "fecha_hora": datetime.now().isoformat(timespec="seconds"),
+        "ruta_recorte": resultado.get("ruta_imagen"),
+        "placa_esperada": placa_esperada,
+        "placa_esperada_normalizada": diagnostico.get("placa_esperada_normalizada", ""),
+        "texto_crudo": resultado.get("texto_detectado_crudo", ""),
+        "texto_postprocesado": resultado.get("texto_postprocesado", ""),
+        "formato_valido": resultado.get("formato", {}).get("valido"),
+        "acierto": resultado.get("comparacion", {}).get("coincide"),
+        "cantidad_esperada": diagnostico.get("cantidad_esperada", 0),
+        "cantidad_detectada": diagnostico.get("cantidad_detectada", len(predicciones)),
+        "predicciones_por_caracter": filas_caracteres,
+        "confianza_por_caracter": [item.get("confianza") for item in filas_caracteres],
+        "top3_por_caracter": [item.get("top3") for item in filas_caracteres],
+        "causa_probable": diagnostico.get("causa_probable"),
+        "mensaje": diagnostico.get("mensaje"),
+    }
+
+    registros = []
+    if ruta_json.exists():
+        try:
+            registros = json.loads(ruta_json.read_text(encoding="utf-8"))
+            if not isinstance(registros, list):
+                registros = []
+        except json.JSONDecodeError:
+            registros = []
+    registros.append(registro)
+    ruta_json.write_text(json.dumps(registros, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    fila_csv = {
+        "fecha_hora": registro["fecha_hora"],
+        "ruta_recorte": registro["ruta_recorte"],
+        "placa_esperada": registro["placa_esperada"],
+        "texto_crudo": registro["texto_crudo"],
+        "texto_postprocesado": registro["texto_postprocesado"],
+        "formato_valido": registro["formato_valido"],
+        "acierto": registro["acierto"],
+        "cantidad_esperada": registro["cantidad_esperada"],
+        "cantidad_detectada": registro["cantidad_detectada"],
+        "prediccion_por_caracter": json.dumps([item.get("prediccion") for item in filas_caracteres], ensure_ascii=False),
+        "confianza_por_caracter": json.dumps(registro["confianza_por_caracter"], ensure_ascii=False),
+        "top3_por_caracter": json.dumps(registro["top3_por_caracter"], ensure_ascii=False),
+        "causa_probable": registro["causa_probable"],
+        "mensaje": registro["mensaje"],
+    }
+    existe_csv = ruta_csv.exists()
+    with open(ruta_csv, "a", newline="", encoding="utf-8") as archivo:
+        writer = csv.DictWriter(archivo, fieldnames=list(fila_csv.keys()))
+        if not existe_csv:
+            writer.writeheader()
+        writer.writerow(fila_csv)
+
+    return {
+        "ruta_json": str(ruta_json),
+        "ruta_csv": str(ruta_csv),
     }
 
 
@@ -609,6 +956,7 @@ def registrar_reporte_ocr(resultado: dict, fuente_recorte: str, placa_esperada: 
         "valida_formato": resultado.get("formato", {}).get("valido"),
         "acierto": resultado.get("comparacion", {}).get("coincide"),
         "predicciones_caracteres": json.dumps(resultado.get("predicciones_caracteres", []), ensure_ascii=False),
+        "cambios_postprocesamiento": json.dumps(resultado.get("cambios_postprocesamiento", []), ensure_ascii=False),
         "cantidad_caracteres_segmentados": resultado.get("cantidad_caracteres_segmentados", 0),
         "estado": resultado.get("estado"),
         "mensaje": resultado.get("mensaje"),

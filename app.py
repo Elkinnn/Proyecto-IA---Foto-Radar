@@ -16,9 +16,28 @@ from src.pipeline import (
 )
 from src.fuzzy_system import clasificar_velocidad
 from src.notifier import generar_notificacion_simulada, guardar_notificacion_simulada
-from src.plate_reader import leer_placa_desde_recorte, registrar_reporte_ocr
+from src.plate_detector import PlateDetector
+from src.plate_reader import (
+    leer_placa_desde_recorte,
+    preprocesar_placa,
+    registrar_diagnostico_recorte,
+    registrar_reporte_ocr,
+    segmentar_caracteres_v2,
+)
 from src.speed_estimator import SpeedTracker
 from src.utils import cargar_config, guardar_archivo_subido
+from scripts.generar_caracteres_desde_placas_ecuador import (
+    CARACTERES_DIR as CARACTERES_ECUADOR_DIR,
+    CLASES as CLASES_CARACTERES_ECUADOR,
+    listar_imagenes_placas,
+    normalizar_placa_esperada,
+    preparar_recorte_placa,
+    guardar_caracteres as guardar_caracteres_ecuador,
+    registrar_auditoria_guardado as registrar_auditoria_guardado_caracteres,
+    validar_placa_para_guardado,
+    leer_labels as leer_labels_caracteres_ecuador,
+    escribir_labels as escribir_labels_caracteres_ecuador,
+)
 
 
 st.set_page_config(
@@ -145,17 +164,17 @@ def _mostrar_estado_flujo(resumen: dict, velocidad: dict, velocidad_kmh: float |
         estado_bd = "pendiente"
 
     estados = [
-        ("Detección de placa", "completado" if placa_detectada else "pendiente"),
-        ("Cruce Línea 1", "completado" if frame_linea_1 else "pendiente"),
-        ("Cruce Línea 2", "completado" if frame_linea_2 else "pendiente"),
+        ("DetecciÃ³n de placa", "completado" if placa_detectada else "pendiente"),
+        ("Cruce LÃ­nea 1", "completado" if frame_linea_1 else "pendiente"),
+        ("Cruce LÃ­nea 2", "completado" if frame_linea_2 else "pendiente"),
         ("Velocidad calculada", "completado" if velocidad_kmh is not None else "pendiente"),
-        ("Clasificación difusa", "completado" if difuso else ("pendiente" if velocidad_kmh is not None else "no_aplica")),
+        ("ClasificaciÃ³n difusa", "completado" if difuso else ("pendiente" if velocidad_kmh is not None else "no_aplica")),
         ("Consulta en base de datos", estado_bd),
         (
-            "Notificación simulada",
+            "NotificaciÃ³n simulada",
             "completado"
             if notificacion
-            else ("no_aplica" if difuso and difuso.get("nivel_infraccion") == "Sin infracción" else ("pendiente" if difuso else "no_aplica")),
+            else ("no_aplica" if difuso and difuso.get("nivel_infraccion") == "Sin infracciÃ³n" else ("pendiente" if difuso else "no_aplica")),
         ),
     ]
 
@@ -164,7 +183,7 @@ def _mostrar_estado_flujo(resumen: dict, velocidad: dict, velocidad_kmh: float |
         columnas[idx % 4].metric(nombre, _etiqueta_estado_flujo(estado))
 
     col_det1, col_det2, col_det3 = st.columns(3)
-    col_det1.metric("Placa detectada", "Sí" if placa_detectada else "No")
+    col_det1.metric("Placa detectada", "SÃ­" if placa_detectada else "No")
     confianza = ultima_deteccion.get("confianza")
     col_det2.metric("Confianza", f"{float(confianza):.2f}" if confianza is not None else "Pendiente")
     mejor_confianza = resumen.get("mejor_confianza_evento")
@@ -176,44 +195,44 @@ def _mostrar_estado_flujo(resumen: dict, velocidad: dict, velocidad_kmh: float |
         st.image(ruta_mejor_recorte, use_container_width=False)
 
     col_cruce1, col_cruce2 = st.columns(2)
-    col_cruce1.metric("Cruce Línea 1", "Sí" if frame_linea_1 else "No")
-    col_cruce1.caption(f"Frame Línea 1: {frame_linea_1 or 'Pendiente'}")
-    col_cruce2.metric("Cruce Línea 2", "Sí" if frame_linea_2 else "No")
-    col_cruce2.caption(f"Frame Línea 2: {frame_linea_2 or 'Pendiente'}")
+    col_cruce1.metric("Cruce LÃ­nea 1", "SÃ­" if frame_linea_1 else "No")
+    col_cruce1.caption(f"Frame LÃ­nea 1: {frame_linea_1 or 'Pendiente'}")
+    col_cruce2.metric("Cruce LÃ­nea 2", "SÃ­" if frame_linea_2 else "No")
+    col_cruce2.caption(f"Frame LÃ­nea 2: {frame_linea_2 or 'Pendiente'}")
 
     if frame_linea_1 and not frame_linea_2:
-        st.warning("La placa cruzó la Línea 1, pero no cruzó la Línea 2. No se puede calcular velocidad hasta completar el cruce entre ambas líneas.")
-        st.info("Esperando cruce de Línea 2.")
+        st.warning("La placa cruzÃ³ la LÃ­nea 1, pero no cruzÃ³ la LÃ­nea 2. No se puede calcular velocidad hasta completar el cruce entre ambas lÃ­neas.")
+        st.info("Esperando cruce de LÃ­nea 2.")
     elif not frame_linea_1:
-        st.info("Esperando que el centro de la placa cruce la Línea 1.")
+        st.info("Esperando que el centro de la placa cruce la LÃ­nea 1.")
 
 
 def _mostrar_diagnostico_monitoreo(resumen: dict, velocidad: dict, velocidad_kmh: float | None) -> None:
-    st.subheader("Diagnóstico del monitoreo")
+    st.subheader("DiagnÃ³stico del monitoreo")
 
     placa_detectada = bool(resumen.get("ultima_deteccion")) or resumen.get("estado_placa") in {"Detectada", "Mantenida"}
     frame_linea_1 = velocidad.get("frame_cruce_linea_1")
     frame_linea_2 = velocidad.get("frame_cruce_linea_2")
 
     if velocidad_kmh is not None:
-        motivo = "La medición de velocidad se completó correctamente."
-        recomendacion = "Revise el resultado difuso, la consulta en base de datos y la notificación si corresponde."
+        motivo = "La mediciÃ³n de velocidad se completÃ³ correctamente."
+        recomendacion = "Revise el resultado difuso, la consulta en base de datos y la notificaciÃ³n si corresponde."
     elif not placa_detectada:
-        motivo = "No se detectó placa válida."
-        recomendacion = "Ajuste confianza mínima, iluminación, enfoque, rotación, zona de cámara o posición del vehículo."
+        motivo = "No se detectÃ³ placa vÃ¡lida."
+        recomendacion = "Ajuste confianza mÃ­nima, iluminaciÃ³n, enfoque, rotaciÃ³n, zona de cÃ¡mara o posiciÃ³n del vehÃ­culo."
     elif not frame_linea_1:
-        motivo = "La placa fue detectada, pero el centro de la placa todavía no cruzó la Línea 1."
-        recomendacion = "Ubique la Línea 1 sobre la trayectoria real de la placa o use un video donde el vehículo avance hacia ambas líneas."
+        motivo = "La placa fue detectada, pero el centro de la placa todavÃ­a no cruzÃ³ la LÃ­nea 1."
+        recomendacion = "Ubique la LÃ­nea 1 sobre la trayectoria real de la placa o use un video donde el vehÃ­culo avance hacia ambas lÃ­neas."
     elif frame_linea_1 and not frame_linea_2:
-        motivo = "La placa no cruzó Línea 2."
-        recomendacion = "Use un video donde el vehículo pase completamente entre ambas líneas o ajuste la posición de Línea 2."
+        motivo = "La placa no cruzÃ³ LÃ­nea 2."
+        recomendacion = "Use un video donde el vehÃ­culo pase completamente entre ambas lÃ­neas o ajuste la posiciÃ³n de LÃ­nea 2."
     else:
-        motivo = "La detección fue válida, pero no hubo movimiento suficiente para medir velocidad."
-        recomendacion = "Verifique que la cámara esté fija, que la placa se desplace de arriba hacia abajo y que las líneas estén separadas correctamente."
+        motivo = "La detecciÃ³n fue vÃ¡lida, pero no hubo movimiento suficiente para medir velocidad."
+        recomendacion = "Verifique que la cÃ¡mara estÃ© fija, que la placa se desplace de arriba hacia abajo y que las lÃ­neas estÃ©n separadas correctamente."
 
     col_diag1, col_diag2 = st.columns(2)
     col_diag1.info(f"Motivo: {motivo}")
-    col_diag2.info(f"Recomendación: {recomendacion}")
+    col_diag2.info(f"RecomendaciÃ³n: {recomendacion}")
 
     mensaje_detector = resumen.get("mensaje_detector")
     if mensaje_detector:
@@ -384,7 +403,7 @@ def ejecutar_simulacion_velocidad(
             vehiculo=vehiculo,
             evidencia_frame=str(rutas["calculada"]) if guardo_calculada else None,
             evidencia_placa=None,
-            fuente="Simulación de velocidad",
+            fuente="SimulaciÃ³n de velocidad",
             ruta_bd=ruta_bd,
         )
         notificacion = _generar_notificacion_para_evento(evento_id, evento, vehiculo, difuso)
@@ -460,7 +479,7 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
     col9.metric("Velocidad", resumen.get("velocidad_reproduccion", "Pendiente"))
 
     col10, _, _ = st.columns(3)
-    col10.metric("Rotacion aplicada", resumen.get("rotacion", "Sin rotación"))
+    col10.metric("Rotacion aplicada", resumen.get("rotacion", "Sin rotaciÃ³n"))
 
     st.info(resumen.get("mensaje_estado", "Sin estado disponible."))
     if not resumen.get("modelo_detector_disponible"):
@@ -527,37 +546,37 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
 
     _mostrar_estado_flujo(resumen, velocidad, velocidad_kmh)
 
-    st.subheader("Clasificación difusa")
+    st.subheader("ClasificaciÃ³n difusa")
     if velocidad_kmh is not None:
         difuso = resumen.get("clasificacion_difusa") or clasificar_velocidad(velocidad_kmh, resumen.get("limite_velocidad_kmh", 30.0))
         col_dif1, col_dif2, col_dif3 = st.columns(3)
         col_dif1.metric("Estado difuso", difuso["estado"])
-        col_dif2.metric("Nivel de infracción", difuso["nivel_infraccion"])
-        col_dif3.metric("Horas de suspensión", difuso["horas_suspension"])
+        col_dif2.metric("Nivel de infracciÃ³n", difuso["nivel_infraccion"])
+        col_dif3.metric("Horas de suspensiÃ³n", difuso["horas_suspension"])
 
         col_dif4, col_dif5 = st.columns(2)
-        col_dif4.metric("Sanción", difuso["sancion"])
-        col_dif5.metric("Límite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
+        col_dif4.metric("SanciÃ³n", difuso["sancion"])
+        col_dif5.metric("LÃ­mite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
         st.info(difuso["mensaje"])
     else:
         col_dif1, col_dif2, col_dif3 = st.columns(3)
         col_dif1.metric("Estado difuso", "Pendiente")
-        col_dif2.metric("Nivel de infracción", "Pendiente")
-        col_dif3.metric("Sanción", "Pendiente")
+        col_dif2.metric("Nivel de infracciÃ³n", "Pendiente")
+        col_dif3.metric("SanciÃ³n", "Pendiente")
 
     if resumen.get("placa_controlada") or resumen.get("evento_bd_id"):
         st.subheader("Resultado del evento")
         vehiculo = resumen.get("vehiculo") or {}
         difuso_evento = resumen.get("clasificacion_difusa") or {}
         notificacion = resumen.get("notificacion_simulada")
-        vehiculo_encontrado = "Sí" if resumen.get("vehiculo_encontrado") else "No"
+        vehiculo_encontrado = "SÃ­" if resumen.get("vehiculo_encontrado") else "No"
 
         if resumen.get("vehiculo_encontrado") is False:
             st.warning("Placa no encontrada en la base de datos.")
 
         col_evt_res1, col_evt_res2, col_evt_res3 = st.columns(3)
         col_evt_res1.metric("Placa usada", resumen.get("placa_controlada", "Pendiente"))
-        col_evt_res2.metric("Vehículo encontrado", vehiculo_encontrado)
+        col_evt_res2.metric("VehÃ­culo encontrado", vehiculo_encontrado)
         col_evt_res3.metric("Evento ID", resumen.get("evento_bd_id", "Pendiente"))
 
         col_evt_res4, col_evt_res5, col_evt_res6 = st.columns(3)
@@ -571,24 +590,24 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
         col_evt_res9.metric("Velocidad calculada", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
 
         col_evt_res10, col_evt_res11, col_evt_res12 = st.columns(3)
-        col_evt_res10.metric("Límite de velocidad", f"{resumen.get('limite_velocidad_kmh', 0):.1f} km/h")
+        col_evt_res10.metric("LÃ­mite de velocidad", f"{resumen.get('limite_velocidad_kmh', 0):.1f} km/h")
         col_evt_res11.metric("Estado difuso", difuso_evento.get("estado", "Pendiente"))
-        col_evt_res12.metric("Nivel de infracción", difuso_evento.get("nivel_infraccion", "Pendiente"))
+        col_evt_res12.metric("Nivel de infracciÃ³n", difuso_evento.get("nivel_infraccion", "Pendiente"))
 
         col_evt_res13, col_evt_res14, col_evt_res15 = st.columns(3)
-        col_evt_res13.metric("Sanción", difuso_evento.get("sancion", "Pendiente"))
-        col_evt_res14.metric("Horas de suspensión", difuso_evento.get("horas_suspension", "Pendiente"))
-        col_evt_res15.metric("Notificación generada", "Sí" if notificacion else "No")
+        col_evt_res13.metric("SanciÃ³n", difuso_evento.get("sancion", "Pendiente"))
+        col_evt_res14.metric("Horas de suspensiÃ³n", difuso_evento.get("horas_suspension", "Pendiente"))
+        col_evt_res15.metric("NotificaciÃ³n generada", "SÃ­" if notificacion else "No")
 
         if notificacion:
             col_not1, col_not2 = st.columns(2)
             col_not1.metric("Destinatario", notificacion.get("destinatario") or "Sin correo")
             col_not2.metric("Asunto", notificacion.get("asunto") or "Pendiente")
             col_not3, col_not4 = st.columns(2)
-            col_not3.metric("Ruta TXT notificación", notificacion.get("ruta_txt") or "Pendiente")
-            col_not4.metric("Ruta JSON notificación", notificacion.get("ruta_json") or "Pendiente")
+            col_not3.metric("Ruta TXT notificaciÃ³n", notificacion.get("ruta_txt") or "Pendiente")
+            col_not4.metric("Ruta JSON notificaciÃ³n", notificacion.get("ruta_json") or "Pendiente")
         elif resumen.get("evento_bd_id"):
-            st.info("No se generó notificación porque no existe infracción.")
+            st.info("No se generÃ³ notificaciÃ³n porque no existe infracciÃ³n.")
 
     _mostrar_diagnostico_monitoreo(resumen, velocidad, velocidad_kmh)
 
@@ -699,15 +718,15 @@ def pestana_monitoreo(config: dict) -> None:
                 "Placa manual/controlada para consulta",
                 value="PBC1234",
                 help=(
-                    "Este campo se usa temporalmente hasta integrar OCR automático. "
+                    "Este campo se usa temporalmente hasta integrar OCR automÃ¡tico. "
                     "El detector ubica visualmente la placa, pero el texto se ingresa de forma controlada "
                     "para probar BD, fuzzy, eventos y notificaciones."
                 ),
             )
 
         rotacion = st.selectbox(
-            "Rotación de imagen",
-            ["Sin rotación", "Rotar 90° derecha", "Rotar 90° izquierda", "Rotar 180°"],
+            "RotaciÃ³n de imagen",
+            ["Sin rotaciÃ³n", "Rotar 90Â° derecha", "Rotar 90Â° izquierda", "Rotar 180Â°"],
             index=0,
         )
 
@@ -832,7 +851,7 @@ def pestana_monitoreo(config: dict) -> None:
         st.warning("No se pudo iniciar el monitoreo: primero carga un video.")
         return
     if (iniciar or procesar_siguiente) and posicion_linea_2 <= posicion_linea_1:
-        st.warning("La Línea 2 debe estar debajo de la Línea 1 para medir movimiento de arriba hacia abajo.")
+        st.warning("La LÃ­nea 2 debe estar debajo de la LÃ­nea 1 para medir movimiento de arriba hacia abajo.")
         return
 
     if fuente_monitoreo == "Video de prueba" and (iniciar or procesar_siguiente) and not st.session_state.get("ruta_video_monitoreo"):
@@ -1003,46 +1022,46 @@ def pestana_pruebas(config: dict) -> None:
         else:
             ruta_imagen = None
 
-    with st.expander("Simulación de velocidad", expanded=True):
+    with st.expander("SimulaciÃ³n de velocidad", expanded=True):
         col_sim1, col_sim2 = st.columns(2)
         with col_sim1:
             fps_simulado = st.number_input("FPS simulado", min_value=1.0, value=30.0, step=1.0)
             placa_simulada = st.text_input(
                 "Placa manual/controlada",
                 value="PBC1234",
-                help="Valor temporal para probar base de datos y eventos hasta integrar OCR automático.",
+                help="Valor temporal para probar base de datos y eventos hasta integrar OCR automÃ¡tico.",
             )
             distancia_simulada = st.number_input(
-                "Distancia real entre líneas en metros",
+                "Distancia real entre lÃ­neas en metros",
                 min_value=0.1,
                 value=10.0,
                 step=0.5,
                 key="distancia_simulacion_velocidad",
             )
             limite_simulado = st.number_input(
-                "Límite de velocidad del campus (km/h)",
+                "LÃ­mite de velocidad del campus (km/h)",
                 min_value=1.0,
                 value=30.0,
                 step=1.0,
                 key="limite_simulacion_velocidad",
             )
-            posicion_sim_linea_1 = st.slider("Posición Línea 1 (% altura)", 0.05, 0.95, 0.35, 0.01)
-            posicion_sim_linea_2 = st.slider("Posición Línea 2 (% altura)", 0.05, 0.95, 0.75, 0.01)
+            posicion_sim_linea_1 = st.slider("PosiciÃ³n LÃ­nea 1 (% altura)", 0.05, 0.95, 0.35, 0.01)
+            posicion_sim_linea_2 = st.slider("PosiciÃ³n LÃ­nea 2 (% altura)", 0.05, 0.95, 0.75, 0.01)
         with col_sim2:
             frame_inicial_sim = st.number_input("Frame inicial de la placa", min_value=0, value=0, step=1)
-            frame_cruce_linea_1_sim = st.number_input("Frame en que cruza Línea 1", min_value=0, value=30, step=1)
-            frame_cruce_linea_2_sim = st.number_input("Frame en que cruza Línea 2", min_value=0, value=75, step=1)
+            frame_cruce_linea_1_sim = st.number_input("Frame en que cruza LÃ­nea 1", min_value=0, value=30, step=1)
+            frame_cruce_linea_2_sim = st.number_input("Frame en que cruza LÃ­nea 2", min_value=0, value=75, step=1)
             total_frames_sim = st.number_input("Total de frames simulados", min_value=1, value=120, step=1)
 
-        ejecutar_simulacion = st.button("Ejecutar simulación de velocidad", type="primary")
+        ejecutar_simulacion = st.button("Ejecutar simulaciÃ³n de velocidad", type="primary")
 
         if ejecutar_simulacion:
             if posicion_sim_linea_2 <= posicion_sim_linea_1:
-                st.warning("La Línea 2 debe estar debajo de la Línea 1 para simular movimiento de arriba hacia abajo.")
+                st.warning("La LÃ­nea 2 debe estar debajo de la LÃ­nea 1 para simular movimiento de arriba hacia abajo.")
             elif frame_cruce_linea_2_sim <= frame_cruce_linea_1_sim:
-                st.warning("El frame de cruce de Línea 2 debe ser mayor que el frame de cruce de Línea 1.")
+                st.warning("El frame de cruce de LÃ­nea 2 debe ser mayor que el frame de cruce de LÃ­nea 1.")
             elif total_frames_sim <= frame_cruce_linea_2_sim:
-                st.warning("El total de frames simulados debe ser mayor que el frame de cruce de Línea 2.")
+                st.warning("El total de frames simulados debe ser mayor que el frame de cruce de LÃ­nea 2.")
             else:
                 resultado_simulacion = ejecutar_simulacion_velocidad(
                     fps=float(fps_simulado),
@@ -1062,32 +1081,32 @@ def pestana_pruebas(config: dict) -> None:
                 difuso = resultado_simulacion.get("difuso")
 
                 col_res1, col_res2, col_res3 = st.columns(3)
-                col_res1.metric("Frame cruce Línea 1", resumen_velocidad.get("frame_cruce_linea_1") or "Pendiente")
-                col_res2.metric("Frame cruce Línea 2", resumen_velocidad.get("frame_cruce_linea_2") or "Pendiente")
+                col_res1.metric("Frame cruce LÃ­nea 1", resumen_velocidad.get("frame_cruce_linea_1") or "Pendiente")
+                col_res2.metric("Frame cruce LÃ­nea 2", resumen_velocidad.get("frame_cruce_linea_2") or "Pendiente")
                 col_res3.metric("Estado tracker", resumen_velocidad.get("estado", "Pendiente"))
 
                 col_res4, col_res5, col_res6 = st.columns(3)
                 tiempo_entre = resumen_velocidad.get("tiempo_entre_lineas")
                 velocidad_kmh = resumen_velocidad.get("velocidad_kmh")
-                col_res4.metric("Tiempo entre líneas", f"{tiempo_entre:.3f} s" if tiempo_entre is not None else "Pendiente")
+                col_res4.metric("Tiempo entre lÃ­neas", f"{tiempo_entre:.3f} s" if tiempo_entre is not None else "Pendiente")
                 col_res5.metric("Distancia configurada", f"{distancia_simulada:.1f} m")
                 col_res6.metric("Velocidad calculada", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
 
                 if difuso:
-                    st.subheader("Clasificación difusa de la simulación")
+                    st.subheader("ClasificaciÃ³n difusa de la simulaciÃ³n")
                     col_dif1, col_dif2, col_dif3 = st.columns(3)
                     col_dif1.metric("Estado", difuso["estado"])
-                    col_dif2.metric("Nivel de infracción", difuso["nivel_infraccion"])
-                    col_dif3.metric("Horas de suspensión", difuso["horas_suspension"])
+                    col_dif2.metric("Nivel de infracciÃ³n", difuso["nivel_infraccion"])
+                    col_dif3.metric("Horas de suspensiÃ³n", difuso["horas_suspension"])
 
                     col_dif4, col_dif5 = st.columns(2)
-                    col_dif4.metric("Sanción", difuso["sancion"])
-                    col_dif5.metric("Límite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
+                    col_dif4.metric("SanciÃ³n", difuso["sancion"])
+                    col_dif5.metric("LÃ­mite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
                     st.info(difuso["mensaje"])
                     st.json(difuso["grados"])
 
                 vehiculo = resultado_simulacion.get("vehiculo")
-                st.subheader("Vehículo consultado")
+                st.subheader("VehÃ­culo consultado")
                 if vehiculo:
                     col_veh1, col_veh2, col_veh3 = st.columns(3)
                     col_veh1.metric("Marca", vehiculo.get("marca", "Sin registro"))
@@ -1099,28 +1118,311 @@ def pestana_pruebas(config: dict) -> None:
                     col_veh5.metric("Correo", vehiculo.get("correo", "Sin registro"))
                     col_veh6.metric("Estado", vehiculo.get("estado", "Sin registro"))
                 else:
-                    st.warning("La placa no existe en la base de datos de vehículos.")
+                    st.warning("La placa no existe en la base de datos de vehÃ­culos.")
 
                 st.success(f"Evento guardado en base de datos con ID: {resultado_simulacion.get('evento_id')}")
 
                 notificacion = resultado_simulacion.get("notificacion")
                 if notificacion:
-                    st.subheader("Notificación simulada")
+                    st.subheader("NotificaciÃ³n simulada")
                     st.metric("Destinatario", notificacion.get("destinatario") or "Sin correo")
                     st.caption(f"Asunto: {notificacion.get('asunto')}")
                     st.text_area("Mensaje", notificacion.get("mensaje", ""), height=260)
                     st.caption(f"TXT: {notificacion.get('ruta_txt')}")
                     st.caption(f"JSON: {notificacion.get('ruta_json')}")
                 else:
-                    st.info("No se generó notificación porque no existe infracción.")
+                    st.info("No se generÃ³ notificaciÃ³n porque no existe infracciÃ³n.")
 
                 frame_final_rgb = resultado_simulacion.get("frame_final_rgb")
                 if frame_final_rgb is not None:
-                    st.image(frame_final_rgb, channels="RGB", caption="Frame final de la simulación", width=640)
+                    st.image(frame_final_rgb, channels="RGB", caption="Frame final de la simulaciÃ³n", width=640)
 
                 st.caption(f"Evidencias guardadas en: reports/evidencias/simulacion_velocidad/")
                 st.caption(f"Resumen JSON: {resultado_simulacion['ruta_json']}")
                 st.json(datos_simulacion)
+
+    with st.expander("Generar caracteres desde placas ecuatorianas", expanded=False):
+        st.caption(
+            "Use esta herramienta para reforzar el dataset OCR con caracteres segmentados de placas reales. "
+            "No usa OCR externo ni entrena el modelo."
+        )
+        imagenes_placas = listar_imagenes_placas()
+        placa_generacion = st.text_input(
+            "Placa esperada",
+            value="",
+            key="placa_generacion_caracteres",
+            help="Formato aceptado: ABC123, ABC1234, ABC-123 o ABC-1234.",
+        )
+        usar_yolo_generacion = st.checkbox(
+            "Usar YOLO si la imagen no parece recorte de placa",
+            value=False,
+            key="usar_yolo_generacion_caracteres",
+        )
+
+        if not imagenes_placas:
+            st.info("No se encontraron imagenes en datasets/placas_ecuador/.")
+        else:
+            imagen_seleccionada = st.selectbox(
+                "Imagen fuente",
+                imagenes_placas,
+                format_func=lambda ruta: str(ruta.relative_to(Path.cwd())),
+                key="imagen_generacion_caracteres",
+            )
+            st.image(str(imagen_seleccionada), caption="Imagen seleccionada", use_container_width=False)
+
+            col_gen_a, col_gen_b = st.columns(2)
+            segmentar_generacion = col_gen_a.button("Segmentar caracteres", type="primary")
+            guardar_generacion = col_gen_b.button("Guardar caracteres segmentados")
+
+            if segmentar_generacion:
+                placa_normalizada = normalizar_placa_esperada(placa_generacion)
+                if not placa_normalizada:
+                    st.warning("Ingrese una placa esperada valida antes de segmentar.")
+                else:
+                    imagen_cv = cv2.imread(str(imagen_seleccionada))
+                    if imagen_cv is None:
+                        st.error("No se pudo cargar la imagen seleccionada.")
+                    else:
+                        detector = PlateDetector() if usar_yolo_generacion else None
+                        ruta_recorte, estado_recorte, motivo_recorte = preparar_recorte_placa(
+                            imagen_seleccionada,
+                            imagen_cv,
+                            usar_yolo_generacion,
+                            detector,
+                        )
+                        if ruta_recorte is None:
+                            st.warning(motivo_recorte or "No se pudo obtener recorte de placa.")
+                        else:
+                            nombre_base = f"{imagen_seleccionada.stem}_{placa_normalizada}_{estado_recorte}"
+                            preprocesamiento = preprocesar_placa(str(ruta_recorte), nombre_base)
+                            ruta_preprocesada = preprocesamiento.get("ruta_imagen_procesada")
+                            if not ruta_preprocesada:
+                                st.error(preprocesamiento.get("mensaje", "Error de preprocesamiento."))
+                            else:
+                                segmentacion = segmentar_caracteres_v2(ruta_preprocesada, nombre_base)
+                                caracteres = segmentacion.get("caracteres", [])
+                                st.session_state["generacion_caracteres_ecuador"] = {
+                                    "ruta_original": imagen_seleccionada,
+                                    "placa": placa_normalizada,
+                                    "ruta_recorte": str(ruta_recorte),
+                                    "preprocesamiento": preprocesamiento,
+                                    "segmentacion": segmentacion,
+                                    "caracteres": caracteres,
+                                }
+
+            resultado_generacion = st.session_state.get("generacion_caracteres_ecuador")
+            if resultado_generacion:
+                placa_normalizada = resultado_generacion["placa"]
+                caracteres = resultado_generacion.get("caracteres", [])
+                cantidad_esperada = len(placa_normalizada)
+                cantidad_segmentada = len(caracteres)
+
+                col_res_1, col_res_2, col_res_3 = st.columns(3)
+                col_res_1.metric("Placa normalizada", placa_normalizada)
+                col_res_2.metric("Caracteres esperados", cantidad_esperada)
+                col_res_3.metric("Caracteres segmentados", cantidad_segmentada)
+
+                ruta_preprocesada = resultado_generacion.get("preprocesamiento", {}).get("ruta_imagen_procesada")
+                if ruta_preprocesada:
+                    st.image(ruta_preprocesada, caption="Placa preprocesada", use_container_width=False)
+                ruta_banda = resultado_generacion.get("segmentacion", {}).get("ruta_banda")
+                if ruta_banda:
+                    st.image(ruta_banda, caption="Banda de caracteres", use_container_width=False)
+                ruta_debug = resultado_generacion.get("segmentacion", {}).get("ruta_debug")
+                if ruta_debug:
+                    st.image(ruta_debug, caption="Debug de segmentacion", use_container_width=False)
+
+                if caracteres:
+                    columnas = st.columns(min(len(caracteres), 8))
+                    indices_guardar = []
+                    for idx, caracter in enumerate(caracteres[:16]):
+                        etiqueta = placa_normalizada[idx] if idx < len(placa_normalizada) else ""
+                        columna = columnas[idx % len(columnas)]
+                        columna.image(
+                            caracter["ruta_caracter"],
+                            caption=f"{idx + 1}: {etiqueta}",
+                            use_container_width=True,
+                        )
+                        guardar_item = columna.checkbox(
+                            "Guardar este caracter",
+                            value=True,
+                            key=f"guardar_caracter_ecuador_{resultado_generacion['ruta_original']}_{placa_normalizada}_{idx}",
+                        )
+                        if guardar_item:
+                            indices_guardar.append(idx)
+                    st.session_state["indices_guardar_caracteres_ecuador"] = indices_guardar
+                    st.caption(
+                        f"Caracteres seleccionados para guardar: {len(indices_guardar)} de {cantidad_esperada} esperados."
+                    )
+                else:
+                    indices_guardar = []
+
+                if cantidad_segmentada != cantidad_esperada:
+                    st.warning("No se guardan caracteres porque la cantidad segmentada no coincide con la placa esperada.")
+                    st.info("Puede desmarcar segmentos de ruido y guardar solo si los caracteres seleccionados coinciden con la placa esperada.")
+
+                if guardar_generacion:
+                    indices_guardar = st.session_state.get("indices_guardar_caracteres_ecuador", [])
+                    placa_valida, motivo_placa = validar_placa_para_guardado(placa_normalizada)
+                    caracteres_validos = all(caracter in CLASES_CARACTERES_ECUADOR for caracter in placa_normalizada)
+                    if not placa_valida or not caracteres_validos:
+                        st.warning(motivo_placa or "La placa esperada contiene caracteres no permitidos.")
+                        registrar_auditoria_guardado_caracteres(
+                            resultado_generacion["ruta_original"],
+                            placa_generacion,
+                            placa_normalizada,
+                            "no_guardado",
+                            motivo_placa or "Caracteres no permitidos.",
+                            cantidad_segmentada,
+                            cantidad_esperada,
+                            [],
+                        )
+                    elif len(indices_guardar) != cantidad_esperada:
+                        mensaje_no_guardado = "No se guardan caracteres porque la cantidad segmentada no coincide con la placa esperada."
+                        st.warning(mensaje_no_guardado)
+                        registrar_auditoria_guardado_caracteres(
+                            resultado_generacion["ruta_original"],
+                            placa_generacion,
+                            placa_normalizada,
+                            "no_guardado",
+                            mensaje_no_guardado,
+                            cantidad_segmentada,
+                            cantidad_esperada,
+                            [],
+                        )
+                    else:
+                        filas = leer_labels_caracteres_ecuador()
+                        existentes = {
+                            fila.get("ruta_imagen", "")
+                            for fila in filas
+                            if fila.get("origen") == "caracter_ecuador_segmentado"
+                        }
+                        try:
+                            cantidad, rutas = guardar_caracteres_ecuador(
+                                resultado_generacion["ruta_original"],
+                                placa_normalizada,
+                                caracteres,
+                                filas,
+                                existentes,
+                                dry_run=False,
+                                indices_guardar=indices_guardar,
+                            )
+                        except ValueError as exc:
+                            st.warning(str(exc))
+                            registrar_auditoria_guardado_caracteres(
+                                resultado_generacion["ruta_original"],
+                                placa_generacion,
+                                placa_normalizada,
+                                "no_guardado",
+                                str(exc),
+                                cantidad_segmentada,
+                                cantidad_esperada,
+                                [],
+                            )
+                        else:
+                            escribir_labels_caracteres_ecuador(filas)
+                            registrar_auditoria_guardado_caracteres(
+                                resultado_generacion["ruta_original"],
+                                placa_generacion,
+                                placa_normalizada,
+                                "guardado",
+                                "Caracteres guardados usando etiquetas de placa esperada manual.",
+                                cantidad_segmentada,
+                                cantidad_esperada,
+                                rutas,
+                            )
+                            st.success(f"Caracteres guardados: {cantidad}")
+                            st.caption(f"Destino: {CARACTERES_ECUADOR_DIR}")
+                            if rutas:
+                                st.write(rutas)
+
+    with st.expander("Diagnóstico YOLO placas", expanded=False):
+        st.caption("Diagnóstico aislado del detector YOLO. No ejecuta OCR ni modifica el modelo.")
+        detector_yolo = PlateDetector()
+        modelo_existe = detector_yolo.model_path.exists()
+        clases_modelo = getattr(detector_yolo.model, "names", {}) if detector_yolo.model is not None else {}
+
+        col_yolo_info1, col_yolo_info2, col_yolo_info3 = st.columns(3)
+        col_yolo_info1.metric("Modelo YOLO", str(detector_yolo.model_path))
+        col_yolo_info2.metric("Modelo existe", "Sí" if modelo_existe else "No")
+        col_yolo_info3.metric("Estado carga", detector_yolo.estado)
+        st.caption(f"Clases del modelo: {clases_modelo}")
+
+        rutas_yolo = []
+        for carpeta in [
+            Path("datasets") / "placas_ecuador" / "images",
+            Path("reports") / "evidencias" / "monitoreo_video",
+            Path("reports") / "evidencias" / "eventos_placa",
+        ]:
+            if carpeta.exists():
+                rutas_yolo.extend(
+                    sorted(
+                        ruta
+                        for ruta in carpeta.rglob("*")
+                        if ruta.is_file() and ruta.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
+                    )
+                )
+
+        conf_yolo_diag = st.slider("Confidence threshold YOLO", 0.05, 0.90, 0.25, 0.05)
+        ruta_yolo = None
+        if rutas_yolo:
+            ruta_yolo = st.selectbox(
+                "Imagen de prueba",
+                rutas_yolo,
+                format_func=lambda ruta: str(ruta),
+                key="imagen_diagnostico_yolo",
+            )
+            st.image(str(ruta_yolo), caption="Imagen original", use_container_width=False)
+        else:
+            st.info("No se encontraron imágenes en datasets/placas_ecuador/images ni evidencias.")
+
+        if st.button("Ejecutar detección YOLO", type="primary"):
+            if ruta_yolo is None:
+                st.warning("Selecciona una imagen antes de ejecutar YOLO.")
+            elif detector_yolo.model is None:
+                st.error(detector_yolo.estado)
+            else:
+                imagen = cv2.imread(str(ruta_yolo))
+                if imagen is None:
+                    st.error("No se pudo leer la imagen seleccionada.")
+                else:
+                    resultado_yolo = detector_yolo.detectar_en_frame(imagen, conf_min=float(conf_yolo_diag))
+                    st.metric("Confidence threshold usado", f"{conf_yolo_diag:.2f}")
+                    st.info(resultado_yolo.get("mensaje", "Sin mensaje."))
+                    frame_rgb = cv2.cvtColor(resultado_yolo["frame_procesado"], cv2.COLOR_BGR2RGB)
+                    st.image(frame_rgb, caption="Resultado con bounding boxes", use_container_width=False)
+
+                    detecciones = resultado_yolo.get("detecciones", [])
+                    col_yolo_res1, col_yolo_res2, col_yolo_res3 = st.columns(3)
+                    col_yolo_res1.metric("Detectada", "Sí" if resultado_yolo.get("detectada") else "No")
+                    col_yolo_res2.metric("Detecciones válidas", len(detecciones))
+                    col_yolo_res3.metric("Detecciones brutas", resultado_yolo.get("detecciones_brutas", 0))
+
+                    if not detecciones:
+                        debug = resultado_yolo.get("debug_detecciones") or []
+                        motivo = debug[-1].get("motivo_rechazo") if debug else "Sin detección YOLO sobre el threshold."
+                        st.warning(f"Motivo: {motivo}")
+                    else:
+                        filas_yolo = []
+                        columnas_recortes = st.columns(min(len(detecciones), 4))
+                        for idx, det in enumerate(detecciones, start=1):
+                            bbox = det.get("bbox", [])
+                            filas_yolo.append(
+                                {
+                                    "idx": idx,
+                                    "confianza": round(float(det.get("confianza", 0.0)), 4),
+                                    "bbox": bbox,
+                                    "area_relativa": round(float(det.get("area_relativa", 0.0)), 6),
+                                }
+                            )
+                            recorte = det.get("recorte_placa")
+                            if recorte is not None:
+                                columnas_recortes[(idx - 1) % len(columnas_recortes)].image(
+                                    cv2.cvtColor(recorte, cv2.COLOR_BGR2RGB),
+                                    caption=f"Recorte {idx}",
+                                    use_container_width=True,
+                                )
+                        st.dataframe(pd.DataFrame(filas_yolo), use_container_width=True)
 
     with st.expander("OCR experimental sobre recortes", expanded=False):
         recortes, fuente_recorte = _buscar_recortes_ocr()
@@ -1129,9 +1431,14 @@ def pestana_pruebas(config: dict) -> None:
             ["Recorte generado por el sistema", "Carga manual"],
             horizontal=True,
         )
-        placa_esperada_ocr = st.text_input("Placa esperada", value="", key="placa_esperada_ocr")
+        placa_esperada_ocr = st.text_input(
+            "Placa esperada para diagnostico",
+            value="",
+            key="placa_esperada_ocr",
+            help="Opcional. Ejemplos: PDZ279, PDP6236, TDH493. Se usa solo para comparar caracter por caracter.",
+        )
         metodo_segmentacion_ocr = st.selectbox(
-            "Método de segmentación",
+            "MÃ©todo de segmentaciÃ³n",
             ["v2_banda_caracteres", "v1_contornos_globales"],
             index=0,
         )
@@ -1171,6 +1478,7 @@ def pestana_pruebas(config: dict) -> None:
                     metodo_segmentacion=metodo_segmentacion_ocr,
                 )
                 reporte_ocr = registrar_reporte_ocr(resultado_ocr, fuente_ocr, placa_esperada_ocr)
+                reporte_diagnostico = registrar_diagnostico_recorte(resultado_ocr, placa_esperada_ocr)
 
                 col_ocr1, col_ocr2, col_ocr3 = st.columns(3)
                 col_ocr1.metric("Texto detectado crudo", resultado_ocr.get("texto_detectado_crudo") or resultado_ocr["texto_detectado"])
@@ -1180,17 +1488,33 @@ def pestana_pruebas(config: dict) -> None:
                 formato = resultado_ocr.get("formato", {})
                 comparacion = resultado_ocr.get("comparacion", {})
                 col_ocr4, col_ocr5, col_ocr6 = st.columns(3)
-                col_ocr4.metric("Formato válido", "Sí" if formato.get("valido") else "No")
-                col_ocr5.metric("Acierto", "Sí" if comparacion.get("coincide") else "No")
+                col_ocr4.metric("Formato vÃ¡lido", "SÃ­" if formato.get("valido") else "No")
+                col_ocr5.metric("Acierto", "SÃ­" if comparacion.get("coincide") else "No")
                 col_ocr6.metric("Caracteres aceptados", resultado_ocr["cantidad_caracteres_segmentados"])
 
                 col_ocr7, col_ocr8 = st.columns(2)
                 col_ocr7.metric("Contornos rechazados", resultado_ocr.get("cantidad_contornos_rechazados", 0))
-                col_ocr8.metric("Método", resultado_ocr.get("metodo_segmentacion", metodo_segmentacion_ocr))
+                col_ocr8.metric("MÃ©todo", resultado_ocr.get("metodo_segmentacion", metodo_segmentacion_ocr))
 
                 st.caption(f"Estado: {resultado_ocr['estado']}")
                 st.info(resultado_ocr["mensaje"])
-                st.caption(comparacion.get("mensaje", "Sin comparación."))
+                st.caption(comparacion.get("mensaje", "Sin comparaciÃ³n."))
+
+                diagnostico = resultado_ocr.get("diagnostico", {})
+                st.subheader("Diagnostico del OCR real")
+                col_diag1, col_diag2, col_diag3 = st.columns(3)
+                col_diag1.metric("Caracteres esperados", diagnostico.get("cantidad_esperada", 0))
+                col_diag2.metric("Caracteres detectados", diagnostico.get("cantidad_detectada", 0))
+                col_diag3.metric("Causa probable", diagnostico.get("causa_probable", "Sin diagnostico"))
+                st.info(diagnostico.get("mensaje", "Sin diagnostico disponible."))
+                if diagnostico.get("cantidad_esperada") and diagnostico.get("cantidad_detectada") != diagnostico.get("cantidad_esperada"):
+                    st.warning(
+                        "Caracteres esperados: "
+                        + " ".join(diagnostico.get("caracteres_esperados", []))
+                        + " | Caracteres detectados: "
+                        + " ".join(diagnostico.get("caracteres_detectados", []))
+                        + ". Posible causa: segmentacion incompleta o caracteres descartados."
+                    )
 
                 preprocesamiento = resultado_ocr.get("preprocesamiento", {})
                 ruta_preprocesada = preprocesamiento.get("ruta_imagen_procesada")
@@ -1203,7 +1527,7 @@ def pestana_pruebas(config: dict) -> None:
 
                 ruta_debug = resultado_ocr.get("ruta_debug_segmentacion")
                 if ruta_debug:
-                    st.image(ruta_debug, caption="Debug segmentación: verde aceptado, rojo rechazado", use_container_width=False)
+                    st.image(ruta_debug, caption="Debug segmentaciÃ³n: verde aceptado, rojo rechazado", use_container_width=False)
 
                 motivos_rechazo = resultado_ocr.get("motivos_rechazo") or {}
                 if motivos_rechazo:
@@ -1220,12 +1544,19 @@ def pestana_pruebas(config: dict) -> None:
                     st.warning("No se segmentaron caracteres con los filtros actuales.")
 
                 predicciones = resultado_ocr.get("predicciones_caracteres") or []
+                diagnostico_caracteres = resultado_ocr.get("diagnostico", {}).get("diagnostico_caracteres") or []
                 if predicciones:
-                    st.subheader("Predicciones por carácter")
+                    st.subheader("Predicciones por carÃ¡cter")
                     for pred in predicciones:
-                        col_img, col_info = st.columns([0.18, 0.82])
+                        indice_pred = int(pred.get("indice", 1))
+                        esperado_pred = ""
+                        if indice_pred - 1 < len(diagnostico_caracteres):
+                            esperado_pred = diagnostico_caracteres[indice_pred - 1].get("etiqueta_esperada", "")
+                        col_img, col_norm, col_info = st.columns([0.16, 0.16, 0.68])
                         if pred.get("ruta_caracter"):
-                            col_img.image(pred["ruta_caracter"], caption=f"#{pred.get('indice')}", use_container_width=True)
+                            col_img.image(pred["ruta_caracter"], caption=f"Original #{pred.get('indice')}", use_container_width=True)
+                        if pred.get("ruta_debug_normalizada"):
+                            col_norm.image(pred["ruta_debug_normalizada"], caption="CNN 32x32", use_container_width=True)
                         top3 = ", ".join(
                             f"{item['caracter']} ({item['confianza']:.2f})"
                             for item in pred.get("top3_predicciones", [])
@@ -1233,14 +1564,41 @@ def pestana_pruebas(config: dict) -> None:
                         col_info.write(
                             {
                                 "indice": pred.get("indice"),
+                                "esperado": esperado_pred,
                                 "prediccion": pred.get("caracter_predicho"),
                                 "confianza": round(float(pred.get("confianza", 0.0)), 4),
                                 "top3": top3,
                             }
                         )
 
+                if diagnostico_caracteres:
+                    st.subheader("Comparacion caracter por caracter")
+                    filas_diag = []
+                    for item in diagnostico_caracteres:
+                        filas_diag.append(
+                            {
+                                "indice": item.get("indice"),
+                                "esperado": item.get("etiqueta_esperada"),
+                                "crudo": item.get("caracter_crudo"),
+                                "postprocesado": item.get("caracter_postprocesado"),
+                                "prediccion": item.get("prediccion"),
+                                "confianza": round(float(item.get("confianza", 0.0)), 4),
+                                "estado": item.get("estado"),
+                                "causa": item.get("causa_probable"),
+                                "observacion": item.get("observacion"),
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(filas_diag), use_container_width=True)
+
+                cambios_post = resultado_ocr.get("cambios_postprocesamiento") or []
+                if cambios_post:
+                    st.subheader("Cambios de postprocesamiento por formato")
+                    st.dataframe(pd.DataFrame(cambios_post), use_container_width=True)
+
                 st.caption(f"Reporte JSON: {reporte_ocr['ruta_json']}")
                 st.caption(f"Reporte CSV: {reporte_ocr['ruta_csv']}")
+                st.caption(f"Diagnostico JSON: {reporte_diagnostico['ruta_json']}")
+                st.caption(f"Diagnostico CSV: {reporte_diagnostico['ruta_csv']}")
 
     with st.expander("Modo desarrollo / pruebas internas", expanded=False):
         placa_manual = st.text_input("Placa manual", value=config["ocr"]["manual_test_plate"])
@@ -1295,10 +1653,10 @@ def pestana_base_datos(config: dict) -> None:
     if placa_busqueda:
         vehiculo = buscar_vehiculo_por_placa(placa_busqueda, ruta_bd)
         if vehiculo:
-            st.success("Vehículo encontrado")
+            st.success("VehÃ­culo encontrado")
             st.json(vehiculo)
         else:
-            st.warning("No existe un vehículo registrado con esa placa.")
+            st.warning("No existe un vehÃ­culo registrado con esa placa.")
 
     vehiculos = listar_vehiculos(ruta_bd)
     eventos = listar_eventos(ruta_bd)
@@ -1343,7 +1701,7 @@ def pestana_evidencias(config: dict) -> None:
         ]
         st.dataframe(pd.DataFrame(datos_notificaciones), use_container_width=True, hide_index=True)
         seleccionado_notificacion = st.selectbox(
-            "Ver notificación simulada",
+            "Ver notificaciÃ³n simulada",
             notificaciones,
             format_func=lambda ruta: ruta.name,
         )
@@ -1388,3 +1746,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
