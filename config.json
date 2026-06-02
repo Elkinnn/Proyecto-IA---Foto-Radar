@@ -1,0 +1,5 @@
+{
+  "models": {
+    "plate_detector_model": "models/plate_detector/placas_ecuador.pt"
+  }
+}

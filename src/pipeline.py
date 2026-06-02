@@ -54,7 +54,7 @@ def procesar_imagen_prueba(
     ruta_bd = config["database"]["path"]
     inicializar_bd(ruta_bd)
 
-    detector = PlateDetector(config["models"]["plate_detector_path"])
+    detector = PlateDetector(config["models"].get("plate_detector_model", config["models"]["plate_detector_path"]))
     lector = PlateReader()
 
     deteccion = detector.detectar(ruta_archivo)
@@ -100,6 +100,7 @@ def procesar_video_monitoreo(
     conf_min: float = 0.30,
     persistencia_frames: int = 10,
     rotacion: str = "Sin rotación",
+    model_path: str | None = None,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -119,6 +120,7 @@ def procesar_video_monitoreo(
         conf_min=conf_min,
         persistencia_frames=persistencia_frames,
         rotacion=rotacion,
+        model_path=model_path,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
@@ -137,6 +139,7 @@ def procesar_camara_monitoreo(
     conf_min: float = 0.30,
     persistencia_frames: int = 10,
     rotacion: str = "Sin rotación",
+    model_path: str | None = None,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -156,6 +159,7 @@ def procesar_camara_monitoreo(
         conf_min=conf_min,
         persistencia_frames=persistencia_frames,
         rotacion=rotacion,
+        model_path=model_path,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
@@ -297,12 +301,13 @@ def _procesar_fuente_monitoreo(
     conf_min: float,
     persistencia_frames: int,
     rotacion: str,
+    model_path: str | None = None,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
 ) -> dict:
     captura = cv2.VideoCapture(fuente)
-    detector = PlateDetector()
+    detector = PlateDetector(model_path) if model_path else PlateDetector()
 
     if not captura.isOpened():
         return {

@@ -1,5 +1,6 @@
 models:
-  plate_detector_path: models/plate_detector/placas_ecuador.pt
+  plate_detector_path: models/plate_detector/placas_roboflow.pt
+  plate_detector_model: models/plate_detector/placas_roboflow.pt
   character_reader_path: models/character_reader/character_reader.keras
 
 paths:

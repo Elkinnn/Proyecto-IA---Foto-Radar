@@ -972,6 +972,7 @@ def pestana_monitoreo(config: dict) -> None:
                 conf_min=conf_min,
                 persistencia_frames=persistencia_frames,
                 rotacion=rotacion,
+                model_path=config["models"].get("plate_detector_model", config["models"].get("plate_detector_path")),
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),
@@ -989,6 +990,7 @@ def pestana_monitoreo(config: dict) -> None:
                 conf_min=conf_min,
                 persistencia_frames=persistencia_frames,
                 rotacion=rotacion,
+                model_path=config["models"].get("plate_detector_model", config["models"].get("plate_detector_path")),
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: st.session_state.get("monitoreo_pausado", False) or not st.session_state.get("monitoreo_activo", True),
@@ -1423,6 +1425,142 @@ def pestana_pruebas(config: dict) -> None:
                                     use_container_width=True,
                                 )
                         st.dataframe(pd.DataFrame(filas_yolo), use_container_width=True)
+
+    with st.expander("Comparar detectores YOLO", expanded=False):
+        st.caption("Comparación visual entre el modelo actual y el candidato entrenado con Roboflow.")
+        modelo_actual_path = Path("models") / "plate_detector" / "placas_ecuador.pt"
+        modelo_roboflow_path = Path("models") / "plate_detector" / "placas_roboflow.pt"
+        conf_comp = st.slider("Confidence threshold comparación", 0.05, 0.90, 0.25, 0.05)
+
+        col_cmp_info1, col_cmp_info2 = st.columns(2)
+        col_cmp_info1.metric("Modelo actual", "Existe" if modelo_actual_path.exists() else "No existe")
+        col_cmp_info1.caption(str(modelo_actual_path))
+        col_cmp_info2.metric("Modelo Roboflow", "Existe" if modelo_roboflow_path.exists() else "No existe")
+        col_cmp_info2.caption(str(modelo_roboflow_path))
+
+        fuentes_cmp = []
+        for carpeta in [
+            Path("datasets") / "placas_ecuador" / "images",
+            Path("datasets") / "placas_yolo_roboflow" / "test",
+            Path("reports") / "evidencias" / "monitoreo_video",
+            Path("data") / "videos_prueba",
+        ]:
+            if carpeta.exists():
+                fuentes_cmp.extend(
+                    sorted(
+                        ruta
+                        for ruta in carpeta.rglob("*")
+                        if ruta.is_file() and ruta.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".mp4", ".avi", ".mov", ".mkv"}
+                    )
+                )
+
+        if fuentes_cmp:
+            ruta_cmp = st.selectbox(
+                "Imagen o video para comparar",
+                fuentes_cmp,
+                format_func=lambda ruta: str(ruta),
+                key="comparar_yolo_fuente",
+            )
+            frame_cmp = 0
+            if ruta_cmp.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv"}:
+                frame_cmp = st.number_input("Frame del video", min_value=0, value=0, step=30)
+        else:
+            ruta_cmp = None
+            st.info("No se encontraron imágenes o videos para comparar.")
+
+        def _leer_imagen_o_frame(ruta, frame_idx=0):
+            if ruta.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv"}:
+                cap = cv2.VideoCapture(str(ruta))
+                if not cap.isOpened():
+                    return None
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                ok, frame = cap.read()
+                cap.release()
+                return frame if ok else None
+            return cv2.imread(str(ruta))
+
+        def _inferir_yolo_streamlit(model_path, imagen, conf):
+            if not model_path.exists():
+                return {
+                    "disponible": False,
+                    "mensaje": "Modelo no encontrado.",
+                    "frame": imagen,
+                    "detecciones": [],
+                    "tiempo_ms": 0.0,
+                    "clases": {},
+                }
+            try:
+                from ultralytics import YOLO
+            except ImportError:
+                return {
+                    "disponible": False,
+                    "mensaje": "Ultralytics no está instalado en este entorno.",
+                    "frame": imagen,
+                    "detecciones": [],
+                    "tiempo_ms": 0.0,
+                    "clases": {},
+                }
+            import time
+
+            model = YOLO(str(model_path))
+            inicio = time.perf_counter()
+            results = model.predict(source=imagen, conf=float(conf), verbose=False)
+            tiempo_ms = (time.perf_counter() - inicio) * 1000
+            boxes = results[0].boxes if results else []
+            frame = imagen.copy()
+            detecciones = []
+            alto, ancho = imagen.shape[:2]
+            for box in boxes:
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                confianza = float(box.conf[0])
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(ancho - 1, x2), min(alto - 1, y2)
+                recorte = imagen[y1:y2, x1:x2].copy() if x2 > x1 and y2 > y1 else None
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 180, 0), 2)
+                cv2.putText(frame, f"{confianza:.2f}", (x1, max(18, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 180, 0), 2)
+                detecciones.append({"bbox": [x1, y1, x2, y2], "confianza": confianza, "recorte": recorte})
+            return {
+                "disponible": True,
+                "mensaje": "OK" if detecciones else "Sin detección.",
+                "frame": frame,
+                "detecciones": detecciones,
+                "tiempo_ms": tiempo_ms,
+                "clases": getattr(model, "names", {}),
+            }
+
+        if st.button("Comparar detectores", type="primary"):
+            if ruta_cmp is None:
+                st.warning("Selecciona una fuente para comparar.")
+            else:
+                imagen_cmp = _leer_imagen_o_frame(ruta_cmp, frame_cmp)
+                if imagen_cmp is None:
+                    st.error("No se pudo leer la imagen o frame seleccionado.")
+                else:
+                    res_actual = _inferir_yolo_streamlit(modelo_actual_path, imagen_cmp, conf_comp)
+                    res_robo = _inferir_yolo_streamlit(modelo_roboflow_path, imagen_cmp, conf_comp)
+                    col_actual, col_robo = st.columns(2)
+                    with col_actual:
+                        st.subheader("Modelo actual")
+                        st.caption(f"Clases: {res_actual.get('clases')}")
+                        st.metric("Tiempo inferencia", f"{res_actual['tiempo_ms']:.2f} ms")
+                        st.metric("Detecciones", len(res_actual["detecciones"]))
+                        st.info(res_actual["mensaje"])
+                        st.image(cv2.cvtColor(res_actual["frame"], cv2.COLOR_BGR2RGB), caption="BBox actual", use_container_width=True)
+                        if res_actual["detecciones"] and res_actual["detecciones"][0].get("recorte") is not None:
+                            st.image(cv2.cvtColor(res_actual["detecciones"][0]["recorte"], cv2.COLOR_BGR2RGB), caption="Recorte actual", use_container_width=False)
+                        if res_actual["detecciones"]:
+                            st.json([{k: v for k, v in det.items() if k != "recorte"} for det in res_actual["detecciones"]])
+                    with col_robo:
+                        st.subheader("Modelo Roboflow")
+                        st.caption(f"Clases: {res_robo.get('clases')}")
+                        st.metric("Tiempo inferencia", f"{res_robo['tiempo_ms']:.2f} ms")
+                        st.metric("Detecciones", len(res_robo["detecciones"]))
+                        st.info(res_robo["mensaje"])
+                        st.image(cv2.cvtColor(res_robo["frame"], cv2.COLOR_BGR2RGB), caption="BBox Roboflow", use_container_width=True)
+                        if res_robo["detecciones"] and res_robo["detecciones"][0].get("recorte") is not None:
+                            st.image(cv2.cvtColor(res_robo["detecciones"][0]["recorte"], cv2.COLOR_BGR2RGB), caption="Recorte Roboflow", use_container_width=False)
+                        if res_robo["detecciones"]:
+                            st.json([{k: v for k, v in det.items() if k != "recorte"} for det in res_robo["detecciones"]])
 
     with st.expander("OCR experimental sobre recortes", expanded=False):
         recortes, fuente_recorte = _buscar_recortes_ocr()
