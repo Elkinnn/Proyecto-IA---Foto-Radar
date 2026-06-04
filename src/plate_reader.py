@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 import csv
+from functools import lru_cache
 import json
 import re
 
@@ -10,7 +11,8 @@ import numpy as np
 from src.utils import normalizar_placa
 
 
-OCR_DIR = Path("reports") / "evidencias" / "ocr"
+RECONOCIMIENTO_CARACTERES_DIR = Path("reports") / "evidencias" / "reconocimiento_caracteres"
+OCR_DIR = RECONOCIMIENTO_CARACTERES_DIR
 PREPROCESADAS_DIR = OCR_DIR / "placas_preprocesadas"
 CARACTERES_DIR = OCR_DIR / "caracteres_segmentados"
 BANDAS_DIR = OCR_DIR / "bandas_caracteres"
@@ -40,7 +42,7 @@ class PlateReader:
                 "texto": placa,
                 "modo": modo_ocr,
                 "confianza": 1.0 if placa else 0.0,
-                "mensaje": "OCR manual/controlado usado temporalmente.",
+            "mensaje": "Lector de caracteres manual/controlado usado temporalmente.",
             }
 
         if modo_ocr == "automatico":
@@ -48,12 +50,13 @@ class PlateReader:
                 "texto": "",
                 "modo": modo_ocr,
                 "confianza": 0.0,
-                "mensaje": "OCR automatico pendiente de integrar con modelo entrenado desde cero.",
+                "mensaje": "Lector CNN de caracteres automatico pendiente de integrar con modelo entrenado desde cero.",
             }
 
-        raise ValueError(f"Modo de OCR no soportado: {modo_ocr}")
+        raise ValueError(f"Modo de lector de caracteres no soportado: {modo_ocr}")
 
 
+@lru_cache(maxsize=1)
 def cargar_modelo_caracteres():
     MODELO_CARACTERES_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not MODELO_CARACTERES_PATH.exists():
@@ -201,8 +204,8 @@ def postprocesar_texto_placa(texto: str) -> dict:
 
 def postprocesar_por_formato_ecuador(texto_crudo: str, predicciones_caracteres: list) -> dict:
     crudo = normalizar_placa((texto_crudo or "").replace("-", ""))
-    letras_directas = {"0": "O", "1": "I", "5": "S", "2": "Z", "8": "B"}
-    numeros_directos = {"O": "0", "I": "1", "S": "5", "Z": "2", "B": "8", "G": "6"}
+    letras_directas = {"0": "O", "1": "I", "5": "S", "2": "Z", "8": "B", "7": "T", "6": "G"}
+    numeros_directos = {"O": "0", "I": "1", "S": "5", "Z": "2", "B": "8", "G": "6", "T": "7"}
     caracteres = []
     cambios = []
 
@@ -220,7 +223,7 @@ def postprocesar_por_formato_ecuador(texto_crudo: str, predicciones_caracteres: 
                 nuevo = caracter
             else:
                 candidato = letras_directas.get(caracter)
-                if candidato and (candidato in top3_map or confianza < 0.85):
+                if candidato and (candidato in top3_map or confianza < 0.65):
                     nuevo = candidato
                     motivo = f"{caracter}->{candidato} por posicion de letra"
                 elif caracter == "6" and "G" in top3_map and confianza < 0.75:
@@ -236,7 +239,7 @@ def postprocesar_por_formato_ecuador(texto_crudo: str, predicciones_caracteres: 
                 nuevo = caracter
             else:
                 candidato = numeros_directos.get(caracter)
-                if candidato and (candidato in top3_map or confianza < 0.85):
+                if candidato and (candidato in top3_map or confianza < 0.65):
                     nuevo = candidato
                     motivo = f"{caracter}->{candidato} por posicion numerica"
                 else:
@@ -296,11 +299,33 @@ def preprocesar_placa(ruta_imagen: str, nombre_base: str = "placa") -> dict:
             "mensaje": "No se pudo cargar el recorte de placa.",
         }
 
-    gris = cv2.cvtColor(imagen, cv2.COLOR_BGR2GRAY)
-    gris = cv2.resize(gris, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    nombre = _nombre_seguro(ruta_imagen, nombre_base)
+    return preprocesar_recorte_placa_para_ocr(imagen, nombre)
+
+
+def preprocesar_recorte_placa_para_ocr(crop, nombre_base: str = "placa") -> dict:
+    PREPROCESADAS_DIR.mkdir(parents=True, exist_ok=True)
+    if crop is None or crop.size == 0:
+        return {
+            "ruta_imagen_procesada": None,
+            "estado": "error",
+            "mensaje": "Recorte vacio para reconocimiento de caracteres.",
+        }
+
+    gris = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop.copy()
+    alto_original, ancho_original = gris.shape[:2]
+    escala = max(2.0, min(4.0, 420 / max(ancho_original, 1)))
+    gris = cv2.resize(gris, None, fx=escala, fy=escala, interpolation=cv2.INTER_CUBIC)
+
+    alto, ancho = gris.shape[:2]
+    margen_x = max(int(ancho * 0.025), 2)
+    margen_y = max(int(alto * 0.06), 2)
+    gris = gris[margen_y : max(alto - margen_y, margen_y + 1), margen_x : max(ancho - margen_x, margen_x + 1)]
+
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contraste = clahe.apply(gris)
-    suavizada = cv2.GaussianBlur(contraste, (3, 3), 0)
+    denoise = cv2.bilateralFilter(contraste, 5, 45, 45)
+    suavizada = cv2.GaussianBlur(denoise, (3, 3), 0)
     _, otsu = cv2.threshold(suavizada, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     adaptativa = cv2.adaptiveThreshold(
         suavizada,
@@ -317,14 +342,20 @@ def preprocesar_placa(ruta_imagen: str, nombre_base: str = "placa") -> dict:
     if blancos > total * 0.65:
         procesada = cv2.bitwise_not(procesada)
 
-    nombre = _nombre_seguro(ruta_imagen, nombre_base)
+    kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+    procesada = cv2.morphologyEx(procesada, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    procesada = cv2.morphologyEx(procesada, cv2.MORPH_CLOSE, kernel_horizontal)
+
+    nombre = _nombre_seguro(nombre_base, "placa")
     ruta_gris = PREPROCESADAS_DIR / f"{nombre}_01_gris.jpg"
     ruta_contraste = PREPROCESADAS_DIR / f"{nombre}_02_contraste.jpg"
     ruta_otsu = PREPROCESADAS_DIR / f"{nombre}_03_otsu.jpg"
     ruta_adaptativa = PREPROCESADAS_DIR / f"{nombre}_04_adaptativa.jpg"
+    ruta_denoise = PREPROCESADAS_DIR / f"{nombre}_02b_denoise.jpg"
     ruta_salida = PREPROCESADAS_DIR / f"{nombre}_preprocesada.jpg"
     cv2.imwrite(str(ruta_gris), gris)
     cv2.imwrite(str(ruta_contraste), contraste)
+    cv2.imwrite(str(ruta_denoise), denoise)
     cv2.imwrite(str(ruta_otsu), otsu)
     cv2.imwrite(str(ruta_adaptativa), adaptativa)
     cv2.imwrite(str(ruta_salida), procesada)
@@ -334,12 +365,13 @@ def preprocesar_placa(ruta_imagen: str, nombre_base: str = "placa") -> dict:
         "rutas_debug": {
             "gris": str(ruta_gris),
             "contraste": str(ruta_contraste),
+            "denoise": str(ruta_denoise),
             "otsu": str(ruta_otsu),
             "adaptativa": str(ruta_adaptativa),
             "final": str(ruta_salida),
         },
         "estado": "ok",
-        "mensaje": "Recorte preprocesado correctamente.",
+        "mensaje": "Recorte preprocesado para reconocimiento de caracteres con contraste, reduccion de ruido y binarizacion robusta.",
     }
 
 
@@ -517,6 +549,7 @@ def segmentar_caracteres_v2(ruta_imagen_procesada: str, nombre_base: str = "plac
             aceptados.append(item)
 
     aceptados = _eliminar_items_duplicados(aceptados)
+    aceptados = _seleccionar_caracteres_principales(aceptados, ancho_banda, alto_banda)
     aceptados.sort(key=lambda item: item["bbox"][0])
 
     for idx, item in enumerate(aceptados, start=1):
@@ -547,9 +580,40 @@ def segmentar_caracteres_v2(ruta_imagen_procesada: str, nombre_base: str = "plac
         "motivos_rechazo": _contar_motivos_rechazo(rechazados),
         "ruta_banda": banda_info.get("ruta_banda"),
         "ruta_debug": str(ruta_debug),
-        "estado": "ok",
-        "mensaje": "Segmentacion v2 ejecutada sobre banda principal de caracteres.",
+        "estado": "ok" if 6 <= len(aceptados) <= 7 else "advertencia",
+        "mensaje": _mensaje_segmentacion_por_cantidad(len(aceptados)),
     }
+
+
+def _seleccionar_caracteres_principales(items: list[dict], ancho_banda: int, alto_banda: int) -> list[dict]:
+    if len(items) <= 7:
+        return items
+
+    centro_y_objetivo = alto_banda * 0.52
+    alto_objetivo = alto_banda * 0.70
+    puntuados = []
+    for item in items:
+        x, y, w, h = item["bbox"]
+        area = max(int(item.get("area", w * h)), 1)
+        centro_y = y + h / 2
+        score_altura = max(0.0, 1.0 - abs(h - alto_objetivo) / max(alto_objetivo, 1))
+        score_y = max(0.0, 1.0 - abs(centro_y - centro_y_objetivo) / max(alto_banda * 0.5, 1))
+        score_area = min(area / max(ancho_banda * alto_banda * 0.08, 1), 1.0)
+        score_x = 1.0 if 0 < x < ancho_banda - w else 0.5
+        item["_score_caracter"] = 0.45 * score_altura + 0.30 * score_y + 0.20 * score_area + 0.05 * score_x
+        puntuados.append(item)
+
+    mejores_7 = sorted(puntuados, key=lambda item: item["_score_caracter"], reverse=True)[:7]
+    mejores_7.sort(key=lambda item: item["bbox"][0])
+    return mejores_7
+
+
+def _mensaje_segmentacion_por_cantidad(cantidad: int) -> str:
+    if 6 <= cantidad <= 7:
+        return "Segmentacion v2 ejecutada sobre banda principal de caracteres."
+    if cantidad < 6:
+        return "Segmentacion incompleta: se detectaron menos de 6 caracteres principales."
+    return "Segmentacion con exceso de componentes: se conservaron los candidatos principales."
 
 
 def _eliminar_items_duplicados(items: list[dict]) -> list[dict]:
@@ -809,7 +873,7 @@ def leer_placa_desde_recorte(
         cambios_postprocesamiento = postprocesado.get("cambios", [])
         estado = "ok" if texto_normalizado else "sin_caracteres_segmentados"
         mensaje = (
-            "OCR experimental ejecutado con CNN propia de caracteres."
+            "Reconocimiento de caracteres ejecutado con CNN propia."
             if texto_normalizado
             else "No hay caracteres segmentados suficientes para reconstruir texto."
         )
@@ -824,6 +888,12 @@ def leer_placa_desde_recorte(
         caracteres_segmentados=caracteres,
         formato_valido=bool(formato.get("valido")),
         acierto=bool(comparacion.get("coincide")),
+    )
+    causa_probable = _causa_probable_ocr(
+        preprocesamiento=preprocesamiento,
+        segmentacion=segmentacion,
+        formato=formato,
+        confianza_promedio=confianza_promedio,
     )
 
     return {
@@ -848,10 +918,25 @@ def leer_placa_desde_recorte(
         "formato": formato,
         "comparacion": comparacion,
         "diagnostico": diagnostico,
+        "causa_probable": causa_probable,
         "estado": estado,
         "mensaje": mensaje,
         "mensaje_modelo": mensaje_modelo,
     }
+
+
+def _causa_probable_ocr(preprocesamiento: dict, segmentacion: dict, formato: dict, confianza_promedio: float) -> str:
+    cantidad = int(segmentacion.get("cantidad_aceptados", 0) or 0)
+    if cantidad < 6:
+        return "segmentacion_incompleta"
+    if not formato.get("valido"):
+        return "formato_invalido"
+    if confianza_promedio and confianza_promedio < 0.60:
+        return "baja_confianza_cnn_caracteres"
+    mensaje_pre = (preprocesamiento.get("mensaje") or "").lower()
+    if "borroso" in mensaje_pre:
+        return "recorte_borroso"
+    return "sin_error_evidente"
 
 
 def registrar_diagnostico_recorte(resultado: dict, placa_esperada: str = "") -> dict:
@@ -939,8 +1024,8 @@ def registrar_diagnostico_recorte(resultado: dict, placa_esperada: str = "") -> 
 
 def registrar_reporte_ocr(resultado: dict, fuente_recorte: str, placa_esperada: str = "") -> dict:
     OCR_DIR.mkdir(parents=True, exist_ok=True)
-    ruta_json = OCR_DIR / "reporte_ocr_experimental.json"
-    ruta_csv = OCR_DIR / "reporte_ocr_experimental.csv"
+    ruta_json = OCR_DIR / "reporte_reconocimiento_caracteres.json"
+    ruta_csv = OCR_DIR / "reporte_reconocimiento_caracteres.csv"
     fila = {
         "fecha_hora": datetime.now().isoformat(timespec="seconds"),
         "ruta_imagen": resultado.get("ruta_imagen"),

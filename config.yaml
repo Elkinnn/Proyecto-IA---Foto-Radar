@@ -1,7 +1,7 @@
 models:
   plate_detector_path: models/plate_detector/placas_roboflow.pt
   plate_detector_model: models/plate_detector/placas_roboflow.pt
-  character_reader_path: models/character_reader/character_reader.keras
+  character_reader_path: models/character_reader/character_cnn.keras
 
 paths:
   input_dir: data/input
@@ -19,6 +19,41 @@ speed:
 ocr:
   default_mode: manual_controlado
   manual_test_plate: PBC1234
+
+plate_crop_selection:
+  enabled: true
+  buffer_frames: 15
+  min_aspect_ratio: 1.5
+  max_aspect_ratio: 6.5
+  min_area_relative: 0.0003
+  max_area_relative: 0.08
+  border_margin_px: 5
+  min_sharpness: 30.0
+  cooldown_frames: 45
+  min_score_improvement: 0.03
+
+monitoring_performance:
+  rapido:
+    yolo_every_n_frames: 10
+    inference_size: 416
+    render_every_n_frames: 3
+    history_max: 10
+  balanceado:
+    yolo_every_n_frames: 5
+    inference_size: 640
+    render_every_n_frames: 2
+    history_max: 15
+  preciso:
+    yolo_every_n_frames: 3
+    inference_size: 640
+    render_every_n_frames: 1
+    history_max: 20
+  demo_fluido:
+    yolo_every_n_frames: 15
+    inference_size: 416
+    render_every_n_frames: 1
+    history_max: 5
+    max_display_fps: 24
 
 fuzzy:
   seguro_hasta: 20

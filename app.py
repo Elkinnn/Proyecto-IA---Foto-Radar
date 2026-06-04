@@ -1,6 +1,8 @@
 from datetime import datetime
 from pathlib import Path
+import csv
 import json
+import time
 
 import cv2
 import numpy as np
@@ -9,6 +11,7 @@ import streamlit as st
 
 from src.database import buscar_vehiculo_por_placa, guardar_evento, inicializar_bd, listar_eventos, listar_vehiculos
 from src.pipeline import (
+    generar_video_demo_anotado,
     procesar_camara_monitoreo,
     procesar_frame_video_monitoreo,
     procesar_imagen_prueba,
@@ -38,6 +41,27 @@ from scripts.generar_caracteres_desde_placas_ecuador import (
     leer_labels as leer_labels_caracteres_ecuador,
     escribir_labels as escribir_labels_caracteres_ecuador,
 )
+
+
+PERFORMANCE_MODE_LABELS = {
+    "Rapido": "rapido",
+    "Balanceado": "balanceado",
+    "Preciso": "preciso",
+    "Demo fluido": "demo_fluido",
+}
+
+
+def _config_modo_rendimiento(config: dict, modo: str) -> dict:
+    clave = PERFORMANCE_MODE_LABELS.get(modo, "balanceado")
+    defaults = {
+        "rapido": {"yolo_every_n_frames": 10, "inference_size": 416, "render_every_n_frames": 3, "history_max": 10},
+        "balanceado": {"yolo_every_n_frames": 5, "inference_size": 640, "render_every_n_frames": 2, "history_max": 15},
+        "preciso": {"yolo_every_n_frames": 3, "inference_size": 640, "render_every_n_frames": 1, "history_max": 20},
+        "demo_fluido": {"yolo_every_n_frames": 15, "inference_size": 416, "render_every_n_frames": 1, "history_max": 5, "max_display_fps": 24},
+    }
+    salida = defaults[clave].copy()
+    salida.update((config.get("monitoring_performance") or {}).get(clave, {}))
+    return salida
 
 
 st.set_page_config(
@@ -95,7 +119,7 @@ def panel_resultados(evento: dict | None) -> None:
         col1.metric("Placa detectada", "Pendiente")
         col2.metric("Velocidad", "Pendiente")
         col3.metric("Estado", "Sin evento")
-        st.info("La deteccion de placa, OCR, velocidad real y sanciones se integraran despues del flujo de video.")
+        st.info("La deteccion de placa, reconocimiento de caracteres CNN, velocidad real y sanciones se integraran despues del flujo de video.")
         return
 
     vehiculo = evento.get("vehiculo") or {}
@@ -103,7 +127,7 @@ def panel_resultados(evento: dict | None) -> None:
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Placa detectada", "Si" if evento.get("placa_detectada") else "No")
-    col2.metric("Texto OCR", evento.get("texto_placa") or "Pendiente")
+    col2.metric("Texto reconocido", evento.get("texto_placa") or "Pendiente")
     col3.metric("Velocidad km/h", f"{evento.get('velocidad_kmh', 0):.2f}")
 
     col4, col5, col6 = st.columns(3)
@@ -675,7 +699,10 @@ def registrar_evento_monitoreo_si_corresponde(resumen: dict, placa_controlada: s
 
 
 def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
-    ruta_recorte = resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    selector_activo = "ultimos_candidatos_recorte" in resumen or "mejor_recorte_placa_info" in resumen
+    ruta_recorte = resumen.get("mejor_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    if not selector_activo:
+        ruta_recorte = ruta_recorte or resumen.get("ultimo_recorte_placa")
     if not ruta_recorte:
         resumen.setdefault("texto_ocr_crudo", "Pendiente")
         resumen.setdefault("texto_ocr_corregido", "Pendiente")
@@ -688,7 +715,9 @@ def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
         return resumen
 
     try:
+        inicio_lector = time.perf_counter()
         resultado_ocr = leer_placa_desde_recorte(str(ruta_recorte), placa_esperada="")
+        tiempo_lector_ms = (time.perf_counter() - inicio_lector) * 1000
         datos_ocr = {
             "texto_ocr_crudo": resultado_ocr.get("texto_detectado_crudo") or "Pendiente",
             "texto_ocr_corregido": resultado_ocr.get("texto_postprocesado") or "Pendiente",
@@ -696,11 +725,20 @@ def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
             "formato_ocr_valido": bool((resultado_ocr.get("formato") or {}).get("valido")),
             "estado_ocr": resultado_ocr.get("estado"),
             "mensaje_ocr": resultado_ocr.get("mensaje"),
+            "causa_probable_ocr": resultado_ocr.get("causa_probable"),
+            "ruta_placa_preprocesada_ocr": (resultado_ocr.get("preprocesamiento") or {}).get("ruta_imagen_procesada"),
+            "ruta_debug_segmentacion_ocr": resultado_ocr.get("ruta_debug_segmentacion"),
+            "ruta_banda_ocr": resultado_ocr.get("ruta_banda"),
+            "caracteres_segmentados_ocr": resultado_ocr.get("caracteres", []),
+            "cantidad_caracteres_segmentados_ocr": resultado_ocr.get("cantidad_caracteres_segmentados", 0),
+            "tiempo_lector_cnn_ms": round(tiempo_lector_ms, 3),
         }
+        st.session_state.contador_lector_cnn_monitoreo = int(st.session_state.get("contador_lector_cnn_monitoreo", 0) or 0) + 1
+        _registrar_metricas_ocr_mejor_recorte(resumen, resultado_ocr)
     except Exception as exc:
         datos_ocr = {
-            "texto_ocr_crudo": "Error OCR",
-            "texto_ocr_corregido": "Error OCR",
+            "texto_ocr_crudo": "Error lector CNN",
+            "texto_ocr_corregido": "Error lector CNN",
             "confianza_ocr": None,
             "formato_ocr_valido": False,
             "estado_ocr": "error",
@@ -711,6 +749,34 @@ def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
     st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
     resumen.update(datos_ocr)
     return resumen
+
+
+def _registrar_metricas_ocr_mejor_recorte(resumen: dict, resultado_ocr: dict) -> None:
+    mejor_info = resumen.get("mejor_recorte_placa_info") or {}
+    if not mejor_info:
+        return
+    salida = Path("reports") / "evidencias" / "mejores_recortes_placa"
+    salida.mkdir(parents=True, exist_ok=True)
+    csv_path = salida / "metricas_reconocimiento_caracteres_mejores_recortes.csv"
+    existe = csv_path.exists()
+    fila = {
+        "frame_index": mejor_info.get("frame_index"),
+        "conf_yolo": mejor_info.get("conf_yolo"),
+        "aspect_ratio": mejor_info.get("aspect_ratio"),
+        "area_relativa": mejor_info.get("area_relativa"),
+        "sharpness": mejor_info.get("nitidez"),
+        "puntaje_total": mejor_info.get("puntaje_total"),
+        "texto_crudo": resultado_ocr.get("texto_detectado_crudo"),
+        "texto_formato": resultado_ocr.get("texto_postprocesado"),
+        "formato_valido": (resultado_ocr.get("formato") or {}).get("valido"),
+        "cantidad_caracteres_segmentados": resultado_ocr.get("cantidad_caracteres_segmentados"),
+        "causa_probable": resultado_ocr.get("causa_probable"),
+    }
+    with open(csv_path, "a", newline="", encoding="utf-8") as archivo:
+        writer = csv.DictWriter(archivo, fieldnames=list(fila.keys()))
+        if not existe:
+            writer.writeheader()
+        writer.writerow(fila)
 
 
 def _obtener_placa_para_evento(resumen: dict, placa_controlada: str) -> str:
@@ -736,8 +802,12 @@ def _accion_monitoreo(resumen: dict) -> str:
 def _actualizar_historial_monitoreo(resumen: dict) -> None:
     velocidad = resumen.get("velocidad") or {}
     ultima_deteccion = resumen.get("ultima_deteccion") or {}
+    selector_activo = "ultimos_candidatos_recorte" in resumen or "mejor_recorte_placa_info" in resumen
+    ruta_historial = resumen.get("mejor_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    if not selector_activo:
+        ruta_historial = ruta_historial or resumen.get("ultimo_recorte_placa")
     clave = (
-        resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento"),
+        ruta_historial,
         velocidad.get("frame_cruce_linea_2"),
         resumen.get("evento_bd_id"),
         resumen.get("frames_procesados") or resumen.get("frame_actual"),
@@ -756,7 +826,7 @@ def _actualizar_historial_monitoreo(resumen: dict) -> None:
             if ultima_deteccion.get("confianza") is not None
             else "Pendiente"
         ),
-        "confianza OCR": (
+        "confianza CNN caracteres": (
             f"{float(resumen.get('confianza_ocr')):.2f}"
             if resumen.get("confianza_ocr") is not None
             else "Pendiente"
@@ -771,12 +841,16 @@ def _actualizar_historial_monitoreo(resumen: dict) -> None:
     }
     historial = st.session_state.get("historial_detecciones_monitoreo", [])
     historial.insert(0, fila)
-    st.session_state.historial_detecciones_monitoreo = historial[:12]
+    max_historial = int(st.session_state.get("historial_maximo_monitoreo", 15) or 15)
+    st.session_state.historial_detecciones_monitoreo = historial[:max_historial]
     st.session_state.ultima_clave_historial_monitoreo = clave
 
 
 def _actualizar_recortes_monitoreo(resumen: dict) -> None:
-    ruta_recorte = resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    selector_activo = "ultimos_candidatos_recorte" in resumen or "mejor_recorte_placa_info" in resumen
+    ruta_recorte = resumen.get("mejor_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    if not selector_activo:
+        ruta_recorte = ruta_recorte or resumen.get("ultimo_recorte_placa")
     if not ruta_recorte:
         return
     clave = str(ruta_recorte)
@@ -786,19 +860,26 @@ def _actualizar_recortes_monitoreo(resumen: dict) -> None:
     item = {
         "ruta": clave,
         "hora": datetime.now().strftime("%H:%M:%S"),
-        "ocr": resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "Pendiente",
+        "lector CNN": resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "Pendiente",
         "confianza_yolo": (resumen.get("ultima_deteccion") or {}).get("confianza"),
         "confianza_ocr": resumen.get("confianza_ocr"),
     }
     recortes = st.session_state.get("recortes_placas_monitoreo", [])
     if not any(actual.get("ruta") == clave for actual in recortes):
         recortes.insert(0, item)
-    st.session_state.recortes_placas_monitoreo = recortes[:12]
+    max_historial = int(st.session_state.get("historial_maximo_monitoreo", 15) or 15)
+    st.session_state.recortes_placas_monitoreo = recortes[:max_historial]
     st.session_state.ultima_clave_recorte_monitoreo = clave
 
 
-def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict) -> None:
-    resumen = _enriquecer_resumen_monitoreo_con_ocr(resumen)
+def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict, ejecutar_lector_cnn: bool = True) -> None:
+    if ejecutar_lector_cnn:
+        resumen = _enriquecer_resumen_monitoreo_con_ocr(resumen)
+    else:
+        resumen.setdefault("texto_ocr_crudo", "Analizando placa..." if resumen.get("mejor_recorte_placa") else "Pendiente")
+        resumen.setdefault("texto_ocr_corregido", "Pendiente")
+        resumen.setdefault("confianza_ocr", None)
+        resumen.setdefault("formato_ocr_valido", False)
     _actualizar_historial_monitoreo(resumen)
     _actualizar_recortes_monitoreo(resumen)
 
@@ -809,31 +890,48 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict) -> None:
     confianza_yolo = ultima_deteccion.get("confianza") or resumen.get("mejor_confianza_evento")
     confianza_ocr = resumen.get("confianza_ocr")
     velocidad_kmh = velocidad.get("velocidad_kmh")
-    ruta_recorte = resumen.get("ultimo_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    ruta_recorte_actual = resumen.get("ultimo_recorte_placa")
+    ruta_mejor_recorte = resumen.get("mejor_recorte_placa") or resumen.get("ruta_mejor_recorte_evento")
+    mejor_info = resumen.get("mejor_recorte_placa_info") or {}
+    ruta_recorte = ruta_mejor_recorte
 
     st.subheader("Ultima placa detectada")
     col_recorte, col_info = st.columns([0.35, 0.65])
     with col_recorte:
-        if ruta_recorte:
-            st.image(ruta_recorte, caption="Recorte detectado", use_container_width=True)
+        if ruta_mejor_recorte:
+            st.image(ruta_mejor_recorte, caption="Mejor recorte para lector CNN", use_container_width=True)
+            if ruta_recorte_actual and ruta_recorte_actual != ruta_mejor_recorte:
+                st.image(ruta_recorte_actual, caption="Recorte actual detectado", use_container_width=True)
+        elif ruta_recorte_actual:
+            st.image(ruta_recorte_actual, caption="Recorte actual detectado (esperando mejor recorte)", use_container_width=True)
         else:
             st.info("Esperando deteccion de placa.")
 
     with col_info:
         c1, c2, c3 = st.columns(3)
-        c1.metric("OCR crudo", resumen.get("texto_ocr_crudo", "Pendiente"))
-        c2.metric("OCR corregido", resumen.get("texto_ocr_corregido", "Pendiente"))
-        c3.metric("Confianza OCR", f"{confianza_ocr:.2f}" if confianza_ocr is not None else "Pendiente")
+        c1.metric("Texto reconocido crudo", resumen.get("texto_ocr_crudo", "Pendiente"))
+        c2.metric("Texto corregido por formato", resumen.get("texto_ocr_corregido", "Pendiente"))
+        c3.metric("Confianza CNN caracteres", f"{confianza_ocr:.2f}" if confianza_ocr is not None else "Pendiente")
 
         c4, c5, c6 = st.columns(3)
         c4.metric("Confianza YOLO", f"{float(confianza_yolo):.2f}" if confianza_yolo is not None else "Pendiente")
         c5.metric("Velocidad", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
         c6.metric("Estado difuso", difuso.get("estado", "Pendiente"))
 
+        c_best1, c_best2, c_best3 = st.columns(3)
+        c_best1.metric("Puntaje recorte", f"{mejor_info.get('puntaje_total'):.3f}" if mejor_info.get("puntaje_total") is not None else "Pendiente")
+        c_best2.metric("Nitidez", f"{mejor_info.get('nitidez'):.1f}" if mejor_info.get("nitidez") is not None else "Pendiente")
+        c_best3.metric("Aspect ratio", f"{mejor_info.get('aspect_ratio'):.2f}" if mejor_info.get("aspect_ratio") is not None else "Pendiente")
+
         c7, c8, c9 = st.columns(3)
         c7.metric("Encontrada en BD", "Si" if resumen.get("vehiculo_encontrado") else "No")
         c8.metric("Fecha/hora", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         c9.metric("Accion", _accion_monitoreo(resumen))
+
+        c10, c11, c12 = st.columns(3)
+        c10.metric("Caracteres CNN", resumen.get("cantidad_caracteres_segmentados_ocr", "Pendiente"))
+        c11.metric("Formato", "Valido" if resumen.get("formato_ocr_valido") else "Pendiente")
+        c12.metric("Causa probable", resumen.get("causa_probable_ocr") or "Pendiente")
 
         if resumen.get("vehiculo_encontrado"):
             st.caption(
@@ -859,7 +957,49 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict) -> None:
                 conf_ocr = recorte.get("confianza_ocr")
                 texto_yolo = f"{conf_yolo:.2f}" if conf_yolo is not None else "Pendiente"
                 texto_ocr = f"{conf_ocr:.2f}" if conf_ocr is not None else "Pendiente"
-                st.caption(f"{recorte['hora']} | {recorte['ocr']} | YOLO {texto_yolo} | OCR {texto_ocr}")
+                st.caption(f"{recorte['hora']} | {recorte['lector CNN']} | YOLO {texto_yolo} | CNN {texto_ocr}")
+
+    with st.expander("Debug mejor recorte", expanded=False):
+        candidatos = resumen.get("ultimos_candidatos_recorte") or []
+        if mejor_info:
+            st.write(
+                {
+                    "motivo": mejor_info.get("motivo"),
+                    "frame_elegido": mejor_info.get("frame_index"),
+                    "puntaje_total": mejor_info.get("puntaje_total"),
+                    "conf_yolo": mejor_info.get("conf_yolo"),
+                    "nitidez": mejor_info.get("nitidez"),
+                    "area_relativa": mejor_info.get("area_relativa"),
+                    "aspect_ratio": mejor_info.get("aspect_ratio"),
+                    "ruta_recorte": mejor_info.get("ruta_recorte"),
+                    "ruta_frame_bbox": mejor_info.get("ruta_frame_bbox"),
+                }
+            )
+        if candidatos:
+            st.dataframe(pd.DataFrame(candidatos), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Aun no hay suficientes candidatos para seleccionar un mejor recorte.")
+
+        ruta_pre = resumen.get("ruta_placa_preprocesada_ocr")
+        ruta_banda = resumen.get("ruta_banda_ocr")
+        ruta_debug_seg = resumen.get("ruta_debug_segmentacion_ocr")
+        imgs = [ruta for ruta in [ruta_pre, ruta_banda, ruta_debug_seg] if ruta]
+        if imgs:
+            st.caption("Preprocesamiento y segmentacion para lector CNN")
+            cols = st.columns(min(3, len(imgs)))
+            for idx, ruta in enumerate(imgs):
+                with cols[idx % len(cols)]:
+                    st.image(ruta, use_container_width=True)
+        caracteres = resumen.get("caracteres_segmentados_ocr") or []
+        if caracteres:
+            st.caption("Caracteres segmentados")
+            cols = st.columns(min(7, len(caracteres)))
+            for idx, caracter in enumerate(caracteres[:7]):
+                ruta_char = caracter.get("ruta_caracter")
+                if ruta_char:
+                    with cols[idx % len(cols)]:
+                        st.image(ruta_char, use_container_width=True)
+                        st.caption(str(idx + 1))
 
     with st.expander("Debug avanzado", expanded=False):
         d1, d2, d3 = st.columns(3)
@@ -872,6 +1012,26 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict) -> None:
         d5.metric("Frecuencia", resumen.get("frecuencia_deteccion", "Pendiente"))
         d6.metric("Resolucion", f"{resumen.get('ancho', 0)} x {resumen.get('alto', 0)}")
 
+        d7, d8, d9 = st.columns(3)
+        d7.metric("FPS procesamiento", resumen.get("fps_procesamiento", "Pendiente"))
+        d8.metric("YOLO ms", resumen.get("tiempo_yolo_ms", "Pendiente"))
+        d9.metric("Lector CNN ms", resumen.get("tiempo_lector_cnn_ms", "Pendiente"))
+
+        d10, d11, d12 = st.columns(3)
+        d10.metric("Frames saltados YOLO", resumen.get("frames_saltados", "Pendiente"))
+        d11.metric("Resolucion inferencia", resumen.get("resolucion_inferencia", "Pendiente"))
+        d12.metric("Flujo", resumen.get("modo_rendimiento", "Pendiente"))
+
+        d13, d14, d15 = st.columns(3)
+        d13.metric("Frames mostrados", resumen.get("frames_mostrados", "Pendiente"))
+        d14.metric("Frames YOLO", resumen.get("frames_yolo_analizados", "Pendiente"))
+        d15.metric("Ejecuciones lector CNN", st.session_state.get("contador_lector_cnn_monitoreo", 0))
+
+        tiempos = resumen.get("tiempos_etapa") or {}
+        if tiempos:
+            st.caption("Tiempos por etapa (ms)")
+            st.json(tiempos)
+
         st.write(
             {
                 "character_reader_path": config["models"].get("character_reader_path"),
@@ -881,7 +1041,7 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict) -> None:
                 "ultimo_frame_deteccion": resumen.get("ultimo_frame_deteccion"),
                 "ultimo_recorte_placa": ruta_recorte,
                 "mensaje_detector": resumen.get("mensaje_detector"),
-                "mensaje_ocr": resumen.get("mensaje_ocr"),
+                "mensaje_lector_cnn": resumen.get("mensaje_ocr"),
                 "parametros": {
                     "distancia_lineas_m": resumen.get("distancia_lineas_m"),
                     "limite_velocidad_kmh": resumen.get("limite_velocidad_kmh"),
@@ -910,6 +1070,7 @@ def _inicializar_estado_monitoreo() -> None:
         "ultima_clave_historial_monitoreo": None,
         "recortes_placas_monitoreo": [],
         "ultima_clave_recorte_monitoreo": None,
+        "contador_lector_cnn_monitoreo": 0,
     }
     for clave, valor in valores_iniciales.items():
         if clave not in st.session_state:
@@ -928,7 +1089,6 @@ def pestana_monitoreo(config: dict) -> None:
 
         if fuente_monitoreo == "Video de prueba":
             video = st.file_uploader("Cargar video de prueba", type=["mp4", "avi", "mov", "mkv"], key="video_monitoreo")
-            rotacion = "Sin rotacion"
         else:
             indice_camara = st.number_input(
                 "Selector de camara",
@@ -937,27 +1097,50 @@ def pestana_monitoreo(config: dict) -> None:
                 step=1,
                 help="0 normalmente corresponde a la camara principal. Si usa una camara externa o Iriun, pruebe 1 o 2.",
             )
-            rotacion_ui = st.selectbox("Rotacion de camara", ["Sin rotacion", "90 grados", "180 grados", "270 grados"])
-            rotacion = {
-                "Sin rotacion": "Sin rotacion",
-                "90 grados": "Rotar 90 derecha",
-                "180 grados": "Rotar 180",
-                "270 grados": "Rotar 90 izquierda",
-            }[rotacion_ui]
 
-        iniciar = st.button(
-            "Reanudar monitoreo" if st.session_state.get("monitoreo_pausado") else "Iniciar monitoreo",
-            type="primary",
-            use_container_width=True,
-        )
-        detener = st.button("Detener / pausar", use_container_width=True)
-        reiniciar = st.button("Reiniciar", use_container_width=True)
+        rotacion_ui = st.selectbox("Rotacion de imagen", ["Sin rotacion", "90 grados", "180 grados", "270 grados"])
+        rotacion = {
+            "Sin rotacion": "Sin rotacion",
+            "90 grados": "Rotar 90 derecha",
+            "180 grados": "Rotar 180",
+            "270 grados": "Rotar 90 izquierda",
+        }[rotacion_ui]
+
+        modo_rendimiento = "Balanceado"
+        config_rendimiento = _config_modo_rendimiento(config, modo_rendimiento)
+        max_display_fps = int(config_rendimiento.get("max_display_fps", 0) or 0)
+
+        if fuente_monitoreo == "Video de prueba":
+            iniciar = st.button(
+                "Reanudar monitoreo" if st.session_state.get("monitoreo_pausado") else "Iniciar monitoreo",
+                type="primary",
+                use_container_width=True,
+            )
+            detener = st.button("Detener / pausar", use_container_width=True)
+            reiniciar = st.button("Reiniciar", use_container_width=True)
+            with st.expander("Procesar video y generar evidencia", expanded=False):
+                st.caption(
+                    "Opcion secundaria: analiza el video completo sin mostrar cada frame en vivo y genera un MP4 anotado como evidencia."
+                )
+                analizar_video = st.button("Analizar video y generar evidencia", use_container_width=True)
+        else:
+            iniciar = st.button(
+                "Reanudar monitoreo" if st.session_state.get("monitoreo_pausado") else "Iniciar monitoreo",
+                type="primary",
+                use_container_width=True,
+            )
+            detener = st.button("Detener / pausar", use_container_width=True)
+            reiniciar = st.button("Reiniciar", use_container_width=True)
+            analizar_video = False
 
         distancia_metros = float(config["speed"].get("default_distance_meters", 10.0))
         limite_velocidad = float(config["speed"].get("campus_speed_limit_kmh", 30.0))
         posicion_linea_1 = 0.45
         posicion_linea_2 = 0.65
-        frecuencia_deteccion = 1
+        frecuencia_deteccion = int(config_rendimiento["yolo_every_n_frames"])
+        inference_size = int(config_rendimiento["inference_size"])
+        render_every_n_frames = int(config_rendimiento["render_every_n_frames"])
+        st.session_state.historial_maximo_monitoreo = int(config_rendimiento["history_max"])
         conf_min = 0.45
         persistencia_frames = 3
         max_frames = 0
@@ -965,14 +1148,6 @@ def pestana_monitoreo(config: dict) -> None:
         placa_controlada = str(config.get("ocr", {}).get("manual_test_plate", "PBC1234"))
 
         with st.expander("Configuracion avanzada", expanded=False):
-            if fuente_monitoreo == "Video de prueba":
-                rotacion_video_ui = st.selectbox("Rotacion de video", ["Sin rotacion", "90 grados", "180 grados", "270 grados"])
-                rotacion = {
-                    "Sin rotacion": "Sin rotacion",
-                    "90 grados": "Rotar 90 derecha",
-                    "180 grados": "Rotar 180",
-                    "270 grados": "Rotar 90 izquierda",
-                }[rotacion_video_ui]
             distancia_metros = st.number_input(
                 "Distancia real entre lineas (m)",
                 min_value=0.1,
@@ -990,6 +1165,9 @@ def pestana_monitoreo(config: dict) -> None:
             posicion_linea_1 = st.slider("Posicion Linea 1", 0.05, 0.95, posicion_linea_1, 0.01)
             posicion_linea_2 = st.slider("Posicion Linea 2", 0.05, 0.95, posicion_linea_2, 0.01)
             frecuencia_deteccion = st.slider("Frecuencia YOLO", 1, 60, frecuencia_deteccion)
+            inference_size = st.select_slider("Resolucion inferencia YOLO", options=[320, 416, 512, 640, 768], value=inference_size)
+            render_every_n_frames = st.slider("Actualizar video cada N frames", 1, 10, render_every_n_frames, 1)
+            max_display_fps = st.slider("FPS maximo visual (0 = sin limite)", 0, 30, max_display_fps, 1)
             conf_min = st.slider("Confianza minima YOLO", 0.10, 0.90, conf_min, 0.05)
             persistencia_frames = st.slider("Persistencia de deteccion", 0, 30, persistencia_frames, 1)
             max_frames = st.number_input(
@@ -1002,16 +1180,32 @@ def pestana_monitoreo(config: dict) -> None:
             placa_controlada = st.text_input(
                 "Placa controlada temporal",
                 value=placa_controlada,
-                help="Se usa solo como respaldo para BD/fuzzy si el OCR automatico aun no entrega una placa valida.",
+                help="Se usa solo como respaldo para BD/fuzzy si el lector CNN automatico aun no entrega una placa valida.",
             )
             st.caption(f"Modelo YOLO: {config['models'].get('plate_detector_model', config['models'].get('plate_detector_path'))}")
-            st.caption(f"Modelo OCR caracteres: {config['models'].get('character_reader_path')}")
+            st.caption(f"Modelo lector CNN de caracteres: {config['models'].get('character_reader_path')}")
+            if fuente_monitoreo == "Camara en vivo":
+                st.caption(
+                    f"Camara: YOLO cada {frecuencia_deteccion} frames | inferencia {inference_size}px"
+                )
 
     with visor_col:
         frame_placeholder = st.empty()
         progreso = st.progress(0)
         estado_placeholder = st.empty()
         panel_placeholder = st.empty()
+
+    if fuente_monitoreo == "Video de prueba" and video:
+        if st.session_state.get("video_monitoreo_nombre") != video.name:
+            st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, Path(config["paths"]["input_dir"]) / "videos")
+            st.session_state.video_monitoreo_nombre = video.name
+            st.session_state.ultimo_resultado = None
+            st.session_state.video_anotado_resultado = None
+        with frame_placeholder.container():
+            if st.session_state.get("ultima_imagen_procesada") is not None:
+                st.image(st.session_state.ultima_imagen_procesada, channels="RGB", use_container_width=True)
+            else:
+                st.info("Video cargado. Presione Iniciar monitoreo para ver el procesamiento frame por frame.")
 
     if detener:
         st.session_state.monitoreo_activo = False
@@ -1033,6 +1227,7 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultima_clave_historial_monitoreo = None
         st.session_state.recortes_placas_monitoreo = []
         st.session_state.ultima_clave_recorte_monitoreo = None
+        st.session_state.contador_lector_cnn_monitoreo = 0
 
     if posicion_linea_2 <= posicion_linea_1:
         st.warning("La Linea 2 debe estar debajo de la Linea 1 para medir movimiento de arriba hacia abajo.")
@@ -1041,7 +1236,12 @@ def pestana_monitoreo(config: dict) -> None:
     continuar_auto = bool(st.session_state.get("monitoreo_activo") and not st.session_state.get("monitoreo_pausado"))
     ejecutar_monitoreo = bool(iniciar or continuar_auto)
 
-    if not ejecutar_monitoreo and not st.session_state.get("ultimo_resultado") and st.session_state.get("ultima_imagen_procesada") is None:
+    if (
+        not ejecutar_monitoreo
+        and not analizar_video
+        and not st.session_state.get("ultimo_resultado")
+        and st.session_state.get("ultima_imagen_procesada") is None
+    ):
         with panel_placeholder.container():
             st.info("Seleccione video o camara en vivo y presione Iniciar monitoreo.")
         return
@@ -1072,11 +1272,89 @@ def pestana_monitoreo(config: dict) -> None:
             st.session_state.ultima_clave_historial_monitoreo = None
             st.session_state.recortes_placas_monitoreo = []
             st.session_state.ultima_clave_recorte_monitoreo = None
+            st.session_state.contador_lector_cnn_monitoreo = 0
         if fuente_monitoreo == "Video de prueba":
             if not reanudar_video:
                 st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
 
     ruta_modelo_placa = config["models"].get("plate_detector_model", config["models"].get("plate_detector_path"))
+
+    if analizar_video:
+        if fuente_monitoreo != "Video de prueba" or not video:
+            st.warning("Cargue un video de prueba antes de analizar.")
+            return
+        ruta_video_demo = st.session_state.get("ruta_video_monitoreo") or guardar_archivo_subido(video, Path(config["paths"]["input_dir"]) / "videos")
+        progreso_analisis = st.progress(0)
+        estado_analisis = st.empty()
+
+        def _progreso_video_anotado(info: dict) -> None:
+            progreso_analisis.progress(float(info.get("porcentaje", 0.0)))
+            total = info.get("total_frames") or "?"
+            estado_analisis.info(f"{info.get('estado', 'Analizando')} | frame {info.get('frame', 0)} / {total}")
+
+        with st.spinner("Analizando video y generando video anotado..."):
+            demo = generar_video_demo_anotado(
+                ruta_video_demo,
+                distancia_lineas_m=float(distancia_metros),
+                limite_velocidad_kmh=float(limite_velocidad),
+                posicion_linea_1=float(posicion_linea_1),
+                posicion_linea_2=float(posicion_linea_2),
+                frecuencia_deteccion=int(frecuencia_deteccion),
+                conf_min=float(conf_min),
+                persistencia_frames=int(persistencia_frames),
+                rotacion=rotacion,
+                model_path=ruta_modelo_placa,
+                inference_size=int(inference_size),
+                max_frames=int(max_frames),
+                progreso_callback=_progreso_video_anotado,
+            )
+        if demo.get("estado") == "ok":
+            st.session_state.video_anotado_resultado = demo
+            st.session_state.ultimo_resultado = {
+                "texto_ocr_crudo": demo.get("texto_reconocido_crudo") or "Pendiente",
+                "texto_ocr_corregido": demo.get("texto_corregido_formato") or "Pendiente",
+                "confianza_ocr": demo.get("confianza_cnn_caracteres"),
+                "ultima_deteccion": {"confianza": demo.get("confianza_yolo")} if demo.get("confianza_yolo") is not None else {},
+                "mejor_recorte_placa": demo.get("ultimo_recorte_placa"),
+                "ultimo_recorte_placa": demo.get("ultimo_recorte_placa"),
+                "frames_procesados": demo.get("frames_procesados"),
+                "frames_yolo_analizados": demo.get("frames_yolo_analizados"),
+                "estado_placa": "Finalizado",
+                "modo_rendimiento": "Video anotado",
+            }
+            st.success("Video anotado generado correctamente.")
+            st.subheader("Video anotado")
+            st.video(demo["ruta_video"])
+            with panel_placeholder.container():
+                mostrar_panel_monitoreo_limpio(st.session_state.ultimo_resultado, config, ejecutar_lector_cnn=False)
+                eventos = demo.get("eventos") or []
+                if eventos:
+                    st.subheader("Historial de eventos de placa")
+                    st.dataframe(pd.DataFrame(eventos), use_container_width=True, hide_index=True)
+                    st.subheader("Mejores recortes por evento")
+                    columnas = st.columns(min(4, len(eventos)))
+                    for idx, evento in enumerate(eventos[:8]):
+                        ruta_recorte = evento.get("ruta_mejor_recorte")
+                        if ruta_recorte and Path(ruta_recorte).exists():
+                            with columnas[idx % len(columnas)]:
+                                st.image(ruta_recorte, use_container_width=True)
+                                st.caption(
+                                    f"Evento {evento.get('event_id')} | "
+                                    f"{evento.get('texto_corregido_formato') or 'Pendiente'} | "
+                                    f"YOLO {evento.get('confianza_yolo')}"
+                                )
+                if Path(demo["ruta_csv"]).exists():
+                    try:
+                        st.subheader("Historial reciente")
+                        st.dataframe(pd.read_csv(demo["ruta_csv"]).tail(10), use_container_width=True, hide_index=True)
+                    except Exception:
+                        st.caption(f"CSV detecciones: {demo['ruta_csv']}")
+            st.caption(f"CSV detecciones: {demo['ruta_csv']}")
+            st.caption(f"JSON resumen: {demo['ruta_json']}")
+            st.caption(f"Reporte: {demo['ruta_reporte']}")
+        else:
+            st.error(demo.get("mensaje", "No se pudo analizar el video."))
+        return
 
     def _actualizar_panel_desde_estado(estado_frame: dict) -> None:
         resumen_parcial = dict(estado_frame)
@@ -1085,9 +1363,12 @@ def pestana_monitoreo(config: dict) -> None:
         resumen_parcial.setdefault("rotacion", rotacion)
         resumen_parcial.setdefault("modelo_detector_disponible", True)
         resumen_parcial.setdefault("placa_controlada", placa_controlada)
-        resumen_parcial = _enriquecer_resumen_monitoreo_con_ocr(resumen_parcial)
+        resumen_parcial.setdefault("modo_rendimiento", modo_rendimiento)
+        ejecutar_lector = modo_rendimiento != "Demo fluido"
+        if ejecutar_lector:
+            resumen_parcial = _enriquecer_resumen_monitoreo_con_ocr(resumen_parcial)
         with panel_placeholder.container():
-            mostrar_panel_monitoreo_limpio(resumen_parcial, config)
+            mostrar_panel_monitoreo_limpio(resumen_parcial, config, ejecutar_lector_cnn=False)
 
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
         frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
@@ -1101,7 +1382,8 @@ def pestana_monitoreo(config: dict) -> None:
             estado_placeholder.info(
                 f"Frame {estado_frame.get('frame_actual', numero_frame)} | "
                 f"Estado placa: {estado_frame.get('estado_placa', 'Pendiente')} | "
-                f"Confianza YOLO: {texto_confianza}"
+                f"Confianza YOLO: {texto_confianza} | "
+                f"FPS proc: {estado_frame.get('fps_procesamiento', 'Pendiente')}"
             )
             if estado_frame.get("ultimo_recorte_placa") or estado_frame.get("ruta_mejor_recorte_evento"):
                 _actualizar_panel_desde_estado(estado_frame)
@@ -1141,6 +1423,11 @@ def pestana_monitoreo(config: dict) -> None:
                 model_path=ruta_modelo_placa,
                 start_frame=int(st.session_state.get("frame_actual", 0) or 0),
                 estado_persistencia=st.session_state.get("estado_persistencia"),
+                plate_crop_selection=config.get("plate_crop_selection"),
+                inference_size=int(inference_size),
+                render_every_n_frames=int(render_every_n_frames),
+                max_display_fps=int(max_display_fps),
+                demo_fluido=modo_rendimiento == "Demo fluido",
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),
@@ -1159,6 +1446,11 @@ def pestana_monitoreo(config: dict) -> None:
                 persistencia_frames=int(persistencia_frames),
                 rotacion=rotacion,
                 model_path=ruta_modelo_placa,
+                plate_crop_selection=config.get("plate_crop_selection"),
+                inference_size=int(inference_size),
+                render_every_n_frames=int(render_every_n_frames),
+                max_display_fps=int(max_display_fps),
+                demo_fluido=modo_rendimiento == "Demo fluido",
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),
@@ -1172,13 +1464,14 @@ def pestana_monitoreo(config: dict) -> None:
     placa_evento = _obtener_placa_para_evento(resumen, placa_controlada)
     resumen = registrar_evento_monitoreo_si_corresponde(resumen, placa_evento, config["database"]["path"])
     resumen["velocidad_reproduccion"] = velocidad_reproduccion
+    resumen["modo_rendimiento"] = modo_rendimiento
     st.session_state.frame_actual = int(resumen.get("frame_actual", st.session_state.get("frame_actual", 0)) or 0)
     if resumen.get("estado_persistencia"):
         st.session_state.estado_persistencia = resumen["estado_persistencia"]
     st.session_state.ultimo_resultado = resumen
     progreso.progress(1.0)
     with panel_placeholder.container():
-        mostrar_panel_monitoreo_limpio(resumen, config)
+        mostrar_panel_monitoreo_limpio(resumen, config, ejecutar_lector_cnn=False)
 
     if fuente_monitoreo == "Video de prueba":
         st.session_state.monitoreo_activo = False
@@ -1203,7 +1496,7 @@ def pestana_pruebas(config: dict) -> None:
             placa_simulada = st.text_input(
                 "Placa manual/controlada",
                 value="PBC1234",
-                help="Valor temporal para probar base de datos y eventos hasta integrar OCR automÃ¡tico.",
+                help="Valor temporal para probar base de datos y eventos hasta integrar lector CNN automatico.",
             )
             distancia_simulada = st.number_input(
                 "Distancia real entre lÃ­neas en metros",
@@ -1317,8 +1610,8 @@ def pestana_pruebas(config: dict) -> None:
 
     with st.expander("Generar caracteres desde placas ecuatorianas", expanded=False):
         st.caption(
-            "Use esta herramienta para reforzar el dataset OCR con caracteres segmentados de placas reales. "
-            "No usa OCR externo ni entrena el modelo."
+            "Use esta herramienta para reforzar el dataset de caracteres CNN con caracteres segmentados de placas reales. "
+            "No usa motores OCR externos ni entrena el modelo."
         )
         imagenes_placas = listar_imagenes_placas()
         placa_generacion = st.text_input(
@@ -1511,7 +1804,7 @@ def pestana_pruebas(config: dict) -> None:
                                 st.write(rutas)
 
     with st.expander("Diagnóstico YOLO placas", expanded=False):
-        st.caption("Diagnóstico aislado del detector YOLO. No ejecuta OCR ni modifica el modelo.")
+        st.caption("Diagnóstico aislado del detector YOLO. No ejecuta reconocimiento de caracteres ni modifica el modelo.")
         detector_yolo = PlateDetector()
         modelo_existe = detector_yolo.model_path.exists()
         clases_modelo = getattr(detector_yolo.model, "names", {}) if detector_yolo.model is not None else {}
@@ -1734,10 +2027,10 @@ def pestana_pruebas(config: dict) -> None:
                         if res_robo["detecciones"]:
                             st.json([{k: v for k, v in det.items() if k != "recorte"} for det in res_robo["detecciones"]])
 
-    with st.expander("OCR experimental sobre recortes", expanded=False):
+    with st.expander("Reconocimiento CNN sobre recortes", expanded=False):
         recortes, fuente_recorte = _buscar_recortes_ocr()
         modo_ocr_exp = st.radio(
-            "Fuente de recorte OCR",
+            "Fuente de recorte para lector CNN",
             ["Recorte generado por el sistema", "Carga manual"],
             horizontal=True,
         )
@@ -1768,7 +2061,7 @@ def pestana_pruebas(config: dict) -> None:
                 st.info("Aun no hay recortes en eventos_placa ni placas_detectadas.")
         else:
             imagen_ocr = st.file_uploader(
-                "Cargar imagen de placa para OCR experimental",
+                "Cargar imagen de placa para reconocimiento CNN",
                 type=["jpg", "jpeg", "png", "bmp"],
                 key="imagen_ocr_experimental",
             )
@@ -1777,10 +2070,10 @@ def pestana_pruebas(config: dict) -> None:
                 fuente_ocr = "carga_manual"
                 st.image(ruta_ocr, caption="Imagen cargada", use_container_width=False)
 
-        ejecutar_ocr = st.button("Ejecutar OCR experimental", type="primary")
+        ejecutar_ocr = st.button("Ejecutar reconocimiento CNN", type="primary")
         if ejecutar_ocr:
             if not ruta_ocr:
-                st.warning("Selecciona o carga un recorte de placa antes de ejecutar OCR experimental.")
+                st.warning("Selecciona o carga un recorte de placa antes de ejecutar reconocimiento CNN.")
             else:
                 resultado_ocr = leer_placa_desde_recorte(
                     ruta_ocr,
@@ -1791,9 +2084,9 @@ def pestana_pruebas(config: dict) -> None:
                 reporte_diagnostico = registrar_diagnostico_recorte(resultado_ocr, placa_esperada_ocr)
 
                 col_ocr1, col_ocr2, col_ocr3 = st.columns(3)
-                col_ocr1.metric("Texto detectado crudo", resultado_ocr.get("texto_detectado_crudo") or resultado_ocr["texto_detectado"])
-                col_ocr2.metric("Texto postprocesado", resultado_ocr.get("texto_postprocesado") or "Pendiente")
-                col_ocr3.metric("Confianza promedio", f"{resultado_ocr.get('confianza_promedio', 0.0):.2f}")
+                col_ocr1.metric("Texto reconocido crudo", resultado_ocr.get("texto_detectado_crudo") or resultado_ocr["texto_detectado"])
+                col_ocr2.metric("Texto corregido por formato", resultado_ocr.get("texto_postprocesado") or "Pendiente")
+                col_ocr3.metric("Confianza CNN caracteres", f"{resultado_ocr.get('confianza_promedio', 0.0):.2f}")
 
                 formato = resultado_ocr.get("formato", {})
                 comparacion = resultado_ocr.get("comparacion", {})
@@ -1811,7 +2104,7 @@ def pestana_pruebas(config: dict) -> None:
                 st.caption(comparacion.get("mensaje", "Sin comparaciÃ³n."))
 
                 diagnostico = resultado_ocr.get("diagnostico", {})
-                st.subheader("Diagnostico del OCR real")
+                st.subheader("Diagnostico del lector CNN")
                 col_diag1, col_diag2, col_diag3 = st.columns(3)
                 col_diag1.metric("Caracteres esperados", diagnostico.get("cantidad_esperada", 0))
                 col_diag2.metric("Caracteres detectados", diagnostico.get("cantidad_detectada", 0))
@@ -2030,6 +2323,10 @@ def pestana_evidencias(config: dict) -> None:
 
 def pestana_configuracion(config: dict) -> None:
     st.header("Configuracion")
+    st.info(
+        "No se utilizan motores OCR externos. El reconocimiento se realiza con segmentacion OpenCV "
+        "y una CNN propia entrenada desde cero para clasificar caracteres."
+    )
     st.json(config)
     st.caption("Los cambios persistentes se realizan editando config.yaml.")
 

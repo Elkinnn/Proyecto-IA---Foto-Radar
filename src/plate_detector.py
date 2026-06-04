@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 import cv2
 
@@ -29,7 +30,8 @@ class PlateDetector:
             self.estado = f"error_cargando_modelo: {exc}"
             self.model = None
 
-    def detectar_en_frame(self, frame, conf_min: float = 0.25) -> dict:
+    def detectar_en_frame(self, frame, conf_min: float = 0.25, imgsz: int | None = None) -> dict:
+        inicio = time.perf_counter()
         if self.model is None:
             return {
                 "detectada": False,
@@ -37,17 +39,24 @@ class PlateDetector:
                 "detecciones_brutas": 0,
                 "debug_detecciones": [],
                 "frame_procesado": frame,
+                "tiempo_yolo_ms": 0.0,
+                "resolucion_inferencia": f"{frame.shape[1]}x{frame.shape[0]}" if frame is not None else "0x0",
                 "mensaje": "Modelo de placa no encontrado. Entrene primero el detector.",
             }
 
-        resultados = self.model.predict(source=frame, conf=conf_min, verbose=False)
+        frame_inferencia, escala_x, escala_y = _preparar_frame_inferencia(frame, imgsz)
+        resultados = self.model.predict(source=frame_inferencia, conf=conf_min, verbose=False)
         cajas = resultados[0].boxes if resultados else []
         frame_procesado = frame.copy()
         detecciones = []
         debug_detecciones = []
 
         for caja in cajas:
-            x1, y1, x2, y2 = [int(valor) for valor in caja.xyxy[0].tolist()]
+            xi1, yi1, xi2, yi2 = caja.xyxy[0].tolist()
+            x1 = int(xi1 / escala_x)
+            y1 = int(yi1 / escala_y)
+            x2 = int(xi2 / escala_x)
+            y2 = int(yi2 / escala_y)
             confianza = float(caja.conf[0])
             if confianza < conf_min:
                 debug_detecciones.append(_crear_debug(confianza, [x1, y1, x2, y2], False, "baja confianza"))
@@ -105,6 +114,8 @@ class PlateDetector:
             "detecciones_brutas": len(cajas),
             "debug_detecciones": debug_detecciones,
             "frame_procesado": frame_procesado,
+            "tiempo_yolo_ms": round((time.perf_counter() - inicio) * 1000, 3),
+            "resolucion_inferencia": f"{frame_inferencia.shape[1]}x{frame_inferencia.shape[0]}",
             "mensaje": "Placa detectada." if detecciones else "No se detecto placa.",
         }
 
@@ -174,3 +185,17 @@ def _crear_debug(confianza: float, bbox: list[int], aceptada: bool, motivo_recha
         "aceptada": aceptada,
         "motivo_rechazo": motivo_rechazo,
     }
+
+
+def _preparar_frame_inferencia(frame, imgsz: int | None):
+    if not imgsz or imgsz <= 0:
+        return frame, 1.0, 1.0
+    alto, ancho = frame.shape[:2]
+    lado_mayor = max(ancho, alto)
+    if lado_mayor <= imgsz:
+        return frame, 1.0, 1.0
+    escala = float(imgsz) / float(lado_mayor)
+    nuevo_ancho = max(1, int(ancho * escala))
+    nuevo_alto = max(1, int(alto * escala))
+    redimensionado = cv2.resize(frame, (nuevo_ancho, nuevo_alto), interpolation=cv2.INTER_AREA)
+    return redimensionado, nuevo_ancho / ancho, nuevo_alto / alto
