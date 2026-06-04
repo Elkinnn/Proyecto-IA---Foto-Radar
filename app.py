@@ -47,21 +47,30 @@ PERFORMANCE_MODE_LABELS = {
     "Rapido": "rapido",
     "Balanceado": "balanceado",
     "Preciso": "preciso",
-    "Demo fluido": "demo_fluido",
 }
 
 
 def _config_modo_rendimiento(config: dict, modo: str) -> dict:
     clave = PERFORMANCE_MODE_LABELS.get(modo, "balanceado")
     defaults = {
-        "rapido": {"yolo_every_n_frames": 10, "inference_size": 416, "render_every_n_frames": 3, "history_max": 10},
-        "balanceado": {"yolo_every_n_frames": 5, "inference_size": 640, "render_every_n_frames": 2, "history_max": 15},
-        "preciso": {"yolo_every_n_frames": 3, "inference_size": 640, "render_every_n_frames": 1, "history_max": 20},
-        "demo_fluido": {"yolo_every_n_frames": 15, "inference_size": 416, "render_every_n_frames": 1, "history_max": 5, "max_display_fps": 24},
+        "rapido": {"yolo_every_n_frames": 5, "inference_size": 416, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 24},
+        "balanceado": {"yolo_every_n_frames": 5, "inference_size": 512, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 24},
+        "preciso": {"yolo_every_n_frames": 3, "inference_size": 640, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 24},
     }
     salida = defaults[clave].copy()
     salida.update((config.get("monitoring_performance") or {}).get(clave, {}))
     return salida
+
+
+def _redimensionar_frame_rgb(frame_rgb, ancho_maximo: int = 800):
+    if frame_rgb is None or ancho_maximo <= 0:
+        return frame_rgb
+    alto, ancho = frame_rgb.shape[:2]
+    if ancho <= ancho_maximo:
+        return frame_rgb
+    escala = ancho_maximo / float(ancho)
+    nuevo_alto = max(1, int(alto * escala))
+    return cv2.resize(frame_rgb, (ancho_maximo, nuevo_alto), interpolation=cv2.INTER_AREA)
 
 
 st.set_page_config(
@@ -1071,6 +1080,7 @@ def _inicializar_estado_monitoreo() -> None:
         "recortes_placas_monitoreo": [],
         "ultima_clave_recorte_monitoreo": None,
         "contador_lector_cnn_monitoreo": 0,
+        "ultima_clave_panel_monitoreo": None,
     }
     for clave, valor in valores_iniciales.items():
         if clave not in st.session_state:
@@ -1090,12 +1100,11 @@ def pestana_monitoreo(config: dict) -> None:
         if fuente_monitoreo == "Video de prueba":
             video = st.file_uploader("Cargar video de prueba", type=["mp4", "avi", "mov", "mkv"], key="video_monitoreo")
         else:
-            indice_camara = st.number_input(
+            indice_camara = st.selectbox(
                 "Selector de camara",
-                min_value=0,
-                value=0,
-                step=1,
-                help="0 normalmente corresponde a la camara principal. Si usa una camara externa o Iriun, pruebe 1 o 2.",
+                options=[0, 1, 2, 3],
+                index=0,
+                help="Si usa celular como webcam, seleccione el indice correspondiente a Iriun/DroidCam/Camo.",
             )
 
         rotacion_ui = st.selectbox("Rotacion de imagen", ["Sin rotacion", "90 grados", "180 grados", "270 grados"])
@@ -1137,15 +1146,21 @@ def pestana_monitoreo(config: dict) -> None:
         limite_velocidad = float(config["speed"].get("campus_speed_limit_kmh", 30.0))
         posicion_linea_1 = 0.45
         posicion_linea_2 = 0.65
-        frecuencia_deteccion = int(config_rendimiento["yolo_every_n_frames"])
+        frecuencia_deteccion = 5 if fuente_monitoreo == "Video de prueba" else 3
+        frecuencia_deteccion = int((config.get("monitoring_performance") or {}).get("video" if fuente_monitoreo == "Video de prueba" else "camara", {}).get("yolo_every_n_frames", frecuencia_deteccion))
         inference_size = int(config_rendimiento["inference_size"])
         render_every_n_frames = int(config_rendimiento["render_every_n_frames"])
         st.session_state.historial_maximo_monitoreo = int(config_rendimiento["history_max"])
         conf_min = 0.45
-        persistencia_frames = 3
+        persistencia_frames = 10
         max_frames = 0
         velocidad_reproduccion = "Normal (1x)"
         placa_controlada = str(config.get("ocr", {}).get("manual_test_plate", "PBC1234"))
+        ancho_visual_max = 800
+        guardar_debug_monitoreo = False
+        resolucion_camara = "1280x720"
+        fps_camara_objetivo = 30
+        cooldown_cnn_frames = 15
 
         with st.expander("Configuracion avanzada", expanded=False):
             distancia_metros = st.number_input(
@@ -1164,12 +1179,40 @@ def pestana_monitoreo(config: dict) -> None:
             )
             posicion_linea_1 = st.slider("Posicion Linea 1", 0.05, 0.95, posicion_linea_1, 0.01)
             posicion_linea_2 = st.slider("Posicion Linea 2", 0.05, 0.95, posicion_linea_2, 0.01)
-            frecuencia_deteccion = st.slider("Frecuencia YOLO", 1, 60, frecuencia_deteccion)
+            frecuencia_deteccion = st.slider(
+                "Detectar cada N frames",
+                1,
+                30,
+                frecuencia_deteccion,
+                1,
+                help="YOLO se ejecuta solo cada N frames. En los frames intermedios se mantiene la ultima bbox visible.",
+            )
             inference_size = st.select_slider("Resolucion inferencia YOLO", options=[320, 416, 512, 640, 768], value=inference_size)
             render_every_n_frames = st.slider("Actualizar video cada N frames", 1, 10, render_every_n_frames, 1)
             max_display_fps = st.slider("FPS maximo visual (0 = sin limite)", 0, 30, max_display_fps, 1)
+            ancho_visual_max = st.select_slider("Ancho maximo visual", options=[640, 800, 960, 1200], value=ancho_visual_max)
             conf_min = st.slider("Confianza minima YOLO", 0.10, 0.90, conf_min, 0.05)
-            persistencia_frames = st.slider("Persistencia de deteccion", 0, 30, persistencia_frames, 1)
+            persistencia_frames = st.slider(
+                "Persistencia de bbox",
+                0,
+                30,
+                persistencia_frames,
+                1,
+                help="Mantiene la ultima caja visible aunque YOLO no se ejecute o falle temporalmente.",
+            )
+            cooldown_cnn_frames = st.slider(
+                "Cooldown lector CNN (frames)",
+                5,
+                90,
+                cooldown_cnn_frames,
+                5,
+                help="Evita repetir la lectura CNN continuamente sobre la misma placa.",
+            )
+            st.session_state.historial_maximo_monitoreo = st.slider("Maximo historial reciente", 5, 30, 10, 1)
+            guardar_debug_monitoreo = st.checkbox("Guardar debug pesado", value=False)
+            if fuente_monitoreo == "Camara en vivo":
+                resolucion_camara = st.selectbox("Resolucion de camara", ["640x480", "1280x720"], index=1)
+                fps_camara_objetivo = st.selectbox("FPS objetivo camara", [15, 24, 30], index=2)
             max_frames = st.number_input(
                 "Frames maximos a procesar (0 = completo)",
                 min_value=0,
@@ -1186,8 +1229,12 @@ def pestana_monitoreo(config: dict) -> None:
             st.caption(f"Modelo lector CNN de caracteres: {config['models'].get('character_reader_path')}")
             if fuente_monitoreo == "Camara en vivo":
                 st.caption(
-                    f"Camara: YOLO cada {frecuencia_deteccion} frames | inferencia {inference_size}px"
+                    f"Camara: YOLO cada {frecuencia_deteccion} frames | inferencia {inference_size}px | {resolucion_camara}"
                 )
+
+        ancho_camara, alto_camara = [int(valor) for valor in resolucion_camara.split("x")]
+        plate_crop_cfg = dict(config.get("plate_crop_selection") or {})
+        plate_crop_cfg["cooldown_frames"] = int(cooldown_cnn_frames)
 
     with visor_col:
         frame_placeholder = st.empty()
@@ -1228,6 +1275,7 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.recortes_placas_monitoreo = []
         st.session_state.ultima_clave_recorte_monitoreo = None
         st.session_state.contador_lector_cnn_monitoreo = 0
+        st.session_state.ultima_clave_panel_monitoreo = None
 
     if posicion_linea_2 <= posicion_linea_1:
         st.warning("La Linea 2 debe estar debajo de la Linea 1 para medir movimiento de arriba hacia abajo.")
@@ -1273,6 +1321,7 @@ def pestana_monitoreo(config: dict) -> None:
             st.session_state.recortes_placas_monitoreo = []
             st.session_state.ultima_clave_recorte_monitoreo = None
             st.session_state.contador_lector_cnn_monitoreo = 0
+            st.session_state.ultima_clave_panel_monitoreo = None
         if fuente_monitoreo == "Video de prueba":
             if not reanudar_video:
                 st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
@@ -1371,8 +1420,9 @@ def pestana_monitoreo(config: dict) -> None:
             mostrar_panel_monitoreo_limpio(resumen_parcial, config, ejecutar_lector_cnn=False)
 
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
-        frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-        st.session_state.ultima_imagen_procesada = frame_rgb
+        frame_mostrado = _redimensionar_frame_rgb(frame_rgb, int(ancho_visual_max))
+        frame_placeholder.image(frame_mostrado, channels="RGB", use_container_width=True)
+        st.session_state.ultima_imagen_procesada = frame_mostrado
         if estado_frame:
             st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
             if estado_frame.get("estado_persistencia"):
@@ -1385,7 +1435,22 @@ def pestana_monitoreo(config: dict) -> None:
                 f"Confianza YOLO: {texto_confianza} | "
                 f"FPS proc: {estado_frame.get('fps_procesamiento', 'Pendiente')}"
             )
-            if estado_frame.get("ultimo_recorte_placa") or estado_frame.get("ruta_mejor_recorte_evento"):
+            clave_panel = (
+                estado_frame.get("mejor_recorte_placa")
+                or estado_frame.get("ruta_mejor_recorte_evento")
+                or estado_frame.get("ultimo_recorte_placa"),
+                estado_frame.get("evento_id"),
+                estado_frame.get("texto_ocr_corregido"),
+            )
+            debe_actualizar_panel = (
+                clave_panel[0]
+                and (
+                    clave_panel != st.session_state.get("ultima_clave_panel_monitoreo")
+                    or int(estado_frame.get("frames_procesados", numero_frame) or numero_frame) % 15 == 0
+                )
+            )
+            if debe_actualizar_panel:
+                st.session_state.ultima_clave_panel_monitoreo = clave_panel
                 _actualizar_panel_desde_estado(estado_frame)
         else:
             estado_placeholder.info(f"Procesando frame {numero_frame}")
@@ -1423,11 +1488,12 @@ def pestana_monitoreo(config: dict) -> None:
                 model_path=ruta_modelo_placa,
                 start_frame=int(st.session_state.get("frame_actual", 0) or 0),
                 estado_persistencia=st.session_state.get("estado_persistencia"),
-                plate_crop_selection=config.get("plate_crop_selection"),
+                plate_crop_selection=plate_crop_cfg,
                 inference_size=int(inference_size),
                 render_every_n_frames=int(render_every_n_frames),
                 max_display_fps=int(max_display_fps),
                 demo_fluido=modo_rendimiento == "Demo fluido",
+                guardar_debug=bool(guardar_debug_monitoreo),
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),
@@ -1446,11 +1512,15 @@ def pestana_monitoreo(config: dict) -> None:
                 persistencia_frames=int(persistencia_frames),
                 rotacion=rotacion,
                 model_path=ruta_modelo_placa,
-                plate_crop_selection=config.get("plate_crop_selection"),
+                plate_crop_selection=plate_crop_cfg,
                 inference_size=int(inference_size),
                 render_every_n_frames=int(render_every_n_frames),
                 max_display_fps=int(max_display_fps),
                 demo_fluido=modo_rendimiento == "Demo fluido",
+                camera_width=int(ancho_camara),
+                camera_height=int(alto_camara),
+                camera_fps=int(fps_camara_objetivo),
+                guardar_debug=bool(guardar_debug_monitoreo),
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),

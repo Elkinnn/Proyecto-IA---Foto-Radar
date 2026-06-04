@@ -29,30 +29,31 @@ plate_crop_selection:
   max_area_relative: 0.08
   border_margin_px: 5
   min_sharpness: 30.0
-  cooldown_frames: 45
+  cooldown_frames: 15
   min_score_improvement: 0.03
 
 monitoring_performance:
+  video:
+    yolo_every_n_frames: 5
+  camara:
+    yolo_every_n_frames: 3
   rapido:
-    yolo_every_n_frames: 10
+    yolo_every_n_frames: 5
     inference_size: 416
-    render_every_n_frames: 3
+    render_every_n_frames: 1
     history_max: 10
+    max_display_fps: 24
   balanceado:
     yolo_every_n_frames: 5
-    inference_size: 640
-    render_every_n_frames: 2
-    history_max: 15
+    inference_size: 512
+    render_every_n_frames: 1
+    history_max: 10
+    max_display_fps: 24
   preciso:
     yolo_every_n_frames: 3
     inference_size: 640
     render_every_n_frames: 1
-    history_max: 20
-  demo_fluido:
-    yolo_every_n_frames: 15
-    inference_size: 416
-    render_every_n_frames: 1
-    history_max: 5
+    history_max: 10
     max_display_fps: 24
 
 fuzzy:

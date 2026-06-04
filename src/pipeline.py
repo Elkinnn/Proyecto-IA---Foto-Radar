@@ -126,6 +126,7 @@ def procesar_video_monitoreo(
     render_every_n_frames: int = 1,
     max_display_fps: int = 24,
     demo_fluido: bool = False,
+    guardar_debug: bool = False,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -153,6 +154,7 @@ def procesar_video_monitoreo(
         render_every_n_frames=render_every_n_frames,
         max_display_fps=max_display_fps,
         demo_fluido=demo_fluido,
+        guardar_debug=guardar_debug,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
@@ -177,6 +179,10 @@ def procesar_camara_monitoreo(
     render_every_n_frames: int = 1,
     max_display_fps: int = 24,
     demo_fluido: bool = False,
+    camera_width: int = 1280,
+    camera_height: int = 720,
+    camera_fps: int = 30,
+    guardar_debug: bool = False,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
@@ -202,6 +208,10 @@ def procesar_camara_monitoreo(
         render_every_n_frames=render_every_n_frames,
         max_display_fps=max_display_fps,
         demo_fluido=demo_fluido,
+        camera_width=camera_width,
+        camera_height=camera_height,
+        camera_fps=camera_fps,
+        guardar_debug=guardar_debug,
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
@@ -352,11 +362,25 @@ def _procesar_fuente_monitoreo(
     render_every_n_frames: int = 1,
     max_display_fps: int = 24,
     demo_fluido: bool = False,
+    camera_width: int | None = None,
+    camera_height: int | None = None,
+    camera_fps: int | None = None,
+    guardar_debug: bool = False,
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
 ) -> dict:
-    captura = cv2.VideoCapture(fuente)
+    if isinstance(fuente, int):
+        captura = cv2.VideoCapture(fuente, cv2.CAP_DSHOW)
+        if camera_width:
+            captura.set(cv2.CAP_PROP_FRAME_WIDTH, int(camera_width))
+        if camera_height:
+            captura.set(cv2.CAP_PROP_FRAME_HEIGHT, int(camera_height))
+        if camera_fps:
+            captura.set(cv2.CAP_PROP_FPS, int(camera_fps))
+        captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    else:
+        captura = cv2.VideoCapture(fuente)
     detector = _obtener_detector_cache(str(model_path) if model_path else None)
 
     if not captura.isOpened():
@@ -391,6 +415,8 @@ def _procesar_fuente_monitoreo(
         }
 
     fps, ancho, alto, total_frames, duracion = _leer_metadata_video(captura)
+    if isinstance(fuente, int) and fps <= 0 and camera_fps:
+        fps = float(camera_fps)
     start_frame = max(int(start_frame or 0), 0)
     if start_frame > 0 and total_frames > 0:
         start_frame = min(start_frame, max(total_frames - 1, 0))
@@ -471,6 +497,7 @@ def _procesar_fuente_monitoreo(
             fps,
             plate_crop_selection,
             inference_size,
+            guardar_debug,
         )
         tiempos_etapa["procesamiento_frame_ms"] = round((time.perf_counter() - t_procesamiento) * 1000, 3)
         frame = estado_frame["frame_visual"]
@@ -554,7 +581,12 @@ def _procesar_fuente_monitoreo(
                 "render_every_n_frames": render_every_n_frames,
                 "frames_mostrados": frames_mostrados + 1,
                 "frames_yolo_analizados": frames_yolo_analizados,
+                "frames_cnn_ejecutados": estado_persistencia.get("frames_cnn_ejecutados", 0),
                 "demo_fluido": demo_fluido,
+                "guardar_debug": guardar_debug,
+                "camera_width": camera_width,
+                "camera_height": camera_height,
+                "camera_fps": camera_fps,
                 "tiempos_etapa": tiempos_etapa.copy(),
                 "estado_persistencia": estado_persistencia,
                 "evento_activo": estado_frame["evento_activo"],
@@ -636,7 +668,12 @@ def _procesar_fuente_monitoreo(
         "max_display_fps": max_display_fps,
         "frames_mostrados": frames_mostrados,
         "frames_yolo_analizados": frames_yolo_analizados,
+        "frames_cnn_ejecutados": estado_persistencia.get("frames_cnn_ejecutados", 0),
         "demo_fluido": demo_fluido,
+        "guardar_debug": guardar_debug,
+        "camera_width": camera_width,
+        "camera_height": camera_height,
+        "camera_fps": camera_fps,
         "tiempos_etapa": tiempos_etapa,
         "primer_frame_evidencia": str(primer_frame_evidencia) if frames_procesados else None,
         "ultimo_frame_evidencia": str(ultimo_frame_evidencia) if frames_procesados else None,
@@ -1364,6 +1401,7 @@ def _procesar_frame_monitoreo(
     fps: float,
     plate_crop_selection: dict | None = None,
     inference_size: int = 640,
+    guardar_debug: bool = False,
 ) -> dict:
     frame_limpio = frame_original.copy()
     frame_visual = frame_original.copy()
@@ -1396,7 +1434,8 @@ def _procesar_frame_monitoreo(
         detecciones_brutas = resultado_detector.get("detecciones_brutas", 0)
         tiempo_yolo_ms = float(resultado_detector.get("tiempo_yolo_ms", 0.0) or 0.0)
         resolucion_inferencia = resultado_detector.get("resolucion_inferencia", resolucion_inferencia)
-        _guardar_debug_evento_detecciones(numero_frame, resultado_detector.get("debug_detecciones", []))
+        if guardar_debug:
+            _guardar_debug_evento_detecciones(numero_frame, resultado_detector.get("debug_detecciones", []))
         motivos_rechazo = _resumir_motivos_rechazo(resultado_detector.get("debug_detecciones", []))
         detecciones_validas = _filtrar_detecciones_zona_superior(
             resultado_detector["detecciones"],
@@ -1467,7 +1506,7 @@ def _procesar_frame_monitoreo(
             "frame_deteccion": estado_persistencia.get("ultimo_frame_deteccion"),
         }
 
-        if ultimo_recorte_placa:
+        if ultimo_recorte_placa and guardar_debug:
             frame_deteccion_path = placas_dir / f"frame_deteccion_{numero_frame:06d}.jpg"
             cv2.imwrite(str(frame_deteccion_path), frame_visual)
             ultimo_frame_deteccion = str(frame_deteccion_path)
