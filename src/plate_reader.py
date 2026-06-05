@@ -371,6 +371,7 @@ def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
             "caracter_predicho": "",
             "confianza": 0.0,
             "top3_predicciones": [],
+            "probs_por_clase": {},
             "ruta_debug_normalizada": normalizacion.get("ruta_debug_normalizada"),
             "mensaje": normalizacion.get("mensaje", "No se pudo normalizar el caracter."),
         }
@@ -394,6 +395,7 @@ def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
             "caracter_predicho": "",
             "confianza": 0.0,
             "top3_predicciones": [],
+            "probs_por_clase": {},
             "ruta_debug_normalizada": normalizacion.get("ruta_debug_normalizada"),
             "mensaje": f"Error en prediccion CNN: {exc}",
         }
@@ -405,11 +407,13 @@ def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
         }
         for idx in indices_top
     ]
+    probs_por_clase = {str(class_names[i]): float(prediccion[i]) for i in range(len(class_names))}
     mejor = top3[0] if top3 else {"caracter": "", "confianza": 0.0}
     return {
         "caracter_predicho": mejor["caracter"],
         "confianza": float(mejor["confianza"]),
         "top3_predicciones": top3,
+        "probs_por_clase": probs_por_clase,
         "ruta_debug_normalizada": normalizacion.get("ruta_debug_normalizada"),
         "shape_array": normalizacion.get("shape_array"),
         "dtype_array": normalizacion.get("dtype_array"),
@@ -419,25 +423,82 @@ def predecir_caracter(ruta_caracter: str, modelo, class_names: list) -> dict:
     }
 
 
+DIGITOS_PLACA = set("0123456789")
+LETRAS_PLACA = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _tipo_posicion_formato(idx: int) -> str:
+    """Formato Ecuador: 3 letras + 3/4 digitos. Posiciones 0-2 = letra, resto = numero."""
+    return "letra" if idx < 3 else "numero"
+
+
+def _mejor_caracter_por_tipo(probs_por_clase: dict, tipo: str) -> tuple[str, float]:
+    """Devuelve (caracter, confianza) restringiendo el argmax al universo del tipo."""
+    universo = LETRAS_PLACA if tipo == "letra" else DIGITOS_PLACA
+    candidatos = [(c, p) for c, p in (probs_por_clase or {}).items() if c in universo]
+    if not candidatos:
+        return "", 0.0
+    candidatos.sort(key=lambda kv: kv[1], reverse=True)
+    return candidatos[0][0], float(candidatos[0][1])
+
+
+def _top3_por_tipo(probs_por_clase: dict, tipo: str) -> list:
+    universo = LETRAS_PLACA if tipo == "letra" else DIGITOS_PLACA
+    candidatos = sorted(
+        ((c, p) for c, p in (probs_por_clase or {}).items() if c in universo),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:3]
+    return [{"caracter": c, "confianza": float(p)} for c, p in candidatos]
+
+
+def _confianzas_enmascaradas_ventana(ventana: list) -> tuple[str, list]:
+    """Calcula texto y confianzas aplicando la mascara de tipo por posicion, SIN mutar."""
+    chars, confs = [], []
+    for i, pred in enumerate(ventana):
+        tipo = _tipo_posicion_formato(i)
+        ch, conf = _mejor_caracter_por_tipo(pred.get("probs_por_clase"), tipo)
+        chars.append(ch)
+        confs.append(conf)
+    return "".join(chars), confs
+
+
 def _puntuar_ventana_lectura(predicciones: list) -> float:
+    """Puntaje de una ventana usando la prediccion enmascarada por formato."""
     if not predicciones:
         return -999.0
-    texto = "".join(p.get("caracter_predicho", "") for p in predicciones)
-    confs = [float(p.get("confianza", 0.0)) for p in predicciones]
+    texto, confs = _confianzas_enmascaradas_ventana(predicciones)
     puntaje = sum(confs)
     if confs:
         puntaje += min(confs) * 2.0
-    formato = validar_formato_placa_ecuador(texto)
-    if formato.get("valido"):
+    if validar_formato_placa_ecuador(texto).get("valido"):
         puntaje += 40.0
     if len(predicciones) in (6, 7):
         puntaje += 10.0
     return puntaje
 
 
+def _aplicar_mascara_formato(ventana: list) -> None:
+    """Reemplaza caracter_predicho/confianza/top3 por la version restringida al tipo
+    de cada posicion (letra en 0-2, numero en 3+). Conserva la prediccion cruda."""
+    for i, pred in enumerate(ventana):
+        tipo = _tipo_posicion_formato(i)
+        ch, conf = _mejor_caracter_por_tipo(pred.get("probs_por_clase"), tipo)
+        if "caracter_predicho_crudo" not in pred:
+            pred["caracter_predicho_crudo"] = pred.get("caracter_predicho", "")
+            pred["confianza_cruda"] = float(pred.get("confianza", 0.0))
+        pred["caracter_predicho"] = ch
+        pred["confianza"] = conf
+        pred["tipo_posicion"] = tipo
+        top3 = _top3_por_tipo(pred.get("probs_por_clase"), tipo)
+        if top3:
+            pred["top3_predicciones"] = top3
+
+
 def _reconstruir_con_ventana_formato(caracteres_segmentados: list, modelo, class_names: list) -> dict:
-    """Predice todos los caracteres y, si hay restos de marco (6-9 slots), elige la
-    ventana de 6 o 7 consecutivos con mejor formato ecuatoriano y confianza."""
+    """Predice todos los caracteres, restringe cada posicion al tipo del formato
+    Ecuador (3 letras + 3/4 numeros) y, si hay restos de marco (>7 slots), elige la
+    ventana de 6 o 7 consecutivos con mejor formato y confianza enmascarada."""
     predicciones = []
     for indice, caracter in enumerate(caracteres_segmentados, start=1):
         prediccion = predecir_caracter(caracter.get("ruta_caracter", ""), modelo, class_names)
@@ -448,19 +509,12 @@ def _reconstruir_con_ventana_formato(caracteres_segmentados: list, modelo, class
 
     n = len(predicciones)
     if n < CARACTERES_MIN_PLACA:
-        texto = "".join(p.get("caracter_predicho", "") for p in predicciones)
-        confs = [float(p.get("confianza", 0.0)) for p in predicciones]
-        return {
-            "texto_detectado": texto,
-            "confianza_promedio": sum(confs) / len(confs) if confs else 0.0,
-            "predicciones_caracteres": predicciones,
-        }
-
-    if n in (CARACTERES_MIN_PLACA, CARACTERES_MAX_PLACA):
+        ventana = predicciones
+    elif n in (CARACTERES_MIN_PLACA, CARACTERES_MAX_PLACA):
         ventana = predicciones
     else:
-        mejor_ventana = predicciones
-        mejor_puntaje = _puntuar_ventana_lectura(predicciones)
+        mejor_ventana = predicciones[:CARACTERES_MAX_PLACA]
+        mejor_puntaje = -1e9
         for tam in (CARACTERES_MAX_PLACA, CARACTERES_MIN_PLACA):
             if n < tam:
                 continue
@@ -472,6 +526,7 @@ def _reconstruir_con_ventana_formato(caracteres_segmentados: list, modelo, class
                     mejor_ventana = candidata
         ventana = mejor_ventana
 
+    _aplicar_mascara_formato(ventana)
     for idx, pred in enumerate(ventana, start=1):
         pred["indice"] = idx
     texto = "".join(p.get("caracter_predicho", "") for p in ventana)
