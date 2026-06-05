@@ -21,6 +21,10 @@ from src.fuzzy_system import clasificar_velocidad
 from src.notifier import generar_notificacion_simulada, guardar_notificacion_simulada
 from src.plate_detector import PlateDetector
 from src.plate_reader import (
+    asegurar_rgb,
+    consolidar_lecturas_evento_placa,
+    guardar_debug_votacion_evento,
+    leer_placa_cnn_seguro_desde_monitoreo,
     leer_placa_desde_recorte,
     preprocesar_placa,
     registrar_diagnostico_recorte,
@@ -471,7 +475,7 @@ def ejecutar_simulacion_velocidad(
         "evento_id": evento_id,
         "notificacion": notificacion,
         "datos": datos,
-        "frame_final_rgb": cv2.cvtColor(ultimo_frame, cv2.COLOR_BGR2RGB) if ultimo_frame is not None else None,
+        "frame_final_rgb": asegurar_rgb(ultimo_frame) if ultimo_frame is not None else None,
         "ruta_json": str(rutas["json"]),
     }
 
@@ -725,34 +729,126 @@ def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
 
     try:
         inicio_lector = time.perf_counter()
-        resultado_ocr = leer_placa_desde_recorte(str(ruta_recorte), placa_esperada="")
+        resultado_ocr = leer_placa_cnn_seguro_desde_monitoreo(
+            str(ruta_recorte),
+            contexto={
+                "funcion": "_enriquecer_resumen_monitoreo_con_ocr",
+                "frame_actual": resumen.get("frame_actual"),
+                "evento_id": resumen.get("evento_id"),
+                "fuente": resumen.get("fuente"),
+            },
+        )
         tiempo_lector_ms = (time.perf_counter() - inicio_lector) * 1000
+        lector_ok = bool(resultado_ocr.get("ok", True))
+        texto_crudo = resultado_ocr.get("texto_detectado_crudo") or resultado_ocr.get("texto_crudo") or ""
+        texto_corregido = resultado_ocr.get("texto_postprocesado") or resultado_ocr.get("texto_corregido_formato") or ""
+        estado_lectura = resultado_ocr.get("estado_lectura") or resultado_ocr.get("estado") or "pendiente"
+        motivo_lectura = resultado_ocr.get("motivo") or resultado_ocr.get("motivo_sin_lectura") or resultado_ocr.get("causa_probable") or ""
+        if texto_corregido and estado_lectura == "lectura_parcial":
+            texto_panel = f"Lectura parcial: {texto_corregido}"
+        elif texto_corregido and estado_lectura == "formato_dudoso":
+            texto_panel = f"Formato dudoso: {texto_corregido}"
+        elif texto_corregido:
+            texto_panel = texto_corregido
+        elif texto_crudo:
+            texto_panel = f"Lectura parcial: {texto_crudo}"
+        else:
+            texto_panel = f"Sin lectura: {motivo_lectura or estado_lectura}"
         datos_ocr = {
-            "texto_ocr_crudo": resultado_ocr.get("texto_detectado_crudo") or "Pendiente",
-            "texto_ocr_corregido": resultado_ocr.get("texto_postprocesado") or "Pendiente",
-            "confianza_ocr": resultado_ocr.get("confianza_promedio"),
-            "formato_ocr_valido": bool((resultado_ocr.get("formato") or {}).get("valido")),
-            "estado_ocr": resultado_ocr.get("estado"),
-            "mensaje_ocr": resultado_ocr.get("mensaje"),
+            "texto_ocr_crudo": texto_crudo or texto_panel,
+            "texto_ocr_corregido": texto_panel,
+            "confianza_ocr": resultado_ocr.get("confianza_promedio") or resultado_ocr.get("confianza_cnn_caracteres"),
+            "formato_ocr_valido": bool(resultado_ocr.get("formato_valido") or (resultado_ocr.get("formato") or {}).get("valido")),
+            "estado_ocr": estado_lectura,
+            "mensaje_ocr": resultado_ocr.get("mensaje") or resultado_ocr.get("error"),
             "causa_probable_ocr": resultado_ocr.get("causa_probable"),
+            "motivo_lector_cnn": motivo_lectura,
             "ruta_placa_preprocesada_ocr": (resultado_ocr.get("preprocesamiento") or {}).get("ruta_imagen_procesada"),
+            "metodo_rectificacion": resultado_ocr.get("metodo_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("metodo_rectificacion"),
+            "puntaje_rectificacion": resultado_ocr.get("puntaje_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("confianza_rectificacion"),
+            "ruta_rectificacion_ocr": (resultado_ocr.get("rectificacion") or {}).get("ruta_seleccionada"),
             "ruta_debug_segmentacion_ocr": resultado_ocr.get("ruta_debug_segmentacion"),
             "ruta_banda_ocr": resultado_ocr.get("ruta_banda"),
-            "caracteres_segmentados_ocr": resultado_ocr.get("caracteres", []),
+            "ruta_debug_sin_lectura": resultado_ocr.get("ruta_debug_sin_lectura"),
+            "estrategia_segmentacion": resultado_ocr.get("estrategia_segmentacion") or (resultado_ocr.get("segmentacion") or {}).get("estrategia_segmentacion"),
+            "puntaje_segmentacion": resultado_ocr.get("puntaje_segmentacion") if resultado_ocr.get("puntaje_segmentacion") is not None else (resultado_ocr.get("segmentacion") or {}).get("puntaje_segmentacion"),
+            "caracteres_segmentados_ocr": resultado_ocr.get("caracteres_segmentados") or resultado_ocr.get("caracteres", []),
             "cantidad_caracteres_segmentados_ocr": resultado_ocr.get("cantidad_caracteres_segmentados", 0),
             "tiempo_lector_cnn_ms": round(tiempo_lector_ms, 3),
+            "lector_cnn_ok": lector_ok,
+            "etapa_error_lector_cnn": resultado_ocr.get("etapa_error"),
         }
+        lectura_evento = {
+            "ruta_recorte": str(ruta_recorte),
+            "frame_index": resumen.get("frame_actual") or resumen.get("frames_procesados"),
+            "confianza_yolo": (resumen.get("ultima_deteccion") or {}).get("confianza") or (resumen.get("mejor_recorte_placa_info") or {}).get("conf_yolo"),
+            "puntaje_recorte": (resumen.get("mejor_recorte_placa_info") or {}).get("puntaje_total"),
+            "nitidez": (resumen.get("mejor_recorte_placa_info") or {}).get("nitidez"),
+            "area_relativa": (resumen.get("mejor_recorte_placa_info") or {}).get("area_relativa"),
+            "aspect_ratio": (resumen.get("mejor_recorte_placa_info") or {}).get("aspect_ratio"),
+            "metodo_rectificacion": datos_ocr.get("metodo_rectificacion"),
+            "puntaje_rectificacion": datos_ocr.get("puntaje_rectificacion"),
+            "estrategia_segmentacion": datos_ocr.get("estrategia_segmentacion"),
+            "puntaje_segmentacion": datos_ocr.get("puntaje_segmentacion"),
+            "segmentacion_guiada_formato": bool((resultado_ocr.get("segmentacion") or {}).get("segmentacion_guiada_formato")),
+            "guion_descartado": bool((resultado_ocr.get("segmentacion") or {}).get("guion_descartado")),
+            "motivos_rechazo": resultado_ocr.get("motivos_rechazo") or (resultado_ocr.get("segmentacion") or {}).get("motivos_rechazo") or {},
+            "cantidad_caracteres_segmentados": datos_ocr.get("cantidad_caracteres_segmentados_ocr"),
+            "texto_crudo": texto_crudo,
+            "texto_corregido_formato": texto_corregido,
+            "confianza_cnn_caracteres": datos_ocr.get("confianza_ocr"),
+            "formato_valido": datos_ocr.get("formato_ocr_valido"),
+            "estado_lectura": estado_lectura,
+            "predicciones_caracteres": resultado_ocr.get("predicciones_caracteres", []),
+        }
+        lecturas = st.session_state.get("lecturas_evento_placa_monitoreo", [])
+        if not any(item.get("ruta_recorte") == lectura_evento["ruta_recorte"] for item in lecturas):
+            lecturas.insert(0, lectura_evento)
+        lecturas = lecturas[:8]
+        st.session_state.lecturas_evento_placa_monitoreo = lecturas
+        consolidado = consolidar_lecturas_evento_placa(list(reversed(lecturas)), max_lecturas=5)
+        try:
+            ruta_debug_votacion = guardar_debug_votacion_evento(
+                resumen.get("evento_id") or resumen.get("eventos_placa") or "monitoreo",
+                list(reversed(lecturas)),
+                consolidado,
+            )
+        except Exception:
+            ruta_debug_votacion = ""
+        datos_ocr.update(
+            {
+                "placa_individual": texto_corregido or texto_crudo,
+                "placa_consolidada_evento": consolidado.get("texto_final") or texto_corregido or texto_crudo,
+                "estado_consolidado_evento": consolidado.get("estado"),
+                "confianza_final_evento": consolidado.get("confianza_final"),
+                "formato_consolidado_valido": consolidado.get("formato_valido"),
+                "votos_por_posicion_evento": consolidado.get("votos_por_posicion", []),
+                "correcciones_evento": consolidado.get("correcciones_por_formato", []),
+                "lecturas_usadas_evento": consolidado.get("cantidad_lecturas_usadas", 0),
+                "lecturas_descartadas_evento": consolidado.get("cantidad_lecturas_descartadas", 0),
+                "lecturas_descartadas_detalle": consolidado.get("lecturas_descartadas", []),
+                "lectura_base_usada": consolidado.get("lectura_base_usada", {}),
+                "recortes_usados_evento": len(lecturas),
+                "ruta_debug_votacion_evento": ruta_debug_votacion,
+            }
+        )
         st.session_state.contador_lector_cnn_monitoreo = int(st.session_state.get("contador_lector_cnn_monitoreo", 0) or 0) + 1
-        _registrar_metricas_ocr_mejor_recorte(resumen, resultado_ocr)
     except Exception as exc:
         datos_ocr = {
-            "texto_ocr_crudo": "Error lector CNN",
-            "texto_ocr_corregido": "Error lector CNN",
+            "texto_ocr_crudo": "Sin lectura",
+            "texto_ocr_corregido": "Sin lectura",
             "confianza_ocr": None,
             "formato_ocr_valido": False,
             "estado_ocr": "error",
             "mensaje_ocr": str(exc),
+            "lector_cnn_ok": False,
+            "etapa_error_lector_cnn": "salida_interfaz",
         }
+    else:
+        try:
+            _registrar_metricas_ocr_mejor_recorte(resumen, resultado_ocr)
+        except Exception as exc:
+            datos_ocr["mensaje_metricas_lector_cnn"] = f"No se pudieron guardar metricas: {exc}"
 
     st.session_state.ultimo_recorte_ocr_procesado = ruta_recorte
     st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
@@ -828,8 +924,11 @@ def _actualizar_historial_monitoreo(resumen: dict) -> None:
 
     fila = {
         "hora": datetime.now().strftime("%H:%M:%S"),
-        "placa detectada": resumen.get("texto_ocr_crudo") or "Pendiente",
-        "placa corregida": resumen.get("texto_ocr_corregido") or resumen.get("placa_controlada") or "Pendiente",
+        "placa individual": resumen.get("placa_individual") or resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "Pendiente",
+        "placa consolidada": resumen.get("placa_consolidada_evento") or resumen.get("texto_ocr_corregido") or resumen.get("placa_controlada") or "Pendiente",
+        "estado lectura": resumen.get("estado_consolidado_evento") or resumen.get("estado_ocr") or "Pendiente",
+        "frames usados": resumen.get("lecturas_usadas_evento", "Pendiente"),
+        "recortes usados": resumen.get("recortes_usados_evento", "Pendiente"),
         "confianza YOLO": (
             f"{float(ultima_deteccion.get('confianza')):.2f}"
             if ultima_deteccion.get("confianza") is not None
@@ -840,12 +939,18 @@ def _actualizar_historial_monitoreo(resumen: dict) -> None:
             if resumen.get("confianza_ocr") is not None
             else "Pendiente"
         ),
+        "confianza final": (
+            f"{float(resumen.get('confianza_final_evento')):.2f}"
+            if resumen.get("confianza_final_evento") is not None
+            else "Pendiente"
+        ),
         "velocidad": (
             f"{velocidad.get('velocidad_kmh'):.2f} km/h"
             if velocidad.get("velocidad_kmh") is not None
             else "Pendiente"
         ),
         "estado": _accion_monitoreo(resumen),
+        "formato valido": "Si" if resumen.get("formato_consolidado_valido") else "No",
         "encontrada en BD": "Si" if resumen.get("vehiculo_encontrado") else "No",
     }
     historial = st.session_state.get("historial_detecciones_monitoreo", [])
@@ -869,9 +974,11 @@ def _actualizar_recortes_monitoreo(resumen: dict) -> None:
     item = {
         "ruta": clave,
         "hora": datetime.now().strftime("%H:%M:%S"),
-        "lector CNN": resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "Pendiente",
+        "lector CNN": resumen.get("placa_consolidada_evento") or resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "Pendiente",
+        "individual": resumen.get("placa_individual") or resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "Pendiente",
         "confianza_yolo": (resumen.get("ultima_deteccion") or {}).get("confianza"),
         "confianza_ocr": resumen.get("confianza_ocr"),
+        "confianza_final": resumen.get("confianza_final_evento"),
     }
     recortes = st.session_state.get("recortes_placas_monitoreo", [])
     if not any(actual.get("ruta") == clave for actual in recortes):
@@ -919,7 +1026,7 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict, ejecutar_lector_
     with col_info:
         c1, c2, c3 = st.columns(3)
         c1.metric("Texto reconocido crudo", resumen.get("texto_ocr_crudo", "Pendiente"))
-        c2.metric("Texto corregido por formato", resumen.get("texto_ocr_corregido", "Pendiente"))
+        c2.metric("Placa consolidada", resumen.get("placa_consolidada_evento") or resumen.get("texto_ocr_corregido", "Pendiente"))
         c3.metric("Confianza CNN caracteres", f"{confianza_ocr:.2f}" if confianza_ocr is not None else "Pendiente")
 
         c4, c5, c6 = st.columns(3)
@@ -939,8 +1046,33 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict, ejecutar_lector_
 
         c10, c11, c12 = st.columns(3)
         c10.metric("Caracteres CNN", resumen.get("cantidad_caracteres_segmentados_ocr", "Pendiente"))
-        c11.metric("Formato", "Valido" if resumen.get("formato_ocr_valido") else "Pendiente")
-        c12.metric("Causa probable", resumen.get("causa_probable_ocr") or "Pendiente")
+        c11.metric("Estado lector CNN", resumen.get("estado_ocr") or "Pendiente")
+        c12.metric("Motivo", resumen.get("motivo_lector_cnn") or resumen.get("causa_probable_ocr") or "Pendiente")
+        c13, c14, c15 = st.columns(3)
+        c13.metric("Estrategia segmentacion", resumen.get("estrategia_segmentacion") or "Pendiente")
+        c14.metric(
+            "Puntaje segmentacion",
+            f"{float(resumen.get('puntaje_segmentacion')):.2f}" if resumen.get("puntaje_segmentacion") is not None else "Pendiente",
+        )
+        c15.metric("Formato", "Valido" if resumen.get("formato_ocr_valido") else "Dudoso/Pendiente")
+        c16, c17, c18 = st.columns(3)
+        c16.metric("Rectificacion", resumen.get("metodo_rectificacion") or "Pendiente")
+        c17.metric(
+            "Puntaje rectificacion",
+            f"{float(resumen.get('puntaje_rectificacion')):.2f}" if resumen.get("puntaje_rectificacion") is not None else "Pendiente",
+        )
+        c18.metric("Estado lectura", resumen.get("estado_consolidado_evento") or resumen.get("estado_ocr") or "Pendiente")
+        c19, c20, c21 = st.columns(3)
+        c19.metric("Lectura individual", resumen.get("placa_individual") or resumen.get("texto_ocr_corregido") or "Pendiente")
+        c20.metric(
+            "Confianza final evento",
+            f"{float(resumen.get('confianza_final_evento')):.2f}" if resumen.get("confianza_final_evento") is not None else "Pendiente",
+        )
+        c21.metric("Recortes usados", resumen.get("recortes_usados_evento", "Pendiente"))
+        c22, c23, c24 = st.columns(3)
+        c22.metric("Segmentacion guiada", "Si" if resumen.get("segmentacion_guiada_formato") else "No")
+        c23.metric("Guion descartado", "Si" if resumen.get("guion_descartado") else "No")
+        c24.metric("Lecturas descartadas", resumen.get("lecturas_descartadas_evento", 0))
 
         if resumen.get("vehiculo_encontrado"):
             st.caption(
@@ -988,14 +1120,28 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict, ejecutar_lector_
             st.dataframe(pd.DataFrame(candidatos), use_container_width=True, hide_index=True)
         else:
             st.caption("Aun no hay suficientes candidatos para seleccionar un mejor recorte.")
+        if resumen.get("votos_por_posicion_evento"):
+            st.caption("Votacion temporal por posicion")
+            st.json(
+                {
+                    "placa_consolidada": resumen.get("placa_consolidada_evento"),
+                    "confianza_final": resumen.get("confianza_final_evento"),
+                    "votos_por_posicion": resumen.get("votos_por_posicion_evento"),
+                    "correcciones": resumen.get("correcciones_evento"),
+                    "lecturas_descartadas": resumen.get("lecturas_descartadas_detalle"),
+                    "lectura_base": resumen.get("lectura_base_usada"),
+                    "debug_votacion": resumen.get("ruta_debug_votacion_evento"),
+                }
+            )
 
+        ruta_rect = resumen.get("ruta_rectificacion_ocr")
         ruta_pre = resumen.get("ruta_placa_preprocesada_ocr")
         ruta_banda = resumen.get("ruta_banda_ocr")
         ruta_debug_seg = resumen.get("ruta_debug_segmentacion_ocr")
-        imgs = [ruta for ruta in [ruta_pre, ruta_banda, ruta_debug_seg] if ruta]
+        imgs = [ruta for ruta in [ruta_rect, ruta_pre, ruta_banda, ruta_debug_seg] if ruta]
         if imgs:
-            st.caption("Preprocesamiento y segmentacion para lector CNN")
-            cols = st.columns(min(3, len(imgs)))
+            st.caption("Rectificacion, preprocesamiento y segmentacion para lector CNN")
+            cols = st.columns(min(4, len(imgs)))
             for idx, ruta in enumerate(imgs):
                 with cols[idx % len(cols)]:
                     st.image(ruta, use_container_width=True)
@@ -1009,6 +1155,8 @@ def mostrar_panel_monitoreo_limpio(resumen: dict, config: dict, ejecutar_lector_
                     with cols[idx % len(cols)]:
                         st.image(ruta_char, use_container_width=True)
                         st.caption(str(idx + 1))
+        if resumen.get("ruta_debug_sin_lectura"):
+            st.caption(f"Debug sin lectura: {resumen.get('ruta_debug_sin_lectura')}")
 
     with st.expander("Debug avanzado", expanded=False):
         d1, d2, d3 = st.columns(3)
@@ -1274,6 +1422,7 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultima_clave_historial_monitoreo = None
         st.session_state.recortes_placas_monitoreo = []
         st.session_state.ultima_clave_recorte_monitoreo = None
+        st.session_state.lecturas_evento_placa_monitoreo = []
         st.session_state.contador_lector_cnn_monitoreo = 0
         st.session_state.ultima_clave_panel_monitoreo = None
 
@@ -1926,7 +2075,7 @@ def pestana_pruebas(config: dict) -> None:
                     resultado_yolo = detector_yolo.detectar_en_frame(imagen, conf_min=float(conf_yolo_diag))
                     st.metric("Confidence threshold usado", f"{conf_yolo_diag:.2f}")
                     st.info(resultado_yolo.get("mensaje", "Sin mensaje."))
-                    frame_rgb = cv2.cvtColor(resultado_yolo["frame_procesado"], cv2.COLOR_BGR2RGB)
+                    frame_rgb = asegurar_rgb(resultado_yolo["frame_procesado"])
                     st.image(frame_rgb, caption="Resultado con bounding boxes", use_container_width=False)
 
                     detecciones = resultado_yolo.get("detecciones", [])
@@ -1955,7 +2104,7 @@ def pestana_pruebas(config: dict) -> None:
                             recorte = det.get("recorte_placa")
                             if recorte is not None:
                                 columnas_recortes[(idx - 1) % len(columnas_recortes)].image(
-                                    cv2.cvtColor(recorte, cv2.COLOR_BGR2RGB),
+                                    asegurar_rgb(recorte),
                                     caption=f"Recorte {idx}",
                                     use_container_width=True,
                                 )
@@ -2080,9 +2229,9 @@ def pestana_pruebas(config: dict) -> None:
                         st.metric("Tiempo inferencia", f"{res_actual['tiempo_ms']:.2f} ms")
                         st.metric("Detecciones", len(res_actual["detecciones"]))
                         st.info(res_actual["mensaje"])
-                        st.image(cv2.cvtColor(res_actual["frame"], cv2.COLOR_BGR2RGB), caption="BBox actual", use_container_width=True)
+                        st.image(asegurar_rgb(res_actual["frame"]), caption="BBox actual", use_container_width=True)
                         if res_actual["detecciones"] and res_actual["detecciones"][0].get("recorte") is not None:
-                            st.image(cv2.cvtColor(res_actual["detecciones"][0]["recorte"], cv2.COLOR_BGR2RGB), caption="Recorte actual", use_container_width=False)
+                            st.image(asegurar_rgb(res_actual["detecciones"][0]["recorte"]), caption="Recorte actual", use_container_width=False)
                         if res_actual["detecciones"]:
                             st.json([{k: v for k, v in det.items() if k != "recorte"} for det in res_actual["detecciones"]])
                     with col_robo:
@@ -2091,9 +2240,9 @@ def pestana_pruebas(config: dict) -> None:
                         st.metric("Tiempo inferencia", f"{res_robo['tiempo_ms']:.2f} ms")
                         st.metric("Detecciones", len(res_robo["detecciones"]))
                         st.info(res_robo["mensaje"])
-                        st.image(cv2.cvtColor(res_robo["frame"], cv2.COLOR_BGR2RGB), caption="BBox Roboflow", use_container_width=True)
+                        st.image(asegurar_rgb(res_robo["frame"]), caption="BBox Roboflow", use_container_width=True)
                         if res_robo["detecciones"] and res_robo["detecciones"][0].get("recorte") is not None:
-                            st.image(cv2.cvtColor(res_robo["detecciones"][0]["recorte"], cv2.COLOR_BGR2RGB), caption="Recorte Roboflow", use_container_width=False)
+                            st.image(asegurar_rgb(res_robo["detecciones"][0]["recorte"]), caption="Recorte Roboflow", use_container_width=False)
                         if res_robo["detecciones"]:
                             st.json([{k: v for k, v in det.items() if k != "recorte"} for det in res_robo["detecciones"]])
 

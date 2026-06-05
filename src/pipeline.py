@@ -11,7 +11,15 @@ from src.database import buscar_vehiculo_por_placa, guardar_evento, inicializar_
 from src.fuzzy_system import clasificar_velocidad
 from src.notifier import enviar_notificacion_sancion
 from src.plate_detector import PlateDetector, dibujar_deteccion
-from src.plate_reader import PlateReader, leer_placa_desde_recorte
+from src.plate_reader import (
+    PlateReader,
+    asegurar_grayscale,
+    asegurar_rgb,
+    consolidar_lecturas_evento_placa,
+    guardar_debug_votacion_evento,
+    leer_placa_cnn_seguro_desde_monitoreo,
+    leer_placa_desde_recorte,
+)
 from src.report_generator import guardar_reporte
 from src.speed_estimator import SpeedTracker, estimar_velocidad
 
@@ -21,14 +29,14 @@ GUARDAR_RECORTE_CADA_N_FRAMES = 15
 BBOX_SUAVIZADO_ALPHA = 0.6
 DEFAULT_PLATE_CROP_SELECTION = {
     "enabled": True,
-    "buffer_frames": 15,
+    "buffer_frames": 25,  # FIX-BUFFER: mas frames = mejor chance de recorte nitido
     "min_aspect_ratio": 1.5,
     "max_aspect_ratio": 6.5,
     "min_area_relative": 0.0003,
     "max_area_relative": 0.08,
     "border_margin_px": 5,
     "min_sharpness": 30.0,
-    "cooldown_frames": 45,
+    "cooldown_frames": 30,  # FIX-BUFFER: cooldown menor para no perder placas reales
     "min_score_improvement": 0.03,
 }
 
@@ -294,7 +302,7 @@ def procesar_frame_video_monitoreo(
         fps,
         None,
     )
-    frame_rgb = cv2.cvtColor(estado_frame["frame_visual"], cv2.COLOR_BGR2RGB)
+    frame_rgb = asegurar_rgb(estado_frame["frame_visual"])
 
     return {
         "estado": "finalizado",
@@ -537,7 +545,7 @@ def _procesar_fuente_monitoreo(
             )
         )
         if debe_renderizar:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = asegurar_rgb(frame)
             tiempo_transcurrido = max(time.perf_counter() - tiempo_inicio_total, 0.001)
             estado_callback = {
                 "frame_actual": numero_frame_actual,
@@ -1029,13 +1037,59 @@ def _cerrar_evento_video_anotado(evento: dict, recortes_dir: Path, candidatos_di
 
     if len(candidatos) >= int(min_candidatos) and evento.get("ruta_mejor_recorte"):
         try:
-            resultado = leer_placa_desde_recorte(evento["ruta_mejor_recorte"])
-            evento["texto_crudo"] = resultado.get("texto_detectado_crudo") or ""
-            evento["texto_corregido_formato"] = resultado.get("texto_postprocesado") or evento["texto_crudo"]
-            evento["confianza_cnn_caracteres"] = resultado.get("confianza_promedio")
-            evento["formato_valido"] = bool((resultado.get("formato") or {}).get("valido"))
+            lecturas_evento = []
+            for idx, candidato in enumerate(sorted(candidatos, key=lambda item: item.get("puntaje_total", 0.0), reverse=True)[:5], start=1):
+                ruta_candidato = candidatos_dir / f"evento_{event_id:04d}_lectura_{idx:02d}.jpg"
+                if candidato.get("recorte") is not None:
+                    cv2.imwrite(str(ruta_candidato), candidato["recorte"])
+                else:
+                    continue
+                resultado = leer_placa_cnn_seguro_desde_monitoreo(
+                    str(ruta_candidato),
+                    contexto={"funcion": "_cerrar_evento_video_anotado", "event_id": event_id, "candidato": idx},
+                )
+                lectura = {
+                    "ruta_recorte": str(ruta_candidato),
+                    "frame_index": candidato.get("frame_index"),
+                    "bbox": candidato.get("bbox"),
+                    "confianza_yolo": candidato.get("conf_yolo"),
+                    "puntaje_recorte": candidato.get("puntaje_total"),
+                    "nitidez": candidato.get("nitidez"),
+                    "area_relativa": candidato.get("area_relativa"),
+                    "aspect_ratio": candidato.get("aspect_ratio"),
+                    "metodo_rectificacion": resultado.get("metodo_rectificacion") or (resultado.get("rectificacion") or {}).get("metodo_rectificacion"),
+                    "puntaje_rectificacion": resultado.get("puntaje_rectificacion") or (resultado.get("rectificacion") or {}).get("confianza_rectificacion"),
+                    "estrategia_segmentacion": resultado.get("estrategia_segmentacion") or (resultado.get("segmentacion") or {}).get("estrategia_segmentacion"),
+                    "puntaje_segmentacion": resultado.get("puntaje_segmentacion") or (resultado.get("segmentacion") or {}).get("puntaje_segmentacion"),
+                    "segmentacion_guiada_formato": bool((resultado.get("segmentacion") or {}).get("segmentacion_guiada_formato")),
+                    "guion_descartado": bool((resultado.get("segmentacion") or {}).get("guion_descartado")),
+                    "motivos_rechazo": resultado.get("motivos_rechazo") or (resultado.get("segmentacion") or {}).get("motivos_rechazo") or {},
+                    "cantidad_caracteres_segmentados": resultado.get("cantidad_caracteres_segmentados", 0),
+                    "texto_crudo": resultado.get("texto_crudo") or resultado.get("texto_detectado_crudo") or "",
+                    "texto_corregido_formato": resultado.get("texto_corregido_formato") or resultado.get("texto_postprocesado") or "",
+                    "confianza_cnn_caracteres": resultado.get("confianza_cnn_caracteres") or resultado.get("confianza_promedio"),
+                    "formato_valido": bool(resultado.get("formato_valido") or (resultado.get("formato") or {}).get("valido")),
+                    "estado_lectura": resultado.get("estado_lectura"),
+                    "predicciones_caracteres": resultado.get("predicciones_caracteres", []),
+                }
+                lecturas_evento.append(lectura)
+
+            resultado = lecturas_evento[0] if lecturas_evento else {}
+            consolidado = consolidar_lecturas_evento_placa(lecturas_evento)
+            ruta_debug_votacion = guardar_debug_votacion_evento(event_id, lecturas_evento, consolidado)
+            evento["lecturas_cnn"] = lecturas_evento
+            evento["consolidacion_placa"] = consolidado
+            evento["ruta_debug_votacion"] = ruta_debug_votacion
+            evento["texto_crudo"] = resultado.get("texto_crudo") or resultado.get("texto_detectado_crudo") or ""
+            evento["texto_individual"] = resultado.get("texto_corregido_formato") or resultado.get("texto_postprocesado") or evento["texto_crudo"]
+            evento["texto_corregido_formato"] = consolidado.get("texto_final") or evento["texto_individual"]
+            evento["confianza_cnn_caracteres"] = resultado.get("confianza_cnn_caracteres") or resultado.get("confianza_promedio")
+            evento["confianza_final_consolidada"] = consolidado.get("confianza_final")
+            evento["formato_valido"] = bool(consolidado.get("formato_valido"))
             evento["cantidad_caracteres_segmentados"] = int(resultado.get("cantidad_caracteres_segmentados", 0) or 0)
-            evento["estado"] = "leido_con_cnn" if evento["texto_corregido_formato"] else "sin_texto"
+            evento["recortes_usados_votacion"] = len(lecturas_evento)
+            evento["lecturas_descartadas_votacion"] = consolidado.get("cantidad_lecturas_descartadas", 0)
+            evento["estado"] = consolidado.get("estado") or resultado.get("estado_lectura") or ("leido_con_cnn" if evento["texto_corregido_formato"] else "sin_texto")
         except Exception as exc:
             evento["estado"] = f"error_lector_cnn: {exc}"
     else:
@@ -1092,10 +1146,17 @@ def _fila_evento_video_anotado(evento: dict, ruta_video: Path) -> dict:
         "aspect_ratio": mejor.get("aspect_ratio"),
         "area_relativa": mejor.get("area_relativa"),
         "texto_reconocido_crudo": evento.get("texto_crudo"),
+        "texto_individual": evento.get("texto_individual"),
         "texto_corregido_formato": evento.get("texto_corregido_formato"),
         "confianza_cnn_caracteres": evento.get("confianza_cnn_caracteres"),
+        "confianza_final_consolidada": evento.get("confianza_final_consolidada"),
         "formato_valido": evento.get("formato_valido"),
         "cantidad_caracteres_segmentados": evento.get("cantidad_caracteres_segmentados"),
+        "lecturas_cnn": len(evento.get("lecturas_cnn") or []),
+        "recortes_usados_votacion": evento.get("recortes_usados_votacion"),
+        "lecturas_descartadas_votacion": evento.get("lecturas_descartadas_votacion"),
+        "estado_consolidado": (evento.get("consolidacion_placa") or {}).get("estado"),
+        "ruta_debug_votacion": evento.get("ruta_debug_votacion"),
         "ruta_mejor_recorte": evento.get("ruta_mejor_recorte"),
     }
 
@@ -1153,7 +1214,7 @@ def calcular_puntaje_recorte_placa(frame, bbox: list[int], recorte, conf_yolo: f
         alto_recorte = 0
         ancho_recorte = 0
     else:
-        gris = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY) if len(recorte.shape) == 3 else recorte
+        gris = asegurar_grayscale(recorte)
         nitidez = float(cv2.Laplacian(gris, cv2.CV_64F).var())
         contraste = float(gris.std())
         alto_recorte, ancho_recorte = recorte.shape[:2]
@@ -1183,11 +1244,12 @@ def calcular_puntaje_recorte_placa(frame, bbox: list[int], recorte, conf_yolo: f
     if ancho_recorte < 50 or alto_recorte < 18:
         penalizacion += 0.25
 
+    # FIX-SCORE: aumentar peso de nitidez para priorizar recortes frontales y nitidos.
     puntaje = (
-        0.35 * float(conf_yolo)
-        + 0.25 * score_nitidez
-        + 0.18 * score_aspect
-        + 0.12 * score_area
+        0.25 * float(conf_yolo)
+        + 0.40 * score_nitidez
+        + 0.15 * score_aspect
+        + 0.10 * score_area
         + 0.05 * score_tamano
         + 0.05 * score_contraste
         - penalizacion

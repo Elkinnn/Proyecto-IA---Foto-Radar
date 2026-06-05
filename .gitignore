@@ -1,10 +1,16 @@
 venv/
 venv*/
 __pycache__/
+.tmp_pycache/
 *.pyc
 runs/
 runs/plate_detector/
 reports/evidencias/
+reports/_bench/
+reports/**/*.png
+reports/**/*.jpg
+reports/**/*.txt
+reports/**/*.log
 models/**/*.pt
 models/plate_detector/*.pt
 models/**/*.keras
