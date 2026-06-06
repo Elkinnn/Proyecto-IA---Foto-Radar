@@ -2,6 +2,7 @@ from datetime import datetime
 from pathlib import Path
 import csv
 import json
+import threading
 import time
 
 import cv2
@@ -53,6 +54,10 @@ PERFORMANCE_MODE_LABELS = {
     "Balanceado": "balanceado",
     "Preciso": "preciso",
 }
+
+_OCR_ASYNC_LOCK = threading.Lock()
+_OCR_ASYNC_PENDIENTES: set[str] = set()
+_OCR_ASYNC_RESULTADOS: dict[str, dict] = {}
 
 
 def _config_modo_rendimiento(config: dict, modo: str) -> dict:
@@ -629,7 +634,7 @@ def _tiene_recorte_placa_valido(resumen: dict) -> bool:
 
 
 def preparar_estado_notificacion_evento(resumen: dict, placa_evento: str, config: dict) -> dict:
-    """Evalua calidad y deja listo el resumen para un envio manual. No envia correo."""
+    """Evalua calidad y deja listo el resumen para envio (manual o automatico)."""
     placa = (placa_evento or "").strip().upper()
     metricas = _metricas_calidad_desde_resumen(resumen, placa)
     evaluacion = evaluar_calidad_evento(metricas, config)
@@ -647,7 +652,7 @@ def enviar_notificacion_evento_monitoreo(
     correo_destino: str,
     config: dict,
 ) -> dict:
-    """Envia el correo solo cuando el usuario lo solicita explicitamente."""
+    """Envia correo para un evento (usado por el envio automatico)."""
     placa = (placa_evento or "").strip().upper()
     resumen = preparar_estado_notificacion_evento(resumen, placa, config)
     evaluacion = resumen.get("evaluacion_calidad_evento") or {}
@@ -717,6 +722,11 @@ def _extraer_placa_desde_resumen(resumen: dict) -> str:
 
 
 def _obtener_texto_placa_ui(resumen: dict) -> str:
+    if resumen.get("estado_ocr") == "pendiente":
+        return "Leyendo..."
+    texto_pendiente = str(resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "")
+    if "Analizando placa" in texto_pendiente:
+        return "Leyendo..."
     placa = _extraer_placa_desde_resumen(resumen)
     if placa:
         return placa
@@ -736,6 +746,234 @@ def _obtener_ruta_recorte_ui(resumen: dict) -> str | None:
         if ruta and Path(str(ruta)).exists():
             return str(ruta)
     return None
+
+
+def _marcar_duplicados_placa_en_cola(cola: list) -> None:
+    """Marca duplicados del mismo paso de vehiculo (ventana de frames)."""
+    _consolidar_marcas_paso_vehiculo(cola, None)
+
+
+def _puntaje_item_evento(item: dict) -> float:
+    """Mayor puntaje = mejor candidato para enviar correo de ese paso."""
+    res = item.get("resumen") or {}
+    puntaje = 0.0
+    if (res.get("evaluacion_calidad_evento") or {}).get("apto"):
+        puntaje += 10.0
+    if res.get("formato_consolidado_valido") or res.get("formato_ocr_valido"):
+        puntaje += 5.0
+    conf_ocr = res.get("confianza_final_evento") or res.get("confianza_ocr")
+    if conf_ocr is not None:
+        puntaje += float(conf_ocr) * 3.0
+    conf_yolo = (res.get("ultima_deteccion") or {}).get("confianza") or res.get("mejor_confianza_evento")
+    if conf_yolo is not None:
+        puntaje += float(conf_yolo) * 1.0
+    placa = _extraer_placa_desde_resumen(res)
+    if placa and len(placa) == 7:
+        puntaje += 1.5
+    elif placa and len(placa) == 6:
+        puntaje += 0.5
+    if res.get("estado_ocr") == "error":
+        puntaje -= 5.0
+    return puntaje
+
+
+def _agrupar_cola_por_paso_vehiculo(cola: list, ventana_frames: int) -> list[dict]:
+    ordenados = sorted(
+        [item for item in cola if item.get("frame_mejor") is not None or (item.get("resumen") or {}).get("frame_mejor_evento")],
+        key=lambda item: int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0),
+    )
+    grupos: list[dict] = []
+    for item in ordenados:
+        frame = int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0)
+        ubicado = False
+        for grupo in grupos:
+            if abs(frame - int(grupo["frame_fin"])) <= ventana_frames:
+                grupo["items"].append(item)
+                grupo["frame_fin"] = max(int(grupo["frame_fin"]), frame)
+                grupo["frame_inicio"] = min(int(grupo["frame_inicio"]), frame)
+                ubicado = True
+                break
+        if not ubicado:
+            grupos.append({"frame_inicio": frame, "frame_fin": frame, "items": [item]})
+    return grupos
+
+
+def _grupo_listo_para_envio(grupo: dict, frame_actual: int, cooldown_frames: int) -> bool:
+    items = grupo.get("items") or []
+    if not items:
+        return False
+    if any(item.get("estado_ocr") == "pendiente" for item in items):
+        return False
+    ultimo_frame = max(
+        int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0)
+        for item in items
+    )
+    return int(frame_actual or 0) - ultimo_frame >= int(cooldown_frames)
+
+
+def _consolidar_marcas_paso_vehiculo(cola: list, config: dict | None) -> None:
+    ventana = 150
+    if config:
+        ventana = int((config.get("notificaciones") or {}).get("ventana_frames_mismo_paso", ventana))
+    for item in cola:
+        item.pop("es_mejor_del_paso", None)
+        item.pop("suprimido_duplicado", None)
+    for grupo in _agrupar_cola_por_paso_vehiculo(cola, ventana):
+        paso_id = f"paso_{grupo['frame_inicio']}"
+        items_listos = [i for i in grupo["items"] if i.get("estado_ocr") == "listo"]
+        if not items_listos:
+            for item in grupo["items"]:
+                item["paso_grupo_id"] = paso_id
+            continue
+        mejor = max(items_listos, key=_puntaje_item_evento)
+        for item in grupo["items"]:
+            item["paso_grupo_id"] = paso_id
+            if item is mejor:
+                item["es_mejor_del_paso"] = True
+            else:
+                item["suprimido_duplicado"] = True
+
+
+def _estado_correo_item(item: dict) -> str:
+    if item.get("notificacion_enviada"):
+        return "Enviado"
+    if item.get("suprimido_duplicado"):
+        return "Duplicado"
+    if item.get("estado_ocr") == "pendiente":
+        return "OCR..."
+    if item.get("estado_ocr") == "error":
+        return "Error OCR"
+    res = item.get("resumen") or {}
+    if item.get("es_mejor_del_paso") and res.get("puede_enviar_notificacion"):
+        return "Pendiente envio"
+    if not res.get("puede_enviar_notificacion"):
+        return "No apto"
+    return "Duplicado"
+
+
+def _procesar_envio_automatico_cola(
+    config: dict,
+    placa_controlada: str,
+    frame_actual: int | None = None,
+    *,
+    forzar: bool = False,
+) -> bool:
+    """Agrupa pasos, elige la mejor lectura y envia un solo correo por vehiculo."""
+    notif_cfg = (config.get("notificaciones") or {})
+    if not notif_cfg.get("envio_automatico", True):
+        return False
+    correo = (st.session_state.get("correo_destino_monitoreo") or "").strip()
+    if not validar_correo(correo):
+        return False
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+    if not cola:
+        return False
+
+    ventana = int(notif_cfg.get("ventana_frames_mismo_paso", 150))
+    cooldown = int(notif_cfg.get("cooldown_frames_envio", 60))
+    frame_ref = int(frame_actual if frame_actual is not None else st.session_state.get("frame_actual") or 0)
+
+    _consolidar_marcas_paso_vehiculo(cola, config)
+    enviados: set[str] = set(st.session_state.get("pasos_grupo_notificados") or [])
+    descartados: set[str] = set(st.session_state.get("pasos_grupo_descartados") or [])
+    hubo_cambio = False
+
+    for grupo in _agrupar_cola_por_paso_vehiculo(cola, ventana):
+        paso_id = f"paso_{grupo['frame_inicio']}"
+        if paso_id in enviados or paso_id in descartados:
+            continue
+        if not forzar and not _grupo_listo_para_envio(grupo, frame_ref, cooldown):
+            continue
+        if forzar and any(item.get("estado_ocr") == "pendiente" for item in grupo.get("items") or []):
+            continue
+
+        items_listos = [i for i in grupo["items"] if i.get("estado_ocr") == "listo"]
+        if not items_listos:
+            continue
+
+        mejor = max(items_listos, key=_puntaje_item_evento)
+        for item in grupo["items"]:
+            if item is mejor:
+                item["es_mejor_del_paso"] = True
+                item.pop("suprimido_duplicado", None)
+            else:
+                item["es_mejor_del_paso"] = False
+                item["suprimido_duplicado"] = True
+
+        if mejor.get("notificacion_enviada"):
+            enviados.add(paso_id)
+            continue
+
+        candidatos_apto = [
+            i for i in items_listos if (i.get("resumen") or {}).get("puede_enviar_notificacion")
+        ]
+        if not candidatos_apto:
+            descartados.add(paso_id)
+            hubo_cambio = True
+            continue
+
+        mejor = max(candidatos_apto, key=_puntaje_item_evento)
+        resumen = dict(mejor.get("resumen") or {})
+        placa = _obtener_placa_para_evento(resumen, placa_controlada)
+        resumen = enviar_notificacion_evento_monitoreo(resumen, placa, correo, config)
+        mejor["resumen"] = resumen
+        notif = resumen.get("notificacion_correo") or {}
+        enviado = bool(notif.get("enviado") or notif.get("modo") == "simulado")
+        mejor["notificacion_enviada"] = enviado
+        if enviado:
+            enviados.add(paso_id)
+        hubo_cambio = True
+
+    st.session_state.pasos_grupo_notificados = list(enviados)
+    st.session_state.pasos_grupo_descartados = list(descartados)
+    st.session_state.eventos_monitoreo_cola = cola
+    return hubo_cambio
+
+
+def _render_tabla_vehiculos_detectados(cola: list, config: dict | None = None, max_filas: int = 12) -> None:
+    """Tabla con miniatura del recorte usado para cada prediccion."""
+    if not cola:
+        return
+    _consolidar_marcas_paso_vehiculo(cola, config)
+    st.markdown("**Vehiculos detectados**")
+    st.caption(
+        "Eventos del mismo paso se agrupan por proximidad de frames. "
+        "Solo la mejor lectura apta se envia automaticamente al correo."
+    )
+    encabezado = st.columns([0.45, 1.15, 0.95, 0.75, 0.65, 0.55, 0.65])
+    encabezado[0].markdown("**#**")
+    encabezado[1].markdown("**Recorte**")
+    encabezado[2].markdown("**Placa**")
+    encabezado[3].markdown("**Hora**")
+    encabezado[4].markdown("**Frame**")
+    encabezado[5].markdown("**YOLO**")
+    encabezado[6].markdown("**Correo**")
+    for item in cola[:max_filas]:
+        res_item = item.get("resumen") or {}
+        ultima = res_item.get("ultima_deteccion") or {}
+        conf_yolo = ultima.get("confianza") or res_item.get("mejor_confianza_evento")
+        ruta = item.get("ruta_recorte") or _obtener_ruta_recorte_ui(res_item)
+        placa_txt = _obtener_texto_placa_ui(res_item)
+        if item.get("es_mejor_del_paso"):
+            placa_txt = f"{placa_txt} ✓"
+        elif item.get("suprimido_duplicado"):
+            placa_txt = f"{placa_txt} · dup"
+        fila = st.columns([0.45, 1.15, 0.95, 0.75, 0.65, 0.55, 0.65])
+        fila[0].write(f"{int(item.get('evento_id') or 0)}")
+        with fila[1]:
+            if ruta and Path(str(ruta)).exists():
+                st.image(str(ruta), width=112)
+            else:
+                st.caption("Sin recorte")
+        fila[2].write(placa_txt)
+        fila[3].write(item.get("hora", "—"))
+        frame_ref = item.get("frame_mejor") or res_item.get("frame_mejor_evento") or res_item.get("frame_actual")
+        fila[4].write(str(frame_ref) if frame_ref is not None else "—")
+        fila[5].write(f"{float(conf_yolo):.0%}" if conf_yolo is not None else "—")
+        fila[6].write(_estado_correo_item(item))
+    enviados = sum(1 for item in cola if item.get("notificacion_enviada"))
+    if enviados:
+        st.caption(f"{enviados} correo(s) enviado(s) automaticamente en esta sesion.")
 
 
 def _render_panel_deteccion_esencial(
@@ -783,15 +1021,18 @@ def _render_panel_deteccion_esencial(
             config,
         )
         if resumen.get("puede_enviar_notificacion"):
-            st.success("Captura lista. Puede enviar la notificacion por correo.")
+            st.success("Captura apta. El correo se enviara automaticamente al cerrar el paso del vehiculo.")
         elif ruta_recorte:
             razones = (resumen.get("evaluacion_calidad_evento") or {}).get("razones") or []
             if razones:
                 st.caption(f"Correo: {razones[0]}")
 
     if mostrar_historial:
+        cola = st.session_state.get("eventos_monitoreo_cola") or []
+        if cola:
+            _render_tabla_vehiculos_detectados(cola, config=config)
         historial = st.session_state.get("historial_detecciones_monitoreo", [])
-        if historial:
+        if historial and not cola:
             st.markdown("**Ultimas detecciones**")
             filas = [
                 {
@@ -859,50 +1100,484 @@ def _render_debug_monitoreo(resumen: dict, config: dict) -> None:
 
 
 def _render_sidebar_envio_correo(config: dict, placa_controlada: str) -> None:
-    """Envio de correo desde el panel lateral."""
+    """Estado del envio automatico de correos."""
     st.divider()
     st.markdown("**Notificacion por correo**")
-
-    resumen = st.session_state.get("ultimo_resultado") or st.session_state.get("ultimo_resultado_parcial") or {}
-    placa = _obtener_placa_para_evento(resumen, placa_controlada)
-    resumen = preparar_estado_notificacion_evento(resumen, placa, config)
-    evaluacion = resumen.get("evaluacion_calidad_evento") or {}
+    notif_cfg = (config.get("notificaciones") or {})
     correo = (st.session_state.get("correo_destino_monitoreo") or "").strip()
-    puede_enviar = bool(resumen.get("puede_enviar_notificacion") and validar_correo(correo))
-    notificacion = resumen.get("notificacion_correo") or {}
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+
+    if notif_cfg.get("envio_automatico", True):
+        st.caption("Envio automatico activo: un correo por paso de vehiculo (mejor lectura).")
+    else:
+        st.caption("Envio automatico desactivado en config.")
 
     if not validar_correo(correo):
-        st.caption("Ingrese un correo destino arriba.")
-    elif not _tiene_recorte_placa_valido(resumen):
-        st.caption("Detecte una placa primero.")
-    elif not evaluacion.get("apto"):
-        st.caption((evaluacion.get("razones") or ["Captura no apta"])[0])
+        st.warning("Ingrese un correo destino valido arriba.")
+        return
+
+    enviados = [item for item in cola if item.get("notificacion_enviada")]
+    pendientes = [
+        item
+        for item in cola
+        if item.get("es_mejor_del_paso") and not item.get("notificacion_enviada") and not item.get("suprimido_duplicado")
+    ]
+
+    st.metric("Correos enviados", len(enviados))
+    if enviados:
+        ultimo = enviados[0]
+        res_u = ultimo.get("resumen") or {}
+        notif = res_u.get("notificacion_correo") or {}
+        placa_u = _obtener_texto_placa_ui(res_u)
+        st.caption(f"Ultimo: **{placa_u}** → {notif.get('destinatario') or correo}")
+    elif pendientes:
+        st.caption("Esperando cierre del paso del vehiculo para enviar la mejor lectura.")
     else:
-        st.success(f"Placa **{_obtener_texto_placa_ui(resumen)}** lista")
+        st.caption("Sin envios en esta sesion.")
 
-    if st.button(
-        "Enviar notificacion",
-        type="primary",
-        disabled=not puede_enviar,
-        use_container_width=True,
-        key="btn_enviar_notificacion_correo",
-    ):
-        resumen = enviar_notificacion_evento_monitoreo(resumen, placa, correo, config)
-        st.session_state.ultimo_resultado = resumen
-        notificacion = resumen.get("notificacion_correo") or {}
-        if notificacion.get("enviado"):
-            st.success(notificacion.get("mensaje_estado", "Correo enviado."))
-        elif notificacion.get("modo") == "simulado":
-            st.info(notificacion.get("mensaje_estado", "Correo generado en modo simulado."))
+    if enviados:
+        with st.expander("Historial de envios", expanded=False):
+            for item in enviados[:6]:
+                res_item = item.get("resumen") or {}
+                st.caption(
+                    f"#{int(item.get('evento_id') or 0):03d} · {_obtener_texto_placa_ui(res_item)} · {item.get('hora', '—')}"
+                )
+
+
+def _cache_key_ocr_monitoreo(resumen: dict, ruta_recorte: str) -> str:
+    evento_id = resumen.get("evento_id") or resumen.get("eventos_placa") or 0
+    frame_ref = resumen.get("frame_mejor_evento") or resumen.get("frame_actual") or resumen.get("frames_procesados")
+    return f"evt{int(evento_id)}|{ruta_recorte}|{frame_ref}"
+
+
+_CAMPOS_OCR_RESUMEN = (
+    "texto_ocr_crudo",
+    "texto_ocr_corregido",
+    "confianza_ocr",
+    "formato_ocr_valido",
+    "estado_ocr",
+    "mensaje_ocr",
+    "causa_probable_ocr",
+    "motivo_lector_cnn",
+    "placa_individual",
+    "placa_consolidada_evento",
+    "estado_consolidado_evento",
+    "confianza_final_evento",
+    "formato_consolidado_valido",
+    "votos_por_posicion_evento",
+    "correcciones_evento",
+    "lecturas_usadas_evento",
+    "lecturas_descartadas_evento",
+    "lecturas_descartadas_detalle",
+    "lectura_base_usada",
+    "recortes_usados_evento",
+    "ruta_debug_votacion_evento",
+    "lector_cnn_ok",
+    "etapa_error_lector_cnn",
+    "tiempo_lector_cnn_ms",
+)
+
+
+def _limpiar_campos_ocr_resumen(resumen: dict, *, pendiente: bool = True) -> dict:
+    limpio = dict(resumen)
+    for campo in _CAMPOS_OCR_RESUMEN:
+        limpio.pop(campo, None)
+    if pendiente:
+        limpio["texto_ocr_crudo"] = "Analizando placa..."
+        limpio["texto_ocr_corregido"] = "Analizando placa..."
+        limpio["confianza_ocr"] = None
+        limpio["formato_ocr_valido"] = False
+        limpio["estado_ocr"] = "pendiente"
+    return limpio
+
+
+def _reiniciar_ocr_vivo_si_cambio_evento(resumen: dict) -> dict:
+    evento_id = resumen.get("evento_id")
+    if evento_id is None:
+        return resumen
+    evento_id = int(evento_id)
+    prev = st.session_state.get("ocr_evento_vivo_id")
+    if prev is not None and evento_id != int(prev):
+        st.session_state.ocr_evento_vivo_id = evento_id
+        st.session_state.lecturas_evento_id = evento_id
+        st.session_state.lecturas_evento_placa_monitoreo = []
+        st.session_state.ultimo_recorte_ocr_procesado = None
+        st.session_state.ultimo_resultado_ocr_monitoreo = None
+        st.session_state.ultima_clave_panel_monitoreo = None
+        return _limpiar_campos_ocr_resumen(resumen)
+    if prev is None:
+        st.session_state.ocr_evento_vivo_id = evento_id
+        st.session_state.lecturas_evento_id = evento_id
+    return resumen
+
+
+def _cache_key_ocr_evento_cerrado(evento_id: int, ruta_recorte: str) -> str:
+    return f"evt{int(evento_id)}|{ruta_recorte}"
+
+
+def _construir_resumen_evento_cerrado(evento: dict, fuente: str) -> dict:
+    return {
+        "evento_id": evento.get("evento_id"),
+        "eventos_placa": evento.get("evento_id"),
+        "frame_mejor_evento": evento.get("frame_mejor"),
+        "frame_actual": evento.get("frame_fin"),
+        "frames_procesados": evento.get("frame_fin"),
+        "mejor_confianza_evento": evento.get("mejor_confianza"),
+        "ruta_mejor_recorte_evento": evento.get("ruta_mejor_recorte"),
+        "ruta_mejor_frame_evento": evento.get("ruta_mejor_frame"),
+        "ultima_deteccion": {
+            "confianza": evento.get("mejor_confianza"),
+            "bbox": evento.get("mejor_bbox"),
+        },
+        "velocidad": evento.get("velocidad") or {},
+        "fuente": fuente,
+        "estado_placa": "Cerrado",
+        "evento_activo": False,
+    }
+
+
+def _registrar_evento_cerrado_monitoreo(
+    evento: dict,
+    config: dict,
+    placa_controlada: str,
+    fuente: str,
+) -> None:
+    if not evento or not evento.get("evento_id"):
+        return
+    evento_id = int(evento["evento_id"])
+    cola = st.session_state.setdefault("eventos_monitoreo_cola", [])
+    if any(item.get("evento_id") == evento_id for item in cola):
+        return
+
+    resumen = _construir_resumen_evento_cerrado(evento, fuente)
+    ruta_recorte = evento.get("ruta_mejor_recorte")
+    item = {
+        "evento_id": evento_id,
+        "hora": datetime.now().strftime("%H:%M:%S"),
+        "resumen": resumen,
+        "ruta_recorte": str(ruta_recorte) if ruta_recorte else None,
+        "frame_mejor": evento.get("frame_mejor"),
+        "estado_ocr": "pendiente",
+        "notificacion_enviada": False,
+    }
+    cola.insert(0, item)
+    max_eventos = int(st.session_state.get("historial_maximo_monitoreo", 15) or 15)
+    st.session_state.eventos_monitoreo_cola = cola[:max_eventos]
+    st.session_state.ultimo_evento_cerrado_registrado = max(
+        int(st.session_state.get("ultimo_evento_cerrado_registrado") or 0),
+        evento_id,
+    )
+
+    ruta_recorte = evento.get("ruta_mejor_recorte")
+    if ruta_recorte and Path(str(ruta_recorte)).exists():
+        _encolar_ocr_evento_cerrado(evento_id, resumen, str(ruta_recorte))
+
+    _actualizar_historial_monitoreo(resumen)
+
+
+def _encolar_ocr_evento_cerrado(evento_id: int, resumen: dict, ruta_recorte: str) -> None:
+    cache_key = _cache_key_ocr_evento_cerrado(evento_id, ruta_recorte)
+    with _OCR_ASYNC_LOCK:
+        if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
+            return
+        _OCR_ASYNC_PENDIENTES.add(cache_key)
+    contexto = {
+        "funcion": "_encolar_ocr_evento_cerrado",
+        "evento_id": evento_id,
+        "frame_actual": resumen.get("frame_actual"),
+        "fuente": resumen.get("fuente"),
+    }
+    threading.Thread(
+        target=_tarea_ocr_monitoreo_asincrona,
+        args=(cache_key, ruta_recorte, contexto, dict(resumen)),
+        daemon=True,
+    ).start()
+
+
+def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
+    """Fusiona OCR listo para cada vehiculo cerrado. Retorna True si hubo cambios."""
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+    if not cola:
+        return False
+    hubo_cambio = False
+    for item in cola:
+        if item.get("estado_ocr") != "pendiente":
+            continue
+        evento_id = int(item.get("evento_id") or 0)
+        resumen = dict(item.get("resumen") or {})
+        ruta_recorte = resumen.get("ruta_mejor_recorte_evento")
+        if not ruta_recorte:
+            continue
+        cache_key = _cache_key_ocr_evento_cerrado(evento_id, str(ruta_recorte))
+        with _OCR_ASYNC_LOCK:
+            payload = _OCR_ASYNC_RESULTADOS.pop(cache_key, None)
+        if not payload:
+            continue
+        if payload.get("error"):
+            resumen.update(
+                {
+                    "texto_ocr_crudo": "Sin lectura",
+                    "texto_ocr_corregido": "Sin lectura",
+                    "confianza_ocr": None,
+                    "formato_ocr_valido": False,
+                    "estado_ocr": "error",
+                    "mensaje_ocr": payload["error"],
+                    "lector_cnn_ok": False,
+                }
+            )
+            item["estado_ocr"] = "error"
         else:
-            st.warning(notificacion.get("mensaje_estado") or "No se pudo enviar el correo.")
+            resumen = _aplicar_resultado_ocr_monitoreo(
+                resumen,
+                payload["resultado_ocr"],
+                float(payload.get("tiempo_lector_ms") or 0.0),
+                str(payload.get("ruta_recorte") or ruta_recorte),
+                cache_key,
+                registrar_metricas=False,
+            )
+            item["estado_ocr"] = "listo"
+        placa = _obtener_placa_para_evento(resumen, placa_controlada)
+        item["resumen"] = preparar_estado_notificacion_evento(resumen, placa, config)
+        _actualizar_historial_monitoreo(item["resumen"])
+        hubo_cambio = True
+    if hubo_cambio:
+        st.session_state.eventos_monitoreo_cola = cola
+        _procesar_envio_automatico_cola(config, placa_controlada)
+    return hubo_cambio
 
-    if notificacion.get("enviado"):
-        st.caption(f"Enviado a {notificacion.get('destinatario') or correo}")
+
+def _obtener_resumen_evento_seleccionado() -> tuple[dict, int | None]:
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+    if cola:
+        idx = int(st.session_state.get("monitoreo_evento_correo_sel") or 0)
+        idx = max(0, min(idx, len(cola) - 1))
+        item = cola[idx]
+        return dict(item.get("resumen") or {}), int(item.get("evento_id") or 0)
+    resumen = st.session_state.get("ultimo_resultado") or st.session_state.get("ultimo_resultado_parcial") or {}
+    return dict(resumen), resumen.get("evento_id")
+
+
+def _limpiar_ocr_asincrono_monitoreo() -> None:
+    with _OCR_ASYNC_LOCK:
+        _OCR_ASYNC_PENDIENTES.clear()
+        _OCR_ASYNC_RESULTADOS.clear()
+
+
+def _aplicar_resultado_ocr_monitoreo(
+    resumen: dict,
+    resultado_ocr: dict,
+    tiempo_lector_ms: float,
+    ruta_recorte: str,
+    cache_key: str,
+    *,
+    registrar_metricas: bool = True,
+) -> dict:
+    lector_ok = bool(resultado_ocr.get("ok", True))
+    texto_crudo = resultado_ocr.get("texto_detectado_crudo") or resultado_ocr.get("texto_crudo") or ""
+    texto_corregido = resultado_ocr.get("texto_postprocesado") or resultado_ocr.get("texto_corregido_formato") or ""
+    estado_lectura = resultado_ocr.get("estado_lectura") or resultado_ocr.get("estado") or "pendiente"
+    motivo_lectura = resultado_ocr.get("motivo") or resultado_ocr.get("motivo_sin_lectura") or resultado_ocr.get("causa_probable") or ""
+    if texto_corregido and estado_lectura == "lectura_parcial":
+        texto_panel = f"Lectura parcial: {texto_corregido}"
+    elif texto_corregido and estado_lectura == "formato_dudoso":
+        texto_panel = f"Formato dudoso: {texto_corregido}"
+    elif texto_corregido:
+        texto_panel = texto_corregido
+    elif texto_crudo:
+        texto_panel = f"Lectura parcial: {texto_crudo}"
+    else:
+        texto_panel = f"Sin lectura: {motivo_lectura or estado_lectura}"
+    datos_ocr = {
+        "texto_ocr_crudo": texto_crudo or texto_panel,
+        "texto_ocr_corregido": texto_panel,
+        "confianza_ocr": resultado_ocr.get("confianza_promedio") or resultado_ocr.get("confianza_cnn_caracteres"),
+        "formato_ocr_valido": bool(resultado_ocr.get("formato_valido") or (resultado_ocr.get("formato") or {}).get("valido")),
+        "estado_ocr": estado_lectura,
+        "mensaje_ocr": resultado_ocr.get("mensaje") or resultado_ocr.get("error"),
+        "causa_probable_ocr": resultado_ocr.get("causa_probable"),
+        "motivo_lector_cnn": motivo_lectura,
+        "ruta_placa_preprocesada_ocr": (resultado_ocr.get("preprocesamiento") or {}).get("ruta_imagen_procesada"),
+        "metodo_rectificacion": resultado_ocr.get("metodo_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("metodo_rectificacion"),
+        "puntaje_rectificacion": resultado_ocr.get("puntaje_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("confianza_rectificacion"),
+        "ruta_rectificacion_ocr": (resultado_ocr.get("rectificacion") or {}).get("ruta_seleccionada"),
+        "ruta_debug_segmentacion_ocr": resultado_ocr.get("ruta_debug_segmentacion"),
+        "ruta_banda_ocr": resultado_ocr.get("ruta_banda"),
+        "ruta_debug_sin_lectura": resultado_ocr.get("ruta_debug_sin_lectura"),
+        "estrategia_segmentacion": resultado_ocr.get("estrategia_segmentacion") or (resultado_ocr.get("segmentacion") or {}).get("estrategia_segmentacion"),
+        "puntaje_segmentacion": resultado_ocr.get("puntaje_segmentacion") if resultado_ocr.get("puntaje_segmentacion") is not None else (resultado_ocr.get("segmentacion") or {}).get("puntaje_segmentacion"),
+        "caracteres_segmentados_ocr": resultado_ocr.get("caracteres_segmentados") or resultado_ocr.get("caracteres", []),
+        "cantidad_caracteres_segmentados_ocr": resultado_ocr.get("cantidad_caracteres_segmentados", 0),
+        "tiempo_lector_cnn_ms": round(tiempo_lector_ms, 3),
+        "lector_cnn_ok": lector_ok,
+        "etapa_error_lector_cnn": resultado_ocr.get("etapa_error"),
+    }
+    lectura_evento = {
+        "ruta_recorte": str(ruta_recorte),
+        "frame_index": resumen.get("frame_actual") or resumen.get("frames_procesados"),
+        "confianza_yolo": (resumen.get("ultima_deteccion") or {}).get("confianza") or (resumen.get("mejor_recorte_placa_info") or {}).get("conf_yolo"),
+        "puntaje_recorte": (resumen.get("mejor_recorte_placa_info") or {}).get("puntaje_total"),
+        "nitidez": (resumen.get("mejor_recorte_placa_info") or {}).get("nitidez"),
+        "area_relativa": (resumen.get("mejor_recorte_placa_info") or {}).get("area_relativa"),
+        "aspect_ratio": (resumen.get("mejor_recorte_placa_info") or {}).get("aspect_ratio"),
+        "metodo_rectificacion": datos_ocr.get("metodo_rectificacion"),
+        "puntaje_rectificacion": datos_ocr.get("puntaje_rectificacion"),
+        "estrategia_segmentacion": datos_ocr.get("estrategia_segmentacion"),
+        "puntaje_segmentacion": datos_ocr.get("puntaje_segmentacion"),
+        "segmentacion_guiada_formato": bool((resultado_ocr.get("segmentacion") or {}).get("segmentacion_guiada_formato")),
+        "guion_descartado": bool((resultado_ocr.get("segmentacion") or {}).get("guion_descartado")),
+        "motivos_rechazo": resultado_ocr.get("motivos_rechazo") or (resultado_ocr.get("segmentacion") or {}).get("motivos_rechazo") or {},
+        "cantidad_caracteres_segmentados": datos_ocr.get("cantidad_caracteres_segmentados_ocr"),
+        "texto_crudo": texto_crudo,
+        "texto_corregido_formato": texto_corregido,
+        "confianza_cnn_caracteres": datos_ocr.get("confianza_ocr"),
+        "formato_valido": datos_ocr.get("formato_ocr_valido"),
+        "estado_lectura": estado_lectura,
+        "predicciones_caracteres": resultado_ocr.get("predicciones_caracteres", []),
+    }
+    lecturas = st.session_state.get("lecturas_evento_placa_monitoreo", [])
+    evento_id = resumen.get("evento_id")
+    if evento_id is not None:
+        if st.session_state.get("lecturas_evento_id") != int(evento_id):
+            lecturas = []
+            st.session_state.lecturas_evento_id = int(evento_id)
+            st.session_state.lecturas_evento_placa_monitoreo = []
+    if not any(item.get("ruta_recorte") == lectura_evento["ruta_recorte"] for item in lecturas):
+        lecturas.insert(0, lectura_evento)
+    lecturas = lecturas[:8]
+    st.session_state.lecturas_evento_placa_monitoreo = lecturas
+    consolidado = consolidar_lecturas_evento_placa(list(reversed(lecturas)), max_lecturas=5)
+    try:
+        ruta_debug_votacion = guardar_debug_votacion_evento(
+            resumen.get("evento_id") or resumen.get("eventos_placa") or "monitoreo",
+            list(reversed(lecturas)),
+            consolidado,
+        )
+    except Exception:
+        ruta_debug_votacion = ""
+    datos_ocr.update(
+        {
+            "placa_individual": texto_corregido or texto_crudo,
+            "placa_consolidada_evento": consolidado.get("texto_final") or texto_corregido or texto_crudo,
+            "estado_consolidado_evento": consolidado.get("estado"),
+            "confianza_final_evento": consolidado.get("confianza_final"),
+            "formato_consolidado_valido": consolidado.get("formato_valido"),
+            "votos_por_posicion_evento": consolidado.get("votos_por_posicion", []),
+            "correcciones_evento": consolidado.get("correcciones_por_formato", []),
+            "lecturas_usadas_evento": consolidado.get("cantidad_lecturas_usadas", 0),
+            "lecturas_descartadas_evento": consolidado.get("cantidad_lecturas_descartadas", 0),
+            "lecturas_descartadas_detalle": consolidado.get("lecturas_descartadas", []),
+            "lectura_base_usada": consolidado.get("lectura_base_usada", {}),
+            "recortes_usados_evento": len(lecturas),
+            "ruta_debug_votacion_evento": ruta_debug_votacion,
+        }
+    )
+    if registrar_metricas:
+        try:
+            _registrar_metricas_ocr_mejor_recorte(resumen, resultado_ocr)
+        except Exception as exc:
+            datos_ocr["mensaje_metricas_lector_cnn"] = f"No se pudieron guardar metricas: {exc}"
+    st.session_state.ultimo_recorte_ocr_procesado = cache_key
+    st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
+    st.session_state.contador_lector_cnn_monitoreo = int(st.session_state.get("contador_lector_cnn_monitoreo", 0) or 0) + 1
+    resumen.update(datos_ocr)
+    return resumen
+
+
+def _tarea_ocr_monitoreo_asincrona(cache_key: str, ruta_recorte: str, contexto: dict, resumen_base: dict) -> None:
+    try:
+        inicio = time.perf_counter()
+        resultado_ocr = leer_placa_cnn_seguro_desde_monitoreo(str(ruta_recorte), contexto=contexto)
+        tiempo_ms = (time.perf_counter() - inicio) * 1000
+        payload = {
+            "resultado_ocr": resultado_ocr,
+            "tiempo_lector_ms": tiempo_ms,
+            "ruta_recorte": ruta_recorte,
+            "resumen_base": dict(resumen_base),
+        }
+    except Exception as exc:
+        payload = {
+            "error": str(exc),
+            "ruta_recorte": ruta_recorte,
+            "resumen_base": dict(resumen_base),
+        }
+    with _OCR_ASYNC_LOCK:
+        _OCR_ASYNC_RESULTADOS[cache_key] = payload
+        _OCR_ASYNC_PENDIENTES.discard(cache_key)
+
+
+def _encolar_ocr_monitoreo_asincrono(resumen: dict, ruta_recorte: str) -> None:
+    cache_key = _cache_key_ocr_monitoreo(resumen, ruta_recorte)
+    if st.session_state.get("ultimo_recorte_ocr_procesado") == cache_key:
+        return
+    with _OCR_ASYNC_LOCK:
+        if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
+            return
+        _OCR_ASYNC_PENDIENTES.add(cache_key)
+    contexto = {
+        "funcion": "_encolar_ocr_monitoreo_asincrono",
+        "frame_actual": resumen.get("frame_actual"),
+        "evento_id": resumen.get("evento_id"),
+        "fuente": resumen.get("fuente"),
+    }
+    threading.Thread(
+        target=_tarea_ocr_monitoreo_asincrona,
+        args=(cache_key, ruta_recorte, contexto, resumen),
+        daemon=True,
+    ).start()
+
+
+def _fusionar_ocr_asincrono_monitoreo(resumen: dict) -> tuple[dict, bool]:
+    """Aplica resultados OCR listos sin bloquear el video. Retorna (resumen, hubo_cambio)."""
+    ruta_recorte = _resolver_ruta_ocr_monitoreo(resumen)
+    if not ruta_recorte:
+        return resumen, False
+    cache_key = _cache_key_ocr_monitoreo(resumen, ruta_recorte)
+    ultimo_key = st.session_state.get("ultimo_recorte_ocr_procesado")
+    if ultimo_key == cache_key:
+        resumen.update(st.session_state.get("ultimo_resultado_ocr_monitoreo") or {})
+        return resumen, False
+    if ultimo_key and ultimo_key != cache_key:
+        resumen = _limpiar_campos_ocr_resumen(resumen)
+    with _OCR_ASYNC_LOCK:
+        payload = _OCR_ASYNC_RESULTADOS.pop(cache_key, None)
+        pendiente = cache_key in _OCR_ASYNC_PENDIENTES
+    if not payload:
+        if pendiente:
+            return resumen, False
+        return resumen, False
+    if payload.get("error"):
+        datos_ocr = {
+            "texto_ocr_crudo": "Sin lectura",
+            "texto_ocr_corregido": "Sin lectura",
+            "confianza_ocr": None,
+            "formato_ocr_valido": False,
+            "estado_ocr": "error",
+            "mensaje_ocr": payload["error"],
+            "lector_cnn_ok": False,
+            "etapa_error_lector_cnn": "salida_interfaz",
+        }
+        st.session_state.ultimo_recorte_ocr_procesado = cache_key
+        st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
+        resumen.update(datos_ocr)
+        return resumen, True
+    base = dict(payload.get("resumen_base") or resumen)
+    base.update({k: v for k, v in resumen.items() if k not in base or v is not None})
+    resumen = _aplicar_resultado_ocr_monitoreo(
+        base,
+        payload["resultado_ocr"],
+        float(payload.get("tiempo_lector_ms") or 0.0),
+        str(payload.get("ruta_recorte") or ruta_recorte),
+        cache_key,
+        registrar_metricas=False,
+    )
+    return resumen, True
 
 
 def _mostrar_panel_compacto_en_vivo(resumen: dict) -> None:
     """Panel minimo durante monitoreo activo."""
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+    if cola:
+        st.caption(f"{len(cola)} vehiculo(s) registrado(s) · evento actual #{int(resumen.get('evento_id') or 0):03d}")
     _render_panel_deteccion_esencial(resumen)
 
 
@@ -920,8 +1595,7 @@ def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
         resumen.setdefault("formato_ocr_valido", False)
         return resumen
 
-    frame_ref = resumen.get("frame_mejor_evento") or resumen.get("frame_actual") or resumen.get("frames_procesados")
-    cache_key = f"{ruta_recorte}|{frame_ref}"
+    cache_key = _cache_key_ocr_monitoreo(resumen, str(ruta_recorte))
     if st.session_state.get("ultimo_recorte_ocr_procesado") == cache_key:
         resumen.update(st.session_state.get("ultimo_resultado_ocr_monitoreo") or {})
         return resumen
@@ -938,100 +1612,14 @@ def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
             },
         )
         tiempo_lector_ms = (time.perf_counter() - inicio_lector) * 1000
-        lector_ok = bool(resultado_ocr.get("ok", True))
-        texto_crudo = resultado_ocr.get("texto_detectado_crudo") or resultado_ocr.get("texto_crudo") or ""
-        texto_corregido = resultado_ocr.get("texto_postprocesado") or resultado_ocr.get("texto_corregido_formato") or ""
-        estado_lectura = resultado_ocr.get("estado_lectura") or resultado_ocr.get("estado") or "pendiente"
-        motivo_lectura = resultado_ocr.get("motivo") or resultado_ocr.get("motivo_sin_lectura") or resultado_ocr.get("causa_probable") or ""
-        if texto_corregido and estado_lectura == "lectura_parcial":
-            texto_panel = f"Lectura parcial: {texto_corregido}"
-        elif texto_corregido and estado_lectura == "formato_dudoso":
-            texto_panel = f"Formato dudoso: {texto_corregido}"
-        elif texto_corregido:
-            texto_panel = texto_corregido
-        elif texto_crudo:
-            texto_panel = f"Lectura parcial: {texto_crudo}"
-        else:
-            texto_panel = f"Sin lectura: {motivo_lectura or estado_lectura}"
-        datos_ocr = {
-            "texto_ocr_crudo": texto_crudo or texto_panel,
-            "texto_ocr_corregido": texto_panel,
-            "confianza_ocr": resultado_ocr.get("confianza_promedio") or resultado_ocr.get("confianza_cnn_caracteres"),
-            "formato_ocr_valido": bool(resultado_ocr.get("formato_valido") or (resultado_ocr.get("formato") or {}).get("valido")),
-            "estado_ocr": estado_lectura,
-            "mensaje_ocr": resultado_ocr.get("mensaje") or resultado_ocr.get("error"),
-            "causa_probable_ocr": resultado_ocr.get("causa_probable"),
-            "motivo_lector_cnn": motivo_lectura,
-            "ruta_placa_preprocesada_ocr": (resultado_ocr.get("preprocesamiento") or {}).get("ruta_imagen_procesada"),
-            "metodo_rectificacion": resultado_ocr.get("metodo_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("metodo_rectificacion"),
-            "puntaje_rectificacion": resultado_ocr.get("puntaje_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("confianza_rectificacion"),
-            "ruta_rectificacion_ocr": (resultado_ocr.get("rectificacion") or {}).get("ruta_seleccionada"),
-            "ruta_debug_segmentacion_ocr": resultado_ocr.get("ruta_debug_segmentacion"),
-            "ruta_banda_ocr": resultado_ocr.get("ruta_banda"),
-            "ruta_debug_sin_lectura": resultado_ocr.get("ruta_debug_sin_lectura"),
-            "estrategia_segmentacion": resultado_ocr.get("estrategia_segmentacion") or (resultado_ocr.get("segmentacion") or {}).get("estrategia_segmentacion"),
-            "puntaje_segmentacion": resultado_ocr.get("puntaje_segmentacion") if resultado_ocr.get("puntaje_segmentacion") is not None else (resultado_ocr.get("segmentacion") or {}).get("puntaje_segmentacion"),
-            "caracteres_segmentados_ocr": resultado_ocr.get("caracteres_segmentados") or resultado_ocr.get("caracteres", []),
-            "cantidad_caracteres_segmentados_ocr": resultado_ocr.get("cantidad_caracteres_segmentados", 0),
-            "tiempo_lector_cnn_ms": round(tiempo_lector_ms, 3),
-            "lector_cnn_ok": lector_ok,
-            "etapa_error_lector_cnn": resultado_ocr.get("etapa_error"),
-        }
-        lectura_evento = {
-            "ruta_recorte": str(ruta_recorte),
-            "frame_index": resumen.get("frame_actual") or resumen.get("frames_procesados"),
-            "confianza_yolo": (resumen.get("ultima_deteccion") or {}).get("confianza") or (resumen.get("mejor_recorte_placa_info") or {}).get("conf_yolo"),
-            "puntaje_recorte": (resumen.get("mejor_recorte_placa_info") or {}).get("puntaje_total"),
-            "nitidez": (resumen.get("mejor_recorte_placa_info") or {}).get("nitidez"),
-            "area_relativa": (resumen.get("mejor_recorte_placa_info") or {}).get("area_relativa"),
-            "aspect_ratio": (resumen.get("mejor_recorte_placa_info") or {}).get("aspect_ratio"),
-            "metodo_rectificacion": datos_ocr.get("metodo_rectificacion"),
-            "puntaje_rectificacion": datos_ocr.get("puntaje_rectificacion"),
-            "estrategia_segmentacion": datos_ocr.get("estrategia_segmentacion"),
-            "puntaje_segmentacion": datos_ocr.get("puntaje_segmentacion"),
-            "segmentacion_guiada_formato": bool((resultado_ocr.get("segmentacion") or {}).get("segmentacion_guiada_formato")),
-            "guion_descartado": bool((resultado_ocr.get("segmentacion") or {}).get("guion_descartado")),
-            "motivos_rechazo": resultado_ocr.get("motivos_rechazo") or (resultado_ocr.get("segmentacion") or {}).get("motivos_rechazo") or {},
-            "cantidad_caracteres_segmentados": datos_ocr.get("cantidad_caracteres_segmentados_ocr"),
-            "texto_crudo": texto_crudo,
-            "texto_corregido_formato": texto_corregido,
-            "confianza_cnn_caracteres": datos_ocr.get("confianza_ocr"),
-            "formato_valido": datos_ocr.get("formato_ocr_valido"),
-            "estado_lectura": estado_lectura,
-            "predicciones_caracteres": resultado_ocr.get("predicciones_caracteres", []),
-        }
-        lecturas = st.session_state.get("lecturas_evento_placa_monitoreo", [])
-        if not any(item.get("ruta_recorte") == lectura_evento["ruta_recorte"] for item in lecturas):
-            lecturas.insert(0, lectura_evento)
-        lecturas = lecturas[:8]
-        st.session_state.lecturas_evento_placa_monitoreo = lecturas
-        consolidado = consolidar_lecturas_evento_placa(list(reversed(lecturas)), max_lecturas=5)
-        try:
-            ruta_debug_votacion = guardar_debug_votacion_evento(
-                resumen.get("evento_id") or resumen.get("eventos_placa") or "monitoreo",
-                list(reversed(lecturas)),
-                consolidado,
-            )
-        except Exception:
-            ruta_debug_votacion = ""
-        datos_ocr.update(
-            {
-                "placa_individual": texto_corregido or texto_crudo,
-                "placa_consolidada_evento": consolidado.get("texto_final") or texto_corregido or texto_crudo,
-                "estado_consolidado_evento": consolidado.get("estado"),
-                "confianza_final_evento": consolidado.get("confianza_final"),
-                "formato_consolidado_valido": consolidado.get("formato_valido"),
-                "votos_por_posicion_evento": consolidado.get("votos_por_posicion", []),
-                "correcciones_evento": consolidado.get("correcciones_por_formato", []),
-                "lecturas_usadas_evento": consolidado.get("cantidad_lecturas_usadas", 0),
-                "lecturas_descartadas_evento": consolidado.get("cantidad_lecturas_descartadas", 0),
-                "lecturas_descartadas_detalle": consolidado.get("lecturas_descartadas", []),
-                "lectura_base_usada": consolidado.get("lectura_base_usada", {}),
-                "recortes_usados_evento": len(lecturas),
-                "ruta_debug_votacion_evento": ruta_debug_votacion,
-            }
+        return _aplicar_resultado_ocr_monitoreo(
+            resumen,
+            resultado_ocr,
+            tiempo_lector_ms,
+            str(ruta_recorte),
+            cache_key,
+            registrar_metricas=True,
         )
-        st.session_state.contador_lector_cnn_monitoreo = int(st.session_state.get("contador_lector_cnn_monitoreo", 0) or 0) + 1
     except Exception as exc:
         datos_ocr = {
             "texto_ocr_crudo": "Sin lectura",
@@ -1043,16 +1631,10 @@ def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
             "lector_cnn_ok": False,
             "etapa_error_lector_cnn": "salida_interfaz",
         }
-    else:
-        try:
-            _registrar_metricas_ocr_mejor_recorte(resumen, resultado_ocr)
-        except Exception as exc:
-            datos_ocr["mensaje_metricas_lector_cnn"] = f"No se pudieron guardar metricas: {exc}"
-
-    st.session_state.ultimo_recorte_ocr_procesado = cache_key
-    st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
-    resumen.update(datos_ocr)
-    return resumen
+        st.session_state.ultimo_recorte_ocr_procesado = cache_key
+        st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
+        resumen.update(datos_ocr)
+        return resumen
 
 
 def _clave_actualizacion_ocr_monitoreo(estado_frame: dict) -> tuple:
@@ -1122,7 +1704,7 @@ def _accion_monitoreo(resumen: dict) -> str:
     if notificacion.get("modo") == "descartado":
         return "Descartado (calidad)"
     if resumen.get("puede_enviar_notificacion"):
-        return "Listo para enviar"
+        return "Pendiente envio auto"
     if (resumen.get("velocidad") or {}).get("velocidad_kmh") is not None:
         return "Velocidad calculada"
     return resumen.get("estado_placa", "Monitoreando")
@@ -1136,6 +1718,7 @@ def _actualizar_historial_monitoreo(resumen: dict) -> None:
     if not selector_activo:
         ruta_historial = ruta_historial or resumen.get("ultimo_recorte_placa")
     clave = (
+        resumen.get("evento_id"),
         ruta_historial,
         velocidad.get("frame_cruce_linea_2"),
         bool(resumen.get("notificacion_correo")),
@@ -1254,6 +1837,12 @@ def _inicializar_estado_monitoreo() -> None:
         "ultima_clave_recorte_monitoreo": None,
         "contador_lector_cnn_monitoreo": 0,
         "ultima_clave_panel_monitoreo": None,
+        "eventos_monitoreo_cola": [],
+        "ultimo_evento_cerrado_registrado": 0,
+        "ocr_evento_vivo_id": None,
+        "lecturas_evento_id": None,
+        "pasos_grupo_notificados": [],
+        "pasos_grupo_descartados": [],
     }
     for clave, valor in valores_iniciales.items():
         if clave not in st.session_state:
@@ -1493,6 +2082,14 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.lecturas_evento_placa_monitoreo = []
         st.session_state.contador_lector_cnn_monitoreo = 0
         st.session_state.ultima_clave_panel_monitoreo = None
+        st.session_state.ultimo_panel_vivo_ts = 0.0
+        st.session_state.eventos_monitoreo_cola = []
+        st.session_state.ultimo_evento_cerrado_registrado = 0
+        st.session_state.ocr_evento_vivo_id = None
+        st.session_state.lecturas_evento_id = None
+        st.session_state.pasos_grupo_notificados = []
+        st.session_state.pasos_grupo_descartados = []
+        _limpiar_ocr_asincrono_monitoreo()
 
     def _refrescar_sidebar_correo() -> None:
         with sidebar_correo_placeholder.container():
@@ -1549,6 +2146,14 @@ def pestana_monitoreo(config: dict) -> None:
             st.session_state.ultima_clave_recorte_monitoreo = None
             st.session_state.contador_lector_cnn_monitoreo = 0
             st.session_state.ultima_clave_panel_monitoreo = None
+            st.session_state.ultimo_panel_vivo_ts = 0.0
+            st.session_state.eventos_monitoreo_cola = []
+            st.session_state.ultimo_evento_cerrado_registrado = 0
+            st.session_state.ocr_evento_vivo_id = None
+            st.session_state.lecturas_evento_id = None
+            st.session_state.pasos_grupo_notificados = []
+            st.session_state.pasos_grupo_descartados = []
+            _limpiar_ocr_asincrono_monitoreo()
         if fuente_monitoreo == "Video de prueba":
             if not reanudar_video:
                 st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
@@ -1652,11 +2257,15 @@ def pestana_monitoreo(config: dict) -> None:
         if monitoreo_activo:
             ruta_ocr = _resolver_ruta_ocr_monitoreo(resumen_parcial)
             if ruta_ocr:
-                resumen_parcial["_ruta_ocr_solicitada"] = ruta_ocr
-                resumen_parcial = _enriquecer_resumen_monitoreo_con_ocr(resumen_parcial)
+                _encolar_ocr_monitoreo_asincrono(resumen_parcial, ruta_ocr)
+            resumen_parcial, hubo_ocr = _fusionar_ocr_asincrono_monitoreo(resumen_parcial)
             st.session_state.ultimo_resultado_parcial = resumen_parcial
-            with panel_placeholder.container():
-                _mostrar_panel_compacto_en_vivo(resumen_parcial)
+            ahora = time.perf_counter()
+            ultimo_panel = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
+            if hubo_ocr or (ahora - ultimo_panel) >= 2.0:
+                with panel_placeholder.container():
+                    _mostrar_panel_compacto_en_vivo(resumen_parcial)
+                st.session_state.ultimo_panel_vivo_ts = ahora
             return
 
         ejecutar_lector = modo_rendimiento != "Demo fluido"
@@ -1679,28 +2288,73 @@ def pestana_monitoreo(config: dict) -> None:
             st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
             if estado_frame.get("estado_persistencia"):
                 st.session_state.estado_persistencia = estado_frame["estado_persistencia"]
+            resumen_live = dict(st.session_state.get("ultimo_resultado_parcial") or {})
+            resumen_live.update(estado_frame)
+            resumen_live.setdefault("frames_procesados", estado_frame.get("frame_actual", numero_frame))
+            resumen_live.setdefault("fuente", fuente_monitoreo)
+            resumen_live.setdefault("placa_controlada", placa_controlada)
+            resumen_live = _reiniciar_ocr_vivo_si_cambio_evento(resumen_live)
+
+            evento_cerrado = estado_frame.get("evento_recien_cerrado")
+            if evento_cerrado:
+                _registrar_evento_cerrado_monitoreo(
+                    evento_cerrado,
+                    config,
+                    placa_controlada,
+                    fuente_monitoreo,
+                )
+                st.session_state.ultimo_recorte_ocr_procesado = None
+                st.session_state.ultimo_resultado_ocr_monitoreo = None
+                st.session_state.lecturas_evento_placa_monitoreo = []
+                st.session_state.ultima_clave_panel_monitoreo = None
+                resumen_live = _limpiar_campos_ocr_resumen(resumen_live)
+
+            clave_panel = _clave_actualizacion_ocr_monitoreo(estado_frame)
+            if clave_panel != st.session_state.get("ultima_clave_panel_monitoreo") and (
+                estado_frame.get("ruta_recorte_evento_en_vivo")
+                or estado_frame.get("mejor_recorte_placa")
+                or estado_frame.get("ultimo_recorte_placa")
+            ):
+                st.session_state.ultima_clave_panel_monitoreo = clave_panel
+                resumen_live = _limpiar_campos_ocr_resumen(resumen_live)
+                st.session_state.ultimo_recorte_ocr_procesado = None
+                st.session_state.ultimo_resultado_ocr_monitoreo = None
+                ruta_ocr = _resolver_ruta_ocr_monitoreo(estado_frame)
+                if ruta_ocr:
+                    _encolar_ocr_monitoreo_asincrono(resumen_live, ruta_ocr)
+
+            resumen_live, _ = _fusionar_ocr_asincrono_monitoreo(resumen_live)
+            hubo_cola = _procesar_ocr_cola_eventos(config, placa_controlada)
+            if hubo_cola:
+                _procesar_envio_automatico_cola(
+                    config,
+                    placa_controlada,
+                    int(estado_frame.get("frame_actual", numero_frame) or 0),
+                )
+            st.session_state.ultimo_resultado_parcial = resumen_live
+
             confianza = estado_frame.get("ultima_confianza")
             texto_confianza = f"{confianza:.0%}" if confianza is not None else "—"
             fps_proc = estado_frame.get("fps_procesamiento", "—")
+            placa_ui = _obtener_texto_placa_ui(resumen_live)
+            if placa_ui == "Leyendo...":
+                texto_placa = " · Leyendo placa..."
+            elif placa_ui != "—":
+                texto_placa = f" · {placa_ui}"
+            else:
+                texto_placa = ""
+            cola_n = len(st.session_state.get("eventos_monitoreo_cola") or [])
+            texto_cola = f" · {cola_n} vehiculo(s) registrado(s)" if cola_n else ""
             estado_placeholder.info(
-                f"{estado_frame.get('estado_placa', '—')} · YOLO {texto_confianza} · {fps_proc} FPS"
+                f"{estado_frame.get('estado_placa', '—')}{texto_placa} · YOLO {texto_confianza} · {fps_proc} FPS{texto_cola}"
             )
-            clave_panel = _clave_actualizacion_ocr_monitoreo(estado_frame)
-            debe_actualizar_panel = bool(
-                clave_panel != st.session_state.get("ultima_clave_panel_monitoreo")
-                and (
-                    estado_frame.get("ruta_recorte_evento_en_vivo")
-                    or estado_frame.get("mejor_recorte_placa")
-                    or estado_frame.get("ultimo_recorte_placa")
-                )
-            )
-            if debe_actualizar_panel:
-                st.session_state.ultima_clave_panel_monitoreo = clave_panel
-                estado_ocr = dict(estado_frame)
-                ruta_ocr = _resolver_ruta_ocr_monitoreo(estado_ocr)
-                if ruta_ocr:
-                    estado_ocr["_ruta_ocr_solicitada"] = ruta_ocr
-                _actualizar_panel_desde_estado(estado_ocr, monitoreo_activo=True)
+
+            ahora = time.perf_counter()
+            ultimo_panel = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
+            if hubo_cola or (ahora - ultimo_panel) >= 2.0 and _obtener_ruta_recorte_ui(resumen_live):
+                with panel_placeholder.container():
+                    _mostrar_panel_compacto_en_vivo(resumen_live)
+                st.session_state.ultimo_panel_vivo_ts = ahora
         else:
             estado_placeholder.info(f"Procesando frame {numero_frame}")
 
@@ -1713,6 +2367,13 @@ def pestana_monitoreo(config: dict) -> None:
             if st.session_state.get("monitoreo_pausado"):
                 estado_placeholder.info(f"Video pausado en el frame {st.session_state.get('frame_actual', 0)}. Presione Reanudar monitoreo para continuar.")
         if st.session_state.get("ultimo_resultado") or st.session_state.get("ultimo_resultado_parcial"):
+            _procesar_ocr_cola_eventos(config, placa_controlada)
+            _procesar_envio_automatico_cola(
+                config,
+                placa_controlada,
+                int(st.session_state.get("frame_actual") or 0),
+                forzar=True,
+            )
             resumen_pausa = dict(st.session_state.get("ultimo_resultado") or st.session_state.get("ultimo_resultado_parcial") or {})
             resumen_pausa = _enriquecer_resumen_monitoreo_con_ocr(resumen_pausa)
             placa_pausa = _obtener_placa_para_evento(resumen_pausa, placa_controlada)
@@ -1784,12 +2445,24 @@ def pestana_monitoreo(config: dict) -> None:
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),
+                tiempo_real=True,
             )
 
     if resumen.get("estado") == "error":
         st.error(resumen.get("mensaje_estado", "No se pudo completar el monitoreo."))
         _refrescar_sidebar_correo()
         return
+
+    estado_final = resumen.get("estado_persistencia") or {}
+    for evento in estado_final.get("eventos_cerrados") or []:
+        _registrar_evento_cerrado_monitoreo(evento, config, placa_controlada, fuente_monitoreo)
+    _procesar_ocr_cola_eventos(config, placa_controlada)
+    _procesar_envio_automatico_cola(
+        config,
+        placa_controlada,
+        int(resumen.get("frame_actual") or 0),
+        forzar=True,
+    )
 
     resumen = _enriquecer_resumen_monitoreo_con_ocr(resumen)
     placa_evento = _obtener_placa_para_evento(resumen, placa_controlada)

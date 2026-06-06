@@ -92,3 +92,7 @@ notificaciones:
     longitud_min: 6
     longitud_max: 7
     permitir_envio_si_no_apto: false
+  # Agrupa eventos cercanos en frames (mismo paso de vehiculo) y envia solo la mejor lectura.
+  envio_automatico: true
+  ventana_frames_mismo_paso: 150
+  cooldown_frames_envio: 60

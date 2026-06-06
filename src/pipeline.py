@@ -24,6 +24,7 @@ from src.speed_estimator import SpeedTracker, estimar_velocidad
 
 EXCLUIR_ZONA_SUPERIOR_PORCENTAJE = 0.20
 GUARDAR_RECORTE_CADA_N_FRAMES = 15
+TIEMPO_REAL_GUARDADO_MIN_INTERVAL_S = 0.35
 BBOX_SUAVIZADO_ALPHA = 0.6
 DEFAULT_PLATE_CROP_SELECTION = {
     "enabled": True,
@@ -172,6 +173,7 @@ def procesar_camara_monitoreo(
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
+    tiempo_real: bool = False,
 ) -> dict:
     return _procesar_fuente_monitoreo(
         fuente=int(indice_camara),
@@ -201,6 +203,7 @@ def procesar_camara_monitoreo(
         frame_callback=frame_callback,
         progreso_callback=progreso_callback,
         detener_callback=detener_callback,
+        tiempo_real=tiempo_real,
     )
 
 
@@ -355,6 +358,7 @@ def _procesar_fuente_monitoreo(
     frame_callback=None,
     progreso_callback=None,
     detener_callback=None,
+    tiempo_real: bool = False,
 ) -> dict:
     if isinstance(fuente, int):
         captura = cv2.VideoCapture(fuente, cv2.CAP_DSHOW)
@@ -418,6 +422,7 @@ def _procesar_fuente_monitoreo(
     placas_dir = Path("reports") / "evidencias" / "placas_detectadas"
     placas_dir.mkdir(parents=True, exist_ok=True)
     estado_persistencia = estado_persistencia or _crear_estado_persistencia()
+    estado_persistencia["_tiempo_real"] = bool(tiempo_real)
     detecciones_frame = 0
     detecciones_brutas = 0
     detecciones_validas = 0
@@ -583,6 +588,8 @@ def _procesar_fuente_monitoreo(
                 "ruta_mejor_recorte_evento": estado_frame["ruta_mejor_recorte_evento"],
                 "ruta_recorte_evento_en_vivo": estado_frame.get("ruta_recorte_evento_en_vivo"),
                 "velocidad": estado_frame["velocidad"],
+                "evento_recien_cerrado": estado_frame.get("evento_recien_cerrado"),
+                "eventos_cerrados": estado_frame.get("eventos_cerrados"),
             }
             try:
                 t_render = time.perf_counter()
@@ -615,10 +622,12 @@ def _procesar_fuente_monitoreo(
 
     frame_final = start_frame + frames_procesados
 
-    if estado_persistencia.get("buffer_recortes_placa"):
+    if estado_persistencia.get("buffer_recortes_placa") and not estado_persistencia.get("_tiempo_real"):
         _seleccionar_mejor_recorte_buffer(estado_persistencia)
 
     if estado_persistencia["evento_activo"]:
+        if estado_persistencia.get("_tiempo_real"):
+            _flush_recorte_en_vivo(estado_persistencia, forzar=True)
         _cerrar_evento_placa(estado_persistencia, frame_final)
         ruta_mejor_recorte_evento = estado_persistencia["ruta_mejor_recorte_evento"] or ruta_mejor_recorte_evento
 
@@ -726,6 +735,8 @@ def _crear_estado_persistencia() -> dict:
         "ultimo_frame_mejor_recorte_placa": None,
         "ultimo_puntaje_recorte_placa": None,
         "ultimo_tiempo_lector_cnn_ms": None,
+        "eventos_cerrados": [],
+        "_ultimo_evento_cerrado": None,
     }
 
 
@@ -1260,6 +1271,8 @@ def _registrar_candidato_recorte(
     cfg = _config_recorte_placa(config)
     if not cfg.get("enabled", True) or recorte is None or recorte.size == 0:
         return
+    if _tiempo_real_activo(estado):
+        return
     estado["_plate_crop_selection_cfg"] = cfg
     metricas = calcular_puntaje_recorte_placa(frame_limpio, bbox, recorte, conf_yolo, cfg)
     candidato = {
@@ -1496,6 +1509,14 @@ def _procesar_frame_monitoreo(
         if not estado_persistencia["bbox_persistente_activa"]:
             eventos_placa += 1
             _iniciar_evento_placa(estado_persistencia, eventos_placa, numero_frame)
+            _reiniciar_speed_tracker(
+                estado_persistencia,
+                frame_visual.shape[0],
+                distancia_lineas_m,
+                fps,
+                posicion_linea_1,
+                posicion_linea_2,
+            )
 
         estado_persistencia["ultima_bbox_valida"] = bbox_suavizada
         estado_persistencia["ultima_confianza_valida"] = float(deteccion["confianza"])
@@ -1533,11 +1554,14 @@ def _procesar_frame_monitoreo(
         _guardar_evidencia_velocidad(frame_visual, velocidad)
 
         if numero_frame - estado_persistencia["ultimo_frame_recorte"] >= GUARDAR_RECORTE_CADA_N_FRAMES:
-            recorte_path = placas_dir / f"placa_{numero_frame:06d}_{eventos_placa:03d}.jpg"
-            cv2.imwrite(str(recorte_path), deteccion["recorte_placa"])
-            ultimo_recorte_placa = str(recorte_path)
-            estado_persistencia["ultimo_recorte_placa"] = str(recorte_path)
-            estado_persistencia["ultimo_frame_recorte"] = numero_frame
+            if not _tiempo_real_activo(estado_persistencia):
+                recorte_path = placas_dir / f"placa_{numero_frame:06d}_{eventos_placa:03d}.jpg"
+                cv2.imwrite(str(recorte_path), deteccion["recorte_placa"])
+                ultimo_recorte_placa = str(recorte_path)
+                estado_persistencia["ultimo_recorte_placa"] = str(recorte_path)
+                estado_persistencia["ultimo_frame_recorte"] = numero_frame
+            else:
+                ultimo_recorte_placa = estado_persistencia.get("ruta_recorte_evento_en_vivo")
         else:
             ultimo_recorte_placa = estado_persistencia["ultimo_recorte_placa"]
 
@@ -1589,6 +1613,8 @@ def _procesar_frame_monitoreo(
 
     _dibujar_info_velocidad(frame_visual, velocidad)
 
+    evento_recien_cerrado = estado_persistencia.pop("_ultimo_evento_cerrado", None)
+
     return {
         "frame_visual": frame_visual,
         "mensaje_detector": mensaje_detector,
@@ -1618,7 +1644,74 @@ def _procesar_frame_monitoreo(
         "ruta_mejor_recorte_evento": estado_persistencia["ruta_mejor_recorte_evento"],
         "ruta_recorte_evento_en_vivo": estado_persistencia.get("ruta_recorte_evento_en_vivo"),
         "velocidad": velocidad,
+        "evento_recien_cerrado": evento_recien_cerrado,
+        "eventos_cerrados": list(estado_persistencia.get("eventos_cerrados") or []),
     }
+
+
+def _tiempo_real_activo(estado: dict) -> bool:
+    return bool(estado.get("_tiempo_real"))
+
+
+def _debe_guardar_recorte_en_vivo(estado: dict, confianza: float, forzar: bool = False) -> bool:
+    if forzar or not _tiempo_real_activo(estado):
+        return True
+    ahora = time.perf_counter()
+    ultimo = float(estado.get("_ultimo_guardado_en_vivo_ts") or 0.0)
+    conf_prev = estado.get("_ultima_conf_escrita_en_vivo")
+    mejora = conf_prev is None or confianza >= float(conf_prev) + 0.015
+    if not mejora:
+        return False
+    if (ahora - ultimo) < TIEMPO_REAL_GUARDADO_MIN_INTERVAL_S:
+        return False
+    estado["_ultimo_guardado_en_vivo_ts"] = ahora
+    estado["_ultima_conf_escrita_en_vivo"] = confianza
+    return True
+
+
+def _flush_recorte_en_vivo(estado: dict, forzar: bool = False) -> None:
+    recorte = estado.get("mejor_recorte_evento")
+    if recorte is None or getattr(recorte, "size", 0) == 0:
+        return
+    confianza = float(estado.get("mejor_confianza_evento") or 0.0)
+    if not _debe_guardar_recorte_en_vivo(estado, confianza, forzar=forzar):
+        return
+    eventos_dir = Path("reports") / "evidencias" / "eventos_placa"
+    eventos_dir.mkdir(parents=True, exist_ok=True)
+    evento_id = int(estado.get("evento_id") or estado.get("eventos_placa") or 0)
+    ruta_en_vivo = eventos_dir / f"evento_{evento_id:04d}_recorte_en_vivo.jpg"
+    cv2.imwrite(str(ruta_en_vivo), recorte)
+    estado["ruta_recorte_evento_en_vivo"] = str(ruta_en_vivo)
+
+
+def _serializar_evento_cerrado(estado: dict, frame_fin: int) -> dict:
+    tracker = estado.get("speed_tracker")
+    velocidad = tracker.resumen() if tracker is not None else {}
+    return {
+        "evento_id": int(estado["evento_id"]),
+        "frame_inicio": estado.get("frame_inicio_evento"),
+        "frame_mejor": estado.get("frame_mejor_evento"),
+        "frame_fin": frame_fin,
+        "mejor_confianza": estado.get("mejor_confianza_evento"),
+        "mejor_bbox": estado.get("mejor_bbox_evento"),
+        "ruta_mejor_frame": estado.get("ruta_mejor_frame_evento"),
+        "ruta_mejor_recorte": estado.get("ruta_mejor_recorte_evento"),
+        "velocidad": velocidad,
+    }
+
+
+def _reiniciar_speed_tracker(
+    estado: dict,
+    alto_frame: int,
+    distancia_metros: float,
+    fps: float,
+    posicion_linea_1: float,
+    posicion_linea_2: float,
+) -> None:
+    linea_1_y = int(alto_frame * posicion_linea_1)
+    linea_2_y = int(alto_frame * posicion_linea_2)
+    _limpiar_evidencia_velocidad()
+    estado["speed_tracker"] = SpeedTracker(linea_1_y, linea_2_y, distancia_metros, fps)
 
 
 def _iniciar_evento_placa(estado: dict, evento_id: int, numero_frame: int) -> None:
@@ -1635,6 +1728,8 @@ def _iniciar_evento_placa(estado: dict, evento_id: int, numero_frame: int) -> No
     estado["ruta_mejor_frame_evento"] = None
     estado["ruta_mejor_recorte_evento"] = None
     estado["ruta_recorte_evento_en_vivo"] = None
+    estado["_ultimo_guardado_en_vivo_ts"] = 0.0
+    estado["_ultima_conf_escrita_en_vivo"] = None
     estado["buffer_recortes_placa"] = []
     estado["ultimo_candidatos_recorte"] = []
     estado["ruta_mejor_recorte_placa"] = None
@@ -1658,20 +1753,28 @@ def _actualizar_mejor_evento_placa(
     if mejor_confianza is None or confianza > mejor_confianza:
         estado["mejor_confianza_evento"] = confianza
         estado["mejor_bbox_evento"] = bbox
-        estado["mejor_frame_evento"] = frame_visual.copy()
+        if not _tiempo_real_activo(estado):
+            estado["mejor_frame_evento"] = frame_visual.copy()
         estado["mejor_recorte_evento"] = recorte_placa.copy()
         estado["frame_mejor_evento"] = numero_frame
         if recorte_placa is not None and recorte_placa.size > 0:
-            eventos_dir = Path("reports") / "evidencias" / "eventos_placa"
-            eventos_dir.mkdir(parents=True, exist_ok=True)
-            evento_id = int(estado.get("evento_id") or estado.get("eventos_placa") or 0)
-            ruta_en_vivo = eventos_dir / f"evento_{evento_id:04d}_recorte_en_vivo.jpg"
-            cv2.imwrite(str(ruta_en_vivo), recorte_placa)
-            estado["ruta_recorte_evento_en_vivo"] = str(ruta_en_vivo)
+            if _debe_guardar_recorte_en_vivo(estado, confianza):
+                eventos_dir = Path("reports") / "evidencias" / "eventos_placa"
+                eventos_dir.mkdir(parents=True, exist_ok=True)
+                evento_id = int(estado.get("evento_id") or estado.get("eventos_placa") or 0)
+                ruta_en_vivo = eventos_dir / f"evento_{evento_id:04d}_recorte_en_vivo.jpg"
+                cv2.imwrite(str(ruta_en_vivo), recorte_placa)
+                estado["ruta_recorte_evento_en_vivo"] = str(ruta_en_vivo)
 
 
 def _cerrar_evento_placa(estado: dict, frame_fin: int) -> None:
-    if not estado["evento_activo"] or estado["mejor_frame_evento"] is None:
+    if estado.get("_tiempo_real"):
+        _flush_recorte_en_vivo(estado, forzar=True)
+    if not estado["evento_activo"]:
+        return
+    if estado["mejor_frame_evento"] is None and estado.get("mejor_recorte_evento") is not None:
+        estado["mejor_frame_evento"] = estado["mejor_recorte_evento"]
+    if estado["mejor_frame_evento"] is None:
         estado["evento_activo"] = False
         return
 
@@ -1715,6 +1818,12 @@ def _cerrar_evento_placa(estado: dict, frame_fin: int) -> None:
                 "estado_evento": "cerrado",
             }
         )
+
+    snapshot = _serializar_evento_cerrado(estado, frame_fin)
+    snapshot["ruta_mejor_frame"] = str(ruta_frame)
+    snapshot["ruta_mejor_recorte"] = str(ruta_recorte)
+    estado.setdefault("eventos_cerrados", []).append(snapshot)
+    estado["_ultimo_evento_cerrado"] = snapshot
 
     estado["evento_activo"] = False
 
