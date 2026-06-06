@@ -7,7 +7,7 @@ import time
 
 import cv2
 
-from src.camera_utils import abrir_captura_camara, frame_tiene_senal, probar_indices_camara
+from src.camera_utils import abrir_captura_camara, frame_tiene_senal, probar_indices_camara, resolucion_real_captura, _configurar_captura
 from src.fuzzy_system import clasificar_velocidad
 from src.plate_detector import PlateDetector, dibujar_deteccion
 from src.plate_reader import (
@@ -29,6 +29,17 @@ TIEMPO_REAL_GUARDADO_MIN_INTERVAL_S = 0.55
 BBOX_SUAVIZADO_ALPHA = 0.6
 IOU_MIN_MISMO_VEHICULO = 0.25
 OCR_SNAPSHOT_CONF_MIN = 0.28
+OCR_SNAPSHOT_MEJORA_MIN = 0.05
+JPEG_CALIDAD_EVIDENCIA = 95
+
+
+def _guardar_jpeg_calidad(ruta, imagen, calidad: int = JPEG_CALIDAD_EVIDENCIA) -> None:
+    if imagen is None:
+        return
+    cv2.imwrite(str(ruta), imagen, [int(cv2.IMWRITE_JPEG_QUALITY), int(calidad)])
+
+
+OCR_MAX_DISPAROS_EVENTO_VIVO = 3
 SALTO_CENTRO_NUEVO_VEHICULO = 0.12
 DEFAULT_PLATE_CROP_SELECTION = {
     "enabled": True,
@@ -415,6 +426,19 @@ def _procesar_fuente_monitoreo(
         }
 
     fps, ancho, alto, total_frames, duracion = _leer_metadata_video(captura)
+    if isinstance(fuente, int):
+        ancho_real, alto_real, fps_real = resolucion_real_captura(captura)
+        if ancho_real > 0 and alto_real > 0:
+            ancho, alto = ancho_real, alto_real
+        if fps_real > 0:
+            fps = fps_real
+        if camera_width and ancho < int(camera_width) * 0.85:
+            _configurar_captura(captura, camera_width, camera_height, camera_fps)
+            ancho_real, alto_real, fps_real = resolucion_real_captura(captura)
+            if ancho_real > 0 and alto_real > 0:
+                ancho, alto = ancho_real, alto_real
+            if fps_real > 0:
+                fps = fps_real
     if isinstance(fuente, int) and fps <= 0 and camera_fps:
         fps = float(camera_fps)
     start_frame = max(int(start_frame or 0), 0)
@@ -495,7 +519,7 @@ def _procesar_fuente_monitoreo(
         t_lectura = time.perf_counter()
         es_camara_vivo = isinstance(fuente, int) and tiempo_real
         if es_camara_vivo:
-            ok, frame = _leer_frame_camara_vivo(captura)
+            ok, frame = _leer_frame_camara_vivo(captura, max_grabs=2)
         else:
             ok, frame = captura.read()
         tiempos_etapa["lectura_frame_ms"] = round((time.perf_counter() - t_lectura) * 1000, 3)
@@ -503,7 +527,7 @@ def _procesar_fuente_monitoreo(
             break
         t_rotacion = time.perf_counter()
         frame = aplicar_rotacion(frame, rotacion)
-        if max_frame_width > 0 and (es_archivo_video or es_camara_vivo):
+        if max_frame_width > 0 and es_archivo_video:
             frame = _reducir_frame_monitoreo(frame, max_frame_width)
         tiempos_etapa["rotacion_ms"] = round((time.perf_counter() - t_rotacion) * 1000, 3)
         alto_actual, ancho_actual = frame.shape[:2]
@@ -572,6 +596,9 @@ def _procesar_fuente_monitoreo(
                         "frame_actual": numero_frame_actual,
                         "frames_procesados": frames_procesados,
                         "fps_procesamiento": round(frames_procesados / tiempo_transcurrido, 2),
+                        "ancho": ancho_actual,
+                        "alto": alto_actual,
+                        "resolucion_captura": f"{ancho_actual}x{alto_actual}",
                         "evento_id": estado_persistencia.get("evento_id"),
                         "evento_activo": bool(estado_persistencia.get("evento_activo")),
                         "estado_placa": (
@@ -1848,7 +1875,7 @@ def _procesar_frame_monitoreo(
         if numero_frame - estado_persistencia["ultimo_frame_recorte"] >= GUARDAR_RECORTE_CADA_N_FRAMES:
             if not _tiempo_real_activo(estado_persistencia):
                 recorte_path = placas_dir / f"placa_{numero_frame:06d}_{eventos_placa:03d}.jpg"
-                cv2.imwrite(str(recorte_path), deteccion["recorte_placa"])
+                _guardar_jpeg_calidad(recorte_path, deteccion["recorte_placa"])
                 ultimo_recorte_placa = str(recorte_path)
                 estado_persistencia["ultimo_recorte_placa"] = str(recorte_path)
                 estado_persistencia["ultimo_frame_recorte"] = numero_frame
@@ -2005,12 +2032,12 @@ def _flush_recorte_en_vivo(estado: dict, forzar: bool = False) -> None:
     eventos_dir.mkdir(parents=True, exist_ok=True)
     evento_id = int(estado.get("evento_id") or estado.get("eventos_placa") or 0)
     ruta_en_vivo = eventos_dir / f"evento_{evento_id:04d}_recorte_en_vivo.jpg"
-    cv2.imwrite(str(ruta_en_vivo), recorte)
+    _guardar_jpeg_calidad(ruta_en_vivo, recorte)
     estado["ruta_recorte_evento_en_vivo"] = str(ruta_en_vivo)
     frame_vivo = estado.get("mejor_frame_evento")
     if frame_vivo is not None and getattr(frame_vivo, "size", 0) > 0:
         ruta_frame = eventos_dir / f"evento_{evento_id:04d}_frame_en_vivo.jpg"
-        cv2.imwrite(str(ruta_frame), frame_vivo)
+        _guardar_jpeg_calidad(ruta_frame, frame_vivo)
         estado["ruta_frame_evento_en_vivo"] = str(ruta_frame)
 
 
@@ -2076,30 +2103,34 @@ def _intentar_disparar_ocr_snapshot_evento(
         return
 
     eid = int(evento_id)
-    disparados = estado.setdefault("_ocr_disparados", set())
+    disparos = int(estado.get("_ocr_disparos_evento") or 0)
+    if disparos >= OCR_MAX_DISPAROS_EVENTO_VIVO:
+        return
     conf_prev = estado.get("_ocr_snapshot_conf")
-    if eid in disparados:
-        if conf_prev is not None and float(confianza) < float(conf_prev) + 0.025:
-            return
-    else:
-        disparados.add(eid)
+    if disparos > 0 and conf_prev is not None and float(confianza) < float(conf_prev) + OCR_SNAPSHOT_MEJORA_MIN:
+        return
 
     eventos_dir = Path("reports") / "evidencias" / "eventos_placa"
     eventos_dir.mkdir(parents=True, exist_ok=True)
-    ruta_snapshot = eventos_dir / f"evento_{eid:04d}_snapshot_ocr.jpg"
-    ruta_frame = eventos_dir / f"evento_{eid:04d}_snapshot_frame.jpg"
-    cv2.imwrite(str(ruta_snapshot), recorte_placa)
-    cv2.imwrite(str(ruta_frame), frame_visual)
-    estado["ruta_snapshot_ocr_evento"] = str(ruta_snapshot)
+    disparo = disparos + 1
+    ruta_en_vivo = eventos_dir / f"evento_{eid:04d}_recorte_en_vivo.jpg"
+    ruta_ocr = eventos_dir / f"evento_{eid:04d}_ocr_{disparo:02d}.jpg"
+    ruta_frame = eventos_dir / f"evento_{eid:04d}_frame_en_vivo.jpg"
+    cv2.imwrite(str(ruta_en_vivo), recorte_placa, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_CALIDAD_EVIDENCIA])
+    cv2.imwrite(str(ruta_ocr), recorte_placa, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_CALIDAD_EVIDENCIA])
+    cv2.imwrite(str(ruta_frame), frame_visual, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_CALIDAD_EVIDENCIA])
+    estado["ruta_recorte_evento_en_vivo"] = str(ruta_en_vivo)
+    estado["ruta_snapshot_ocr_evento"] = str(ruta_ocr)
     estado["ruta_snapshot_frame_evento"] = str(ruta_frame)
     estado["_ocr_snapshot_conf"] = float(confianza)
+    estado["_ocr_disparos_evento"] = disparo
     estado["_ocr_evento_pendiente"] = {
         "evento_id": eid,
-        "ruta_recorte": str(ruta_snapshot),
+        "ruta_recorte": str(ruta_ocr),
         "ruta_frame": str(ruta_frame),
         "confianza": float(confianza),
         "frame": int(numero_frame),
-        "mejorado": eid in disparados and conf_prev is not None,
+        "mejorado": disparo > 1,
     }
 
 
@@ -2125,6 +2156,8 @@ def _iniciar_evento_placa(estado: dict, evento_id: int, numero_frame: int) -> No
     estado["mejor_recorte_placa"] = None
     estado["mejor_recorte_placa_info"] = None
     estado["ultimo_frame_recorte"] = numero_frame - GUARDAR_RECORTE_CADA_N_FRAMES
+    estado["_ocr_snapshot_conf"] = None
+    estado["_ocr_disparos_evento"] = 0
 
 
 def _actualizar_mejor_evento_placa(

@@ -43,8 +43,8 @@ monitoring_performance:
     yolo_every_n_frames: 5
     inference_size: 416
     max_display_fps: 0
-    max_frame_width: 640
-    preview_width: 420
+    max_frame_width: 0
+    preview_width: 960
   rapido:
     yolo_every_n_frames: 5
     inference_size: 416

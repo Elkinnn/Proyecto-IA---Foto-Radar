@@ -102,11 +102,22 @@ def _redimensionar_frame_rgb(frame_rgb, ancho_maximo: int = 800):
         return frame_rgb
     escala = ancho_maximo / float(ancho)
     nuevo_alto = max(1, int(alto * escala))
-    return cv2.resize(frame_rgb, (ancho_maximo, nuevo_alto), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(frame_rgb, (ancho_maximo, nuevo_alto), interpolation=cv2.INTER_AREA)
 
 
 def _preparar_imagen_streamlit(frame_rgb, ancho_maximo: int = 640):
     return _redimensionar_frame_rgb(frame_rgb, ancho_maximo)
+
+
+def _texto_resolucion_captura_ui(estado_frame: dict) -> str:
+    res = estado_frame.get("resolucion_captura")
+    if res:
+        return str(res)
+    ancho = estado_frame.get("ancho")
+    alto = estado_frame.get("alto")
+    if ancho and alto:
+        return f"{int(ancho)}x{int(alto)}"
+    return ""
 
 
 st.set_page_config(
@@ -807,54 +818,93 @@ def _extraer_placa_desde_resumen(resumen: dict) -> str:
     return ""
 
 
+def _entrada_cache_ocr_evento(evento_id: int | None) -> dict:
+    if evento_id is None:
+        return {}
+    return (st.session_state.get("ocr_eventos_cache") or {}).get(int(evento_id)) or {}
+
+
+def _placa_consolidada_en_cache(evento_id: int | None) -> str:
+    entry = _entrada_cache_ocr_evento(evento_id)
+    if not entry.get("datos"):
+        return ""
+    tmp = dict(entry.get("datos") or {})
+    if entry.get("resumen_completo"):
+        tmp.update(entry["resumen_completo"])
+    return _extraer_placa_desde_resumen(tmp)
+
+
+def _ocr_en_vuelo_evento(evento_id: int | None) -> bool:
+    if evento_id is None:
+        return False
+    cache_key = f"evento_{int(evento_id)}"
+    with _OCR_ASYNC_LOCK:
+        if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
+            return True
+    entry = _entrada_cache_ocr_evento(evento_id)
+    return entry.get("estado") == "pendiente" and not entry.get("evento_cerrado")
+
+
 def _obtener_texto_placa_ui(resumen: dict) -> str:
     evento_id = resumen.get("evento_id")
+    placa_cache = _placa_consolidada_en_cache(int(evento_id) if evento_id is not None else None)
+    if placa_cache:
+        return placa_cache
     if evento_id is not None:
-        entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(evento_id))
-        if entry and entry.get("estado") == "listo":
+        entry = _entrada_cache_ocr_evento(int(evento_id))
+        if entry.get("datos"):
             tmp = dict(resumen)
             tmp.update(entry.get("datos") or {})
-            if entry.get("resumen_completo"):
-                tmp.update(entry["resumen_completo"])
             placa_cache = _extraer_placa_desde_resumen(tmp)
             if placa_cache:
                 return placa_cache
     placa = _extraer_placa_desde_resumen(resumen)
     if placa:
         return placa
+    eid = int(evento_id or 0)
+    if resumen.get("evento_activo") or resumen.get("estado_placa") in ("Detectada", "Mantenida"):
+        if eid and _ocr_en_vuelo_evento(eid):
+            return "Leyendo..."
+        if eid:
+            return f"Capturando #{eid:03d}..."
+        return "Capturando..."
     if resumen.get("capturando_vehiculo_activo"):
-        evento_id = int(resumen.get("evento_id") or 0)
-        return f"Capturando #{evento_id:03d}..." if evento_id else "Capturando..."
-    if resumen.get("estado_ocr") == "pendiente":
+        return f"Capturando #{eid:03d}..." if eid else "Capturando..."
+    if resumen.get("estado_placa") == "Cerrado" and eid and _ocr_en_vuelo_evento(eid):
         return "Leyendo..."
-    texto_pendiente = str(resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "")
-    if "Analizando placa" in texto_pendiente:
-        return "Leyendo..."
-    if resumen.get("evento_activo") and resumen.get("estado_placa") in ("Detectada", "Mantenida"):
-        evento_id = int(resumen.get("evento_id") or 0)
-        return f"Capturando #{evento_id:03d}..." if evento_id else "Capturando..."
     return "—"
 
 
 def _obtener_resumen_panel_vivo(resumen_live: dict) -> dict:
-    """Placa bloqueada por evento_id; el recorte en vivo se actualiza con mejores frames."""
+    """Placa consolidada por evento; el recorte en vivo sigue al mejor frame."""
     cache = st.session_state.get("ocr_eventos_cache") or {}
-    evento_activo_id = int(resumen_live.get("evento_id") or 0) if resumen_live.get("evento_activo") else None
+    evento_id_ui = int(resumen_live.get("evento_id") or 0)
 
-    if evento_activo_id and evento_activo_id in cache:
-        entry = cache[evento_activo_id]
-        if entry.get("estado") == "listo":
-            return _resumen_panel_desde_cache(entry, resumen_live)
+    if evento_id_ui and evento_id_ui in cache:
+        entry = cache[evento_id_ui]
         out = _resumen_panel_desde_cache(entry, resumen_live)
-        ruta_viva = resumen_live.get("ruta_recorte_evento_en_vivo")
+        ruta_viva = (
+            resumen_live.get("ruta_recorte_evento_en_vivo")
+            or resumen_live.get("ruta_mejor_recorte_evento")
+            or resumen_live.get("mejor_recorte_placa")
+        )
         if ruta_viva and Path(str(ruta_viva)).exists():
             out["ruta_recorte_evento_en_vivo"] = str(ruta_viva)
             out["mejor_recorte_placa"] = str(ruta_viva)
             out["ruta_mejor_recorte_evento"] = str(ruta_viva)
-        if entry.get("estado") == "pendiente":
+        out["evento_id"] = evento_id_ui
+        placa_visible = _extraer_placa_desde_resumen(out)
+        if placa_visible:
+            out["estado_ocr"] = "confirmada" if entry.get("estado") == "listo" else "consolidado_parcial"
+            out["placa_estado_ui"] = "confirmada" if entry.get("evento_cerrado") else "provisional"
+        elif entry.get("estado") == "pendiente" and _ocr_en_vuelo_evento(evento_id_ui):
             out["estado_ocr"] = "pendiente"
-            out["texto_ocr_corregido"] = "Analizando placa..."
+            out["placa_estado_ui"] = "leyendo"
+        elif resumen_live.get("evento_activo") or resumen_live.get("estado_placa") in ("Detectada", "Mantenida"):
+            out["placa_estado_ui"] = "capturando"
         return out
+
+    evento_activo_id = evento_id_ui if resumen_live.get("evento_activo") else None
 
     for eid in sorted((int(k) for k in cache.keys()), reverse=True):
         if evento_activo_id and eid == evento_activo_id:
@@ -869,15 +919,32 @@ def _obtener_resumen_panel_vivo(resumen_live: dict) -> dict:
 
     cola = st.session_state.get("eventos_monitoreo_cola") or []
     if cola:
-        item = cola[0]
+        item = next(
+            (i for i in cola if int(i.get("evento_id") or 0) == evento_id_ui),
+            cola[0],
+        )
         res_cerrado = dict(item.get("resumen") or {})
-        if item.get("estado_ocr") == "listo":
+        cache_item = _entrada_cache_ocr_evento(int(item.get("evento_id") or 0))
+        if cache_item.get("datos"):
+            res_cerrado.update({k: v for k, v in cache_item["datos"].items() if v is not None})
+        if item.get("estado_ocr") == "listo" or (cache_item.get("estado") == "listo" and cache_item.get("resumen_completo")):
+            if cache_item.get("resumen_completo"):
+                res_cerrado = dict(cache_item["resumen_completo"])
+            if evento_activo_id and evento_activo_id != int(item.get("evento_id") or 0):
+                res_cerrado["capturando_otro_vehiculo"] = evento_activo_id
+            return res_cerrado
+        if _extraer_placa_desde_resumen(res_cerrado):
+            res_cerrado["placa_estado_ui"] = "confirmada" if item.get("estado_ocr") == "listo" else "provisional"
+            if evento_activo_id and evento_activo_id != int(item.get("evento_id") or 0):
+                res_cerrado["capturando_otro_vehiculo"] = evento_activo_id
+            return res_cerrado
+        if item.get("estado_ocr") == "pendiente" and _ocr_en_vuelo_evento(int(item.get("evento_id") or 0)):
+            res_cerrado["placa_estado_ui"] = "leyendo"
             if evento_activo_id and evento_activo_id != int(item.get("evento_id") or 0):
                 res_cerrado["capturando_otro_vehiculo"] = evento_activo_id
             return res_cerrado
         if item.get("estado_ocr") == "pendiente":
-            res_cerrado.setdefault("estado_ocr", "pendiente")
-            res_cerrado.setdefault("texto_ocr_corregido", "Analizando placa...")
+            res_cerrado["placa_estado_ui"] = "capturando"
             if evento_activo_id and evento_activo_id != int(item.get("evento_id") or 0):
                 res_cerrado["capturando_otro_vehiculo"] = evento_activo_id
             return res_cerrado
@@ -909,10 +976,10 @@ def _resumen_panel_desde_cache(entry: dict, resumen_live: dict) -> dict:
         out["ruta_recorte_evento_en_vivo"] = ruta
         out["mejor_recorte_placa"] = ruta
         out["ruta_mejor_recorte_evento"] = ruta
-    if entry.get("estado") == "listo":
+    if entry.get("datos"):
         out.update(entry.get("datos") or {})
-        if entry.get("resumen_completo"):
-            out.update(entry["resumen_completo"])
+    if entry.get("resumen_completo"):
+        out.update(entry["resumen_completo"])
     return out
 
 
@@ -1341,6 +1408,15 @@ def _render_panel_deteccion_esencial(
         else:
             st.info("Esperando placa...")
     with col_main:
+        placa_estado = resumen.get("placa_estado_ui")
+        if placa_estado == "confirmada":
+            st.caption("Placa confirmada")
+        elif placa_estado == "provisional" and placa not in ("—", "Leyendo...", "Capturando...", "Capturando") and not str(placa).startswith("Capturando #"):
+            st.caption("Lectura provisional · se consolida con mas frames")
+        elif placa_estado == "leyendo" and placa == "Leyendo...":
+            st.caption("Primera lectura OCR en curso")
+        elif placa_estado == "capturando":
+            st.caption("Acumulando frames del vehiculo")
         st.markdown(f"## {placa}")
         m1, m2, m3 = st.columns(3)
         m1.metric("Velocidad", texto_velocidad, delta=detalle_velocidad)
@@ -1357,10 +1433,22 @@ def _render_panel_deteccion_esencial(
         partes_conf = []
         if conf_yolo is not None:
             partes_conf.append(f"YOLO {float(conf_yolo):.0%}")
-        if conf_ocr is not None:
+        conf_consolidada = resumen.get("confianza_final_evento")
+        if conf_consolidada is not None:
+            partes_conf.append(f"CNN {float(conf_consolidada):.0%}")
+        elif conf_ocr is not None:
             partes_conf.append(f"CNN {float(conf_ocr):.0%}")
         if partes_conf:
             st.caption(" · ".join(partes_conf))
+
+        lecturas_n = int(resumen.get("lecturas_usadas_evento") or resumen.get("recortes_usados_evento") or 0)
+        if lecturas_n > 0:
+            st.caption(f"Lectura consolidada · {lecturas_n} frame(s) analizados")
+        ultima_frame = resumen.get("placa_individual_ultimo_frame") or resumen.get("placa_individual")
+        placa_mostrada = _extraer_placa_desde_resumen(resumen)
+        ultima_norm = _extraer_placa_desde_resumen({"texto_ocr_corregido": ultima_frame}) if ultima_frame else ""
+        if ultima_norm and placa_mostrada and ultima_norm != placa_mostrada:
+            st.caption(f"Ultimo frame descartado: {ultima_norm}")
 
     if config is not None:
         resumen = preparar_estado_notificacion_evento(
@@ -1561,7 +1649,74 @@ _CAMPOS_OCR_RESUMEN = (
     "lector_cnn_ok",
     "etapa_error_lector_cnn",
     "tiempo_lector_cnn_ms",
+    "placa_individual_ultimo_frame",
+    "mejor_puntaje_consolidado_evento",
 )
+
+
+def _obtener_entrada_cache_ocr(evento_id: int) -> dict:
+    cache = st.session_state.setdefault("ocr_eventos_cache", {})
+    entry = cache.get(int(evento_id)) or {}
+    entry.setdefault("lecturas", [])
+    entry.setdefault("estado", "pendiente")
+    cache[int(evento_id)] = entry
+    st.session_state.ocr_eventos_cache = cache
+    return entry
+
+
+def _puntaje_consolidado_evento(consolidado: dict | None) -> float:
+    if not consolidado:
+        return -1.0
+    texto = str(consolidado.get("texto_final") or "")
+    puntaje = float(consolidado.get("confianza_final") or 0.0) * 100.0
+    if consolidado.get("formato_valido"):
+        puntaje += 25.0
+    if len(texto) == 7:
+        puntaje += 10.0
+    elif len(texto) == 6:
+        puntaje += 5.0
+    usadas = int(consolidado.get("cantidad_lecturas_usadas") or 0)
+    puntaje += min(usadas, 5) * 4.0
+    return puntaje
+
+
+def _lectura_existe_para_ruta(lecturas: list, ruta_recorte: str) -> bool:
+    destino = str(ruta_recorte or "")
+    if not destino:
+        return False
+    return any(str(item.get("ruta_recorte") or "") == destino for item in (lecturas or []))
+
+
+def _evento_ocr_cerrado_y_listo(evento_id: int | None) -> bool:
+    if evento_id is None:
+        return False
+    entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(evento_id))
+    return bool(entry and entry.get("evento_cerrado") and entry.get("estado") == "listo")
+
+
+def _finalizar_ocr_evento_en_cache(evento_id: int, config: dict, placa_controlada: str) -> None:
+    """Congela la placa consolidada al cerrar el vehiculo (correo / historial)."""
+    eid = int(evento_id)
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    entry = cache.get(eid)
+    if not entry or not entry.get("evento_cerrado"):
+        return
+    if entry.get("estado") == "listo" and entry.get("resumen_completo"):
+        return
+    resumen_base = dict(entry.get("resumen_base") or {})
+    resumen_base["evento_id"] = eid
+    if entry.get("datos"):
+        resumen_base.update({k: v for k, v in entry["datos"].items() if v is not None})
+    ruta_final = entry.get("ruta_mejor_recorte_final") or entry.get("ruta_recorte")
+    if ruta_final and Path(str(ruta_final)).exists():
+        resumen_base["ruta_mejor_recorte_evento"] = str(ruta_final)
+        resumen_base["mejor_recorte_placa"] = str(ruta_final)
+    placa = _obtener_placa_para_evento(resumen_base, placa_controlada)
+    entry["resumen_completo"] = preparar_estado_notificacion_evento(resumen_base, placa, config)
+    entry["estado"] = "listo"
+    cache[eid] = entry
+    st.session_state.ocr_eventos_cache = cache
+    _sync_cola_item_desde_cache(eid, entry, config, placa_controlada)
 
 
 def _limpiar_campos_ocr_resumen(resumen: dict, *, pendiente: bool = True) -> dict:
@@ -1612,10 +1767,13 @@ def _evento_ocr_listo_en_cache(evento_id: int | None) -> bool:
 
 
 def _hay_ocr_pendiente_en_cache() -> bool:
-    return any(
+    if any(
         entry.get("estado") == "pendiente"
         for entry in (st.session_state.get("ocr_eventos_cache") or {}).values()
-    )
+    ):
+        return True
+    with _OCR_ASYNC_LOCK:
+        return bool(_OCR_ASYNC_PENDIENTES or _OCR_ASYNC_RESULTADOS)
 
 
 def _fusionar_resumen_live_monitoreo(estado_frame: dict, fuente: str, placa_controlada: str) -> dict:
@@ -1718,31 +1876,17 @@ def _solicitar_ocr_desde_estado_frame(
     placa_controlada: str,
     config: dict,
 ) -> None:
-    """Encola OCR en segundo plano; no bloquea el video."""
+    """Encola OCR solo cuando el pipeline entrega un recorte nuevo."""
     ocr_pendiente = estado_frame.get("ocr_evento_pendiente")
-    if ocr_pendiente and ocr_pendiente.get("evento_id") and ocr_pendiente.get("ruta_recorte"):
-        eid = int(ocr_pendiente["evento_id"])
-        if _evento_ocr_listo_en_cache(eid):
-            return
-        base_ocr = _fusionar_resumen_live_monitoreo(estado_frame, fuente, placa_controlada)
-        base_ocr["evento_id"] = eid
-        base_ocr["ruta_snapshot_ocr_evento"] = ocr_pendiente["ruta_recorte"]
-        _encolar_ocr_evento_vivo_asincrono(eid, str(ocr_pendiente["ruta_recorte"]), base_ocr, config, placa_controlada)
+    if not (ocr_pendiente and ocr_pendiente.get("evento_id") and ocr_pendiente.get("ruta_recorte")):
         return
-
-    evento_id = estado_frame.get("evento_id")
-    ruta = estado_frame.get("ruta_snapshot_ocr_evento") or estado_frame.get("ruta_recorte_evento_en_vivo")
-    if not evento_id or not ruta:
-        return
-    eid = int(evento_id)
-    if _evento_ocr_listo_en_cache(eid):
-        return
-    if not Path(str(ruta)).exists():
-        return
-    if int(estado_frame.get("detecciones_validas") or 0) <= 0 and not estado_frame.get("evento_activo"):
+    eid = int(ocr_pendiente["evento_id"])
+    if _evento_ocr_cerrado_y_listo(eid):
         return
     base_ocr = _fusionar_resumen_live_monitoreo(estado_frame, fuente, placa_controlada)
-    _encolar_ocr_evento_vivo_asincrono(eid, str(ruta), base_ocr, config, placa_controlada)
+    base_ocr["evento_id"] = eid
+    base_ocr["ruta_snapshot_ocr_evento"] = ocr_pendiente["ruta_recorte"]
+    _encolar_ocr_evento_vivo_asincrono(eid, str(ocr_pendiente["ruta_recorte"]), base_ocr, config, placa_controlada)
 
 
 def _poll_ocr_monitoreo_instantaneo(
@@ -1783,10 +1927,16 @@ def _encolar_ocr_evento_vivo_asincrono(
 ) -> None:
     eid = int(evento_id)
     cache = st.session_state.setdefault("ocr_eventos_cache", {})
-    if cache.get(eid, {}).get("estado") == "listo":
+    entry = cache.get(eid) or {}
+    if entry.get("evento_cerrado") and entry.get("estado") == "listo":
+        return
+    lecturas = entry.get("lecturas") or []
+    if not entry.get("evento_cerrado") and len(lecturas) >= 3:
         return
     cache_key = _cache_key_ocr_evento_id(eid)
     ruta_nueva = str(ruta_recorte)
+    if _lectura_existe_para_ruta(lecturas, ruta_nueva):
+        return
     with _OCR_ASYNC_LOCK:
         en_vuelo = cache_key in _OCR_ASYNC_PENDIENTES
     if en_vuelo:
@@ -1845,6 +1995,14 @@ def _sync_cola_item_desde_cache(evento_id: int, entry: dict, config: dict, placa
             item["estado_ocr"] = "listo"
             item["resumen"] = dict(entry["resumen_completo"])
             _actualizar_historial_monitoreo(item["resumen"])
+        elif entry.get("datos"):
+            res_item = dict(item.get("resumen") or {})
+            res_item.update({k: v for k, v in entry["datos"].items() if v is not None})
+            item["resumen"] = res_item
+            if entry.get("estado") == "error":
+                item["estado_ocr"] = "error"
+            elif _extraer_placa_desde_resumen(res_item):
+                item["estado_ocr"] = "consolidado_parcial"
         elif entry.get("estado") == "error":
             item["estado_ocr"] = "error"
             item["resumen"].update(entry.get("datos") or {})
@@ -1910,10 +2068,18 @@ def _actualizar_cache_ocr_eventos(config: dict, placa_controlada: str) -> bool:
                 cache_key,
                 registrar_metricas=False,
             )
-            entry["estado"] = "listo"
-            entry["datos"] = {campo: resumen.get(campo) for campo in _CAMPOS_OCR_RESUMEN if campo in resumen}
-            placa = _obtener_placa_para_evento(resumen, placa_controlada)
-            entry["resumen_completo"] = preparar_estado_notificacion_evento(resumen, placa, config)
+            entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(eid)) or entry
+            entry["ruta_recorte"] = ruta_recorte
+            entry.setdefault("resumen_base", dict(entry.get("resumen_base") or resumen))
+            if entry.get("evento_cerrado"):
+                _finalizar_ocr_evento_en_cache(int(eid), config, placa_controlada)
+                entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(eid)) or entry
+            else:
+                entry["estado"] = "pendiente"
+                cache[int(eid)] = entry
+                st.session_state.ocr_eventos_cache = cache
+                _sync_cola_item_desde_cache(int(eid), entry, config, placa_controlada)
+                continue
         _sync_cola_item_desde_cache(int(eid), entry, config, placa_controlada)
     if hubo_cambio:
         st.session_state.ocr_eventos_cache = cache
@@ -1961,12 +2127,22 @@ def _registrar_evento_cerrado_monitoreo(
     resumen = _construir_resumen_evento_cerrado(evento, fuente, config)
     ruta_recorte = evento.get("ruta_mejor_recorte")
     cache = st.session_state.get("ocr_eventos_cache") or {}
-    cache_entry = cache.get(evento_id)
+    cache_entry = _obtener_entrada_cache_ocr(evento_id)
+    cache_entry["evento_cerrado"] = True
+    cache_entry["ruta_mejor_recorte_final"] = str(ruta_recorte) if ruta_recorte else cache_entry.get("ruta_recorte")
+    cache_entry["resumen_base"] = dict(resumen)
+    cache[evento_id] = cache_entry
+    st.session_state.ocr_eventos_cache = cache
+
     estado_ocr_inicial = "pendiente"
-    if cache_entry and cache_entry.get("estado") == "listo" and cache_entry.get("resumen_completo"):
+    if cache_entry.get("estado") == "listo" and cache_entry.get("resumen_completo"):
         resumen = dict(cache_entry["resumen_completo"])
         estado_ocr_inicial = "listo"
-    elif cache_entry and cache_entry.get("estado") == "error":
+    elif cache_entry.get("datos"):
+        resumen.update({k: v for k, v in cache_entry["datos"].items() if v is not None})
+        if _extraer_placa_desde_resumen(resumen):
+            estado_ocr_inicial = "consolidado_parcial"
+    elif cache_entry.get("estado") == "error":
         resumen.update(cache_entry.get("datos") or {})
         estado_ocr_inicial = "error"
 
@@ -1989,15 +2165,25 @@ def _registrar_evento_cerrado_monitoreo(
 
     ruta_recorte = evento.get("ruta_mejor_recorte")
     if estado_ocr_inicial == "pendiente" and ruta_recorte and Path(str(ruta_recorte)).exists():
-        if not _evento_ocr_listo_en_cache(evento_id):
+        if not _evento_ocr_cerrado_y_listo(evento_id):
             _encolar_ocr_evento_cerrado(evento_id, resumen, str(ruta_recorte))
+    elif estado_ocr_inicial in ("consolidado_parcial", "listo"):
+        _finalizar_ocr_evento_en_cache(evento_id, config, placa_controlada)
 
     _actualizar_historial_monitoreo(resumen)
 
 
 def _encolar_ocr_evento_cerrado(evento_id: int, resumen: dict, ruta_recorte: str) -> None:
-    cache = st.session_state.get("ocr_eventos_cache") or {}
-    if cache.get(int(evento_id), {}).get("estado") == "listo":
+    entry = _obtener_entrada_cache_ocr(int(evento_id))
+    if entry.get("evento_cerrado") and entry.get("estado") == "listo":
+        return
+    entry["evento_cerrado"] = True
+    entry["ruta_mejor_recorte_final"] = str(ruta_recorte)
+    entry["resumen_base"] = dict(resumen)
+    st.session_state.ocr_eventos_cache[int(evento_id)] = entry
+    if _lectura_existe_para_ruta(entry.get("lecturas"), str(ruta_recorte)):
+        entry["estado"] = "pendiente"
+        st.session_state.ocr_eventos_cache[int(evento_id)] = entry
         return
     cache_key = _cache_key_ocr_evento_id(evento_id)
     with _OCR_ASYNC_LOCK:
@@ -2066,7 +2252,7 @@ def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
             )
             item["estado_ocr"] = "error"
         else:
-            resumen = _aplicar_resultado_ocr_monitoreo(
+            _aplicar_resultado_ocr_monitoreo(
                 resumen,
                 payload["resultado_ocr"],
                 float(payload.get("tiempo_lector_ms") or 0.0),
@@ -2074,18 +2260,19 @@ def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
                 cache_key,
                 registrar_metricas=False,
             )
+            entry_cola = _obtener_entrada_cache_ocr(evento_id)
+            entry_cola["evento_cerrado"] = True
+            entry_cola["ruta_mejor_recorte_final"] = str(ruta_recorte)
+            st.session_state.ocr_eventos_cache[evento_id] = entry_cola
+            _finalizar_ocr_evento_en_cache(evento_id, config, placa_controlada)
+            entry_cola = (st.session_state.get("ocr_eventos_cache") or {}).get(evento_id) or {}
             item["estado_ocr"] = "listo"
-        placa = _obtener_placa_para_evento(resumen, placa_controlada)
-        item["resumen"] = preparar_estado_notificacion_evento(resumen, placa, config)
-        cache = st.session_state.setdefault("ocr_eventos_cache", {})
-        cache[evento_id] = {
-            "estado": item["estado_ocr"],
-            "ruta_recorte": str(ruta_recorte),
-            "resumen_base": dict(item["resumen"]),
-            "datos": {campo: resumen.get(campo) for campo in _CAMPOS_OCR_RESUMEN if campo in resumen},
-            "resumen_completo": dict(item["resumen"]) if item["estado_ocr"] == "listo" else None,
-        }
-        st.session_state.ocr_eventos_cache = cache
+            resumen = dict(entry_cola.get("resumen_completo") or resumen)
+        if item.get("estado_ocr") != "listo":
+            placa = _obtener_placa_para_evento(resumen, placa_controlada)
+            item["resumen"] = preparar_estado_notificacion_evento(resumen, placa, config)
+        else:
+            item["resumen"] = resumen
         _actualizar_historial_monitoreo(item["resumen"])
         hubo_cambio = True
     if hubo_cambio:
@@ -2215,18 +2402,31 @@ def _aplicar_resultado_ocr_monitoreo(
         "estado_lectura": estado_lectura,
         "predicciones_caracteres": resultado_ocr.get("predicciones_caracteres", []),
     }
-    lecturas = st.session_state.get("lecturas_evento_placa_monitoreo", [])
     evento_id = resumen.get("evento_id")
-    if evento_id is not None:
-        if st.session_state.get("lecturas_evento_id") != int(evento_id):
-            lecturas = []
-            st.session_state.lecturas_evento_id = int(evento_id)
-            st.session_state.lecturas_evento_placa_monitoreo = []
-    if not any(item.get("ruta_recorte") == lectura_evento["ruta_recorte"] for item in lecturas):
+    entry_cache = _obtener_entrada_cache_ocr(int(evento_id)) if evento_id is not None else {}
+    lecturas = list(entry_cache.get("lecturas") or [])
+    if st.session_state.get("lecturas_evento_id") != int(evento_id or 0):
+        st.session_state.lecturas_evento_id = int(evento_id or 0)
+        st.session_state.lecturas_evento_placa_monitoreo = []
+        lecturas = []
+    if evento_id is not None and not _lectura_existe_para_ruta(lecturas, lectura_evento["ruta_recorte"]):
         lecturas.insert(0, lectura_evento)
-    lecturas = lecturas[:8]
+    lecturas = lecturas[:5]
+    if evento_id is not None:
+        entry_cache["lecturas"] = lecturas
+        st.session_state.ocr_eventos_cache[int(evento_id)] = entry_cache
     st.session_state.lecturas_evento_placa_monitoreo = lecturas
     consolidado = consolidar_lecturas_evento_placa(list(reversed(lecturas)), max_lecturas=5)
+    puntaje_nuevo = _puntaje_consolidado_evento(consolidado)
+    puntaje_previo = float(entry_cache.get("mejor_puntaje_consolidado") or -1.0) if evento_id is not None else -1.0
+    usar_nuevo = puntaje_nuevo >= puntaje_previo
+    if evento_id is not None and usar_nuevo:
+        entry_cache["mejor_puntaje_consolidado"] = puntaje_nuevo
+        entry_cache["mejor_consolidado"] = consolidado
+    elif evento_id is not None and entry_cache.get("mejor_consolidado"):
+        consolidado = dict(entry_cache["mejor_consolidado"])
+    texto_final = str(consolidado.get("texto_final") or "").strip()
+    texto_individual = (texto_corregido or texto_crudo or "").strip()
     try:
         ruta_debug_votacion = guardar_debug_votacion_evento(
             resumen.get("evento_id") or resumen.get("eventos_placa") or "monitoreo",
@@ -2237,8 +2437,9 @@ def _aplicar_resultado_ocr_monitoreo(
         ruta_debug_votacion = ""
     datos_ocr.update(
         {
-            "placa_individual": texto_corregido or texto_crudo,
-            "placa_consolidada_evento": consolidado.get("texto_final") or texto_corregido or texto_crudo,
+            "placa_individual": texto_individual,
+            "placa_individual_ultimo_frame": texto_individual,
+            "placa_consolidada_evento": texto_final or (texto_individual if usar_nuevo else entry_cache.get("datos", {}).get("placa_consolidada_evento")),
             "estado_consolidado_evento": consolidado.get("estado"),
             "confianza_final_evento": consolidado.get("confianza_final"),
             "formato_consolidado_valido": consolidado.get("formato_valido"),
@@ -2250,17 +2451,53 @@ def _aplicar_resultado_ocr_monitoreo(
             "lectura_base_usada": consolidado.get("lectura_base_usada", {}),
             "recortes_usados_evento": len(lecturas),
             "ruta_debug_votacion_evento": ruta_debug_votacion,
+            "mejor_puntaje_consolidado_evento": round(float(puntaje_nuevo if usar_nuevo else puntaje_previo), 2),
         }
     )
+    if texto_final and usar_nuevo:
+        datos_ocr["texto_ocr_corregido"] = texto_final
+        datos_ocr["confianza_ocr"] = consolidado.get("confianza_final")
+        datos_ocr["formato_ocr_valido"] = consolidado.get("formato_valido")
+        datos_ocr["estado_ocr"] = "consolidado_parcial"
+    elif evento_id is not None and entry_cache.get("datos"):
+        prev = entry_cache["datos"]
+        if prev.get("texto_ocr_corregido"):
+            datos_ocr["texto_ocr_corregido"] = prev["texto_ocr_corregido"]
+        if prev.get("placa_consolidada_evento"):
+            datos_ocr["placa_consolidada_evento"] = prev["placa_consolidada_evento"]
+        if prev.get("confianza_final_evento") is not None:
+            datos_ocr["confianza_ocr"] = prev.get("confianza_final_evento")
+            datos_ocr["confianza_final_evento"] = prev.get("confianza_final_evento")
+        datos_ocr["estado_ocr"] = prev.get("estado_ocr") or "consolidado_parcial"
+    if evento_id is not None:
+        entry_cache = _obtener_entrada_cache_ocr(int(evento_id))
+        entry_cache["lecturas"] = lecturas
+        if usar_nuevo or not entry_cache.get("datos"):
+            entry_cache["datos"] = {
+                campo: datos_ocr.get(campo) for campo in _CAMPOS_OCR_RESUMEN if campo in datos_ocr
+            }
+        else:
+            prev_datos = dict(entry_cache.get("datos") or {})
+            prev_datos["placa_individual_ultimo_frame"] = texto_individual
+            prev_datos["recortes_usados_evento"] = len(lecturas)
+            prev_datos["lecturas_usadas_evento"] = datos_ocr.get("lecturas_usadas_evento")
+            entry_cache["datos"] = prev_datos
+        st.session_state.ocr_eventos_cache[int(evento_id)] = entry_cache
+        resumen.update(entry_cache["datos"])
     if registrar_metricas:
         try:
             _registrar_metricas_ocr_mejor_recorte(resumen, resultado_ocr)
         except Exception as exc:
-            datos_ocr["mensaje_metricas_lector_cnn"] = f"No se pudieron guardar metricas: {exc}"
+            resumen["mensaje_metricas_lector_cnn"] = f"No se pudieron guardar metricas: {exc}"
     st.session_state.ultimo_recorte_ocr_procesado = cache_key
-    st.session_state.ultimo_resultado_ocr_monitoreo = datos_ocr
+    st.session_state.ultimo_resultado_ocr_monitoreo = (
+        (st.session_state.get("ocr_eventos_cache") or {}).get(int(evento_id or 0), {}).get("datos")
+        if evento_id is not None
+        else datos_ocr
+    )
     st.session_state.contador_lector_cnn_monitoreo = int(st.session_state.get("contador_lector_cnn_monitoreo", 0) or 0) + 1
-    resumen.update(datos_ocr)
+    if evento_id is None:
+        resumen.update(datos_ocr)
     return resumen
 
 
@@ -2802,7 +3039,7 @@ def pestana_monitoreo(config: dict) -> None:
         max_frames = 0
         velocidad_reproduccion = "Normal (1x)"
         placa_controlada = str(config.get("ocr", {}).get("manual_test_plate", "PBC1234"))
-        _opciones_ancho_visual = [360, 420, 480, 640, 800, 960]
+        _opciones_ancho_visual = [480, 640, 800, 960, 1280]
         ancho_visual_max = _snap_a_opcion_slider(
             int(config_rendimiento.get("preview_width", 640) or 640),
             _opciones_ancho_visual,
@@ -2917,8 +3154,9 @@ def pestana_monitoreo(config: dict) -> None:
             if fuente_monitoreo == "Camara en vivo":
                 resolucion_camara = st.selectbox(
                     "Resolucion de camara",
-                    ["640x480", "1280x720"],
-                    index=1,
+                    ["1280x720", "1920x1080", "640x480"],
+                    index=0,
+                    help="Debe coincidir con la resolucion en Camo (ajustes del dispositivo virtual). 1280x720 suele ser el mejor equilibrio.",
                     key="monitoreo_resolucion_camara",
                 )
                 fps_camara_objetivo = st.selectbox(
@@ -2926,6 +3164,10 @@ def pestana_monitoreo(config: dict) -> None:
                     [15, 24, 30],
                     index=2,
                     key="monitoreo_fps_camara",
+                )
+                st.caption(
+                    "Calidad: la camara se procesa a resolucion completa. "
+                    "Use 'Ancho maximo visual' solo para la pantalla, no afecta el recorte OCR."
                 )
 
         rotacion = {
@@ -3192,13 +3434,32 @@ def pestana_monitoreo(config: dict) -> None:
 
         if solo_video and not ocr_pendiente and not evento_cerrado:
             ultimo_poll = float(st.session_state.get("ultimo_poll_ocr_ts") or 0.0)
-            if _hay_ocr_pendiente_en_cache() and (ahora - ultimo_poll) >= 0.3:
+            ultimo_panel = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
+            evento_activo = bool(estado_frame.get("evento_activo"))
+            evento_id = estado_frame.get("evento_id")
+            placa_cache = _placa_consolidada_en_cache(int(evento_id) if evento_id is not None else None)
+            hay_trabajo_ocr = _hay_ocr_pendiente_en_cache()
+            intervalo_poll = 0.3
+            intervalo_panel = 0.35 if es_camara else 0.25
+            debe_poll = hay_trabajo_ocr and (ahora - ultimo_poll) >= intervalo_poll
+            debe_panel = (
+                evento_activo
+                or hay_trabajo_ocr
+                or bool(placa_cache)
+                or int(estado_frame.get("detecciones_validas") or 0) > 0
+            ) and (ahora - ultimo_panel) >= intervalo_panel
+            if debe_poll or debe_panel:
                 resumen_live = _fusionar_resumen_live_monitoreo(estado_frame, fuente_monitoreo, placa_controlada)
-                _, hubo_ocr = _poll_ocr_monitoreo_instantaneo(
-                    config, placa_controlada, resumen_live, frame_actual=int(estado_frame.get("frame_actual") or numero_frame)
-                )
-                st.session_state.ultimo_poll_ocr_ts = ahora
-                if hubo_ocr:
+                hubo_ocr = False
+                if debe_poll:
+                    _, hubo_ocr = _poll_ocr_monitoreo_instantaneo(
+                        config,
+                        placa_controlada,
+                        resumen_live,
+                        frame_actual=int(estado_frame.get("frame_actual") or numero_frame),
+                    )
+                    st.session_state.ultimo_poll_ocr_ts = ahora
+                if hubo_ocr or debe_panel:
                     st.session_state.ultimo_resultado_parcial = resumen_live
                     with panel_placeholder.container():
                         _mostrar_panel_compacto_en_vivo(resumen_live)
@@ -3207,7 +3468,9 @@ def pestana_monitoreo(config: dict) -> None:
             intervalo_estado = 0.35 if es_camara else 0.5
             if (ahora - ultimo_estado_ui) >= intervalo_estado:
                 fps_proc = estado_frame.get("fps_procesamiento", "—")
-                estado_placeholder.info(f"Monitoreo en vivo · {fps_proc} FPS")
+                res_txt = _texto_resolucion_captura_ui(estado_frame)
+                res_part = f" · {res_txt}" if res_txt and es_camara else ""
+                estado_placeholder.info(f"Monitoreo en vivo · {fps_proc} FPS{res_part}")
                 st.session_state.ultimo_estado_ui_ts = ahora
             st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
             return
@@ -3223,7 +3486,7 @@ def pestana_monitoreo(config: dict) -> None:
                 fuente_monitoreo,
             )
 
-        if ocr_pendiente or not solo_video:
+        if ocr_pendiente:
             _solicitar_ocr_desde_estado_frame(
                 estado_frame, fuente_monitoreo, placa_controlada, config
             )
@@ -3275,7 +3538,9 @@ def pestana_monitoreo(config: dict) -> None:
                     texto_placa = f" · {placa_ui}"
                 else:
                     texto_placa = ""
-                estado_placeholder.info(f"Monitoreo{texto_placa} · {fps_proc} FPS")
+                res_txt = _texto_resolucion_captura_ui(estado_frame)
+                res_part = f" · {res_txt}" if res_txt and es_camara else ""
+                estado_placeholder.info(f"Monitoreo{texto_placa} · {fps_proc} FPS{res_part}")
                 st.session_state.ultimo_estado_ui_ts = ahora
             return
 

@@ -79,6 +79,8 @@ def _set_prop_seguro(captura, prop: int, value) -> bool:
 
 
 def _configurar_captura(captura, camera_width: int | None, camera_height: int | None, camera_fps: int | None) -> None:
+    if sys.platform == "win32":
+        _set_prop_seguro(captura, cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     if camera_width:
         _set_prop_seguro(captura, cv2.CAP_PROP_FRAME_WIDTH, int(camera_width))
     if camera_height:
@@ -86,6 +88,14 @@ def _configurar_captura(captura, camera_width: int | None, camera_height: int | 
     if camera_fps:
         _set_prop_seguro(captura, cv2.CAP_PROP_FPS, int(camera_fps))
     _set_prop_seguro(captura, cv2.CAP_PROP_BUFFERSIZE, 1)
+
+
+def resolucion_real_captura(captura) -> tuple[int, int, float]:
+    """Resolucion y FPS reales tras abrir la camara (puede diferir de lo solicitado)."""
+    ancho = int(captura.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    alto = int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = float(captura.get(cv2.CAP_PROP_FPS) or 0.0)
+    return ancho, alto, fps
 
 
 def _leer_frame_muestra(captura):
