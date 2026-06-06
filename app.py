@@ -17,6 +17,12 @@ from src.pipeline import (
     procesar_imagen_prueba,
     procesar_video_monitoreo,
 )
+from src.camera_utils import (
+    frame_tiene_senal,
+    indices_a_escanear,
+    probar_indices_camara,
+    resumen_camaras_sistema,
+)
 from src.fuzzy_system import clasificar_velocidad
 from src.notifier import evaluar_calidad_evento, notificar_evento_placa, validar_correo
 from src.plate_detector import PlateDetector
@@ -80,6 +86,14 @@ def _config_rendimiento_monitoreo(config: dict, modo: str, fuente_monitoreo: str
     return base
 
 
+def _snap_a_opcion_slider(valor: int, opciones: list[int], default: int | None = None) -> int:
+    if valor in opciones:
+        return valor
+    if not opciones:
+        return int(default or 0)
+    return min(opciones, key=lambda opt: abs(int(opt) - int(valor)))
+
+
 def _redimensionar_frame_rgb(frame_rgb, ancho_maximo: int = 800):
     if frame_rgb is None or ancho_maximo <= 0:
         return frame_rgb
@@ -88,21 +102,11 @@ def _redimensionar_frame_rgb(frame_rgb, ancho_maximo: int = 800):
         return frame_rgb
     escala = ancho_maximo / float(ancho)
     nuevo_alto = max(1, int(alto * escala))
-    return cv2.resize(frame_rgb, (ancho_maximo, nuevo_alto), interpolation=cv2.INTER_AREA)
+    return cv2.resize(frame_rgb, (ancho_maximo, nuevo_alto), interpolation=cv2.INTER_LINEAR)
 
 
 def _preparar_imagen_streamlit(frame_rgb, ancho_maximo: int = 640):
-    frame = _redimensionar_frame_rgb(frame_rgb, ancho_maximo)
-    if frame is None:
-        return None
-    ok, buf = cv2.imencode(
-        ".jpg",
-        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
-        [int(cv2.IMWRITE_JPEG_QUALITY), 72],
-    )
-    if ok:
-        return buf.tobytes()
-    return frame
+    return _redimensionar_frame_rgb(frame_rgb, ancho_maximo)
 
 
 st.set_page_config(
@@ -804,6 +808,17 @@ def _extraer_placa_desde_resumen(resumen: dict) -> str:
 
 
 def _obtener_texto_placa_ui(resumen: dict) -> str:
+    evento_id = resumen.get("evento_id")
+    if evento_id is not None:
+        entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(evento_id))
+        if entry and entry.get("estado") == "listo":
+            tmp = dict(resumen)
+            tmp.update(entry.get("datos") or {})
+            if entry.get("resumen_completo"):
+                tmp.update(entry["resumen_completo"])
+            placa_cache = _extraer_placa_desde_resumen(tmp)
+            if placa_cache:
+                return placa_cache
     placa = _extraer_placa_desde_resumen(resumen)
     if placa:
         return placa
@@ -822,19 +837,24 @@ def _obtener_texto_placa_ui(resumen: dict) -> str:
 
 
 def _obtener_resumen_panel_vivo(resumen_live: dict) -> dict:
-    """Muestra placa bloqueada por evento_id; el recorte snapshot no cambia con cada frame."""
+    """Placa bloqueada por evento_id; el recorte en vivo se actualiza con mejores frames."""
     cache = st.session_state.get("ocr_eventos_cache") or {}
     evento_activo_id = int(resumen_live.get("evento_id") or 0) if resumen_live.get("evento_activo") else None
 
     if evento_activo_id and evento_activo_id in cache:
         entry = cache[evento_activo_id]
-        out = _resumen_panel_desde_cache(entry, resumen_live)
         if entry.get("estado") == "listo":
-            return out
+            return _resumen_panel_desde_cache(entry, resumen_live)
+        out = _resumen_panel_desde_cache(entry, resumen_live)
+        ruta_viva = resumen_live.get("ruta_recorte_evento_en_vivo")
+        if ruta_viva and Path(str(ruta_viva)).exists():
+            out["ruta_recorte_evento_en_vivo"] = str(ruta_viva)
+            out["mejor_recorte_placa"] = str(ruta_viva)
+            out["ruta_mejor_recorte_evento"] = str(ruta_viva)
         if entry.get("estado") == "pendiente":
             out["estado_ocr"] = "pendiente"
             out["texto_ocr_corregido"] = "Analizando placa..."
-            return out
+        return out
 
     for eid in sorted((int(k) for k in cache.keys()), reverse=True):
         if evento_activo_id and eid == evento_activo_id:
@@ -897,17 +917,48 @@ def _resumen_panel_desde_cache(entry: dict, resumen_live: dict) -> dict:
 
 
 def _obtener_ruta_recorte_ui(resumen: dict) -> str | None:
-    for clave in (
-        "ruta_snapshot_ocr_evento",
-        "mejor_recorte_placa",
-        "ruta_recorte_evento_en_vivo",
-        "ruta_mejor_recorte_evento",
-        "ultimo_recorte_placa",
-    ):
+    evento_activo = bool(resumen.get("evento_activo"))
+    ocr_listo = resumen.get("estado_ocr") == "listo" or _evento_ocr_listo_en_cache(resumen.get("evento_id"))
+    if evento_activo and not ocr_listo:
+        claves = (
+            "ruta_recorte_evento_en_vivo",
+            "mejor_recorte_placa",
+            "ruta_snapshot_ocr_evento",
+            "ruta_mejor_recorte_evento",
+            "ultimo_recorte_placa",
+        )
+    else:
+        claves = (
+            "ruta_snapshot_ocr_evento",
+            "ruta_recorte_evento_en_vivo",
+            "mejor_recorte_placa",
+            "ruta_mejor_recorte_evento",
+            "ultimo_recorte_placa",
+        )
+    for clave in claves:
         ruta = resumen.get(clave)
         if ruta and Path(str(ruta)).exists():
             return str(ruta)
     return None
+
+
+def _cargar_recorte_ui_rgb(ruta: str):
+    """Lee recorte desde disco; cache por mtime para no releer en cada frame de video."""
+    path = Path(str(ruta))
+    if not path.exists():
+        return None
+    mtime = path.stat().st_mtime_ns
+    cache = st.session_state.setdefault("_cache_recorte_ui_rgb", {})
+    prev = cache.get(str(path))
+    if prev and prev.get("mtime") == mtime:
+        return prev.get("rgb")
+    bgr = cv2.imread(str(path))
+    if bgr is None:
+        return None
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    cache[str(path)] = {"mtime": mtime, "rgb": rgb}
+    st.session_state._cache_recorte_ui_rgb = cache
+    return rgb
 
 
 def _marcar_duplicados_placa_en_cola(cola: list) -> None:
@@ -1278,7 +1329,11 @@ def _render_panel_deteccion_esencial(
     col_img, col_main = st.columns([0.3, 0.7], gap="medium")
     with col_img:
         if ruta_recorte:
-            st.image(ruta_recorte, use_container_width=True)
+            imagen_recorte = _cargar_recorte_ui_rgb(ruta_recorte)
+            if imagen_recorte is not None:
+                st.image(imagen_recorte, channels="RGB", use_container_width=True)
+            else:
+                st.image(ruta_recorte, use_container_width=True)
         else:
             st.info("Esperando placa...")
     with col_main:
@@ -1507,42 +1562,236 @@ def _cache_key_ocr_evento_cerrado(evento_id: int, ruta_recorte: str = "") -> str
     return _cache_key_ocr_evento_id(evento_id)
 
 
-def _solicitar_ocr_evento_tiempo_real(evento_id: int, ruta_recorte: str, resumen_base: dict) -> None:
+def _evento_ocr_listo_en_cache(evento_id: int | None) -> bool:
+    if evento_id is None:
+        return False
+    entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(evento_id))
+    return bool(entry and entry.get("estado") == "listo")
+
+
+def _hay_ocr_pendiente_en_cache() -> bool:
+    return any(
+        entry.get("estado") == "pendiente"
+        for entry in (st.session_state.get("ocr_eventos_cache") or {}).values()
+    )
+
+
+def _fusionar_resumen_live_monitoreo(estado_frame: dict, fuente: str, placa_controlada: str) -> dict:
+    prev = st.session_state.get("ultimo_resultado_parcial") or {}
+    if estado_frame.get("_solo_video"):
+        resumen_live = {
+            clave: prev[clave]
+            for clave in (
+                "evento_id",
+                "evento_activo",
+                "mejor_confianza_evento",
+                "frame_mejor_evento",
+                "ruta_recorte_evento_en_vivo",
+                "ruta_snapshot_ocr_evento",
+                "ruta_mejor_recorte_evento",
+                "velocidad",
+                "distancia_lineas_m",
+                "limite_velocidad_kmh",
+                "modo_rendimiento",
+            )
+            if clave in prev
+        }
+    else:
+        resumen_live = dict(prev)
+        for campo in (
+            "texto_ocr_crudo",
+            "texto_ocr_corregido",
+            "confianza_ocr",
+            "formato_ocr_valido",
+            "estado_ocr",
+            "mensaje_ocr",
+            "placa_consolidada_evento",
+            "placa_individual",
+        ):
+            resumen_live.pop(campo, None)
+    resumen_live.update(estado_frame)
+    resumen_live.setdefault("frames_procesados", estado_frame.get("frame_actual", 0))
+    resumen_live.setdefault("fuente", fuente)
+    resumen_live.setdefault("placa_controlada", placa_controlada)
+    return _reiniciar_ocr_vivo_si_cambio_evento(resumen_live)
+
+
+def _persistir_ocr_evento_en_cache(
+    evento_id: int,
+    resumen_base: dict,
+    ruta_recorte: str,
+    config: dict,
+    placa_controlada: str,
+    resultado_ocr: dict | None,
+    tiempo_ms: float,
+    *,
+    error: str | None = None,
+) -> None:
+    eid = int(evento_id)
+    cache_key = _cache_key_ocr_evento_id(eid)
+    cache = st.session_state.setdefault("ocr_eventos_cache", {})
+    resumen = dict(resumen_base)
+    resumen["evento_id"] = eid
+    if error:
+        entry = {
+            "estado": "error",
+            "ruta_recorte": str(ruta_recorte),
+            "resumen_base": dict(resumen_base),
+            "datos": {
+                "texto_ocr_crudo": "Sin lectura",
+                "texto_ocr_corregido": "Sin lectura",
+                "confianza_ocr": None,
+                "formato_ocr_valido": False,
+                "estado_ocr": "error",
+                "mensaje_ocr": error,
+                "lector_cnn_ok": False,
+            },
+        }
+    else:
+        resumen = _aplicar_resultado_ocr_monitoreo(
+            resumen,
+            resultado_ocr or {},
+            float(tiempo_ms),
+            str(ruta_recorte),
+            cache_key,
+            registrar_metricas=False,
+        )
+        placa = _obtener_placa_para_evento(resumen, placa_controlada)
+        resumen_completo = preparar_estado_notificacion_evento(resumen, placa, config)
+        entry = {
+            "estado": "listo",
+            "ruta_recorte": str(ruta_recorte),
+            "resumen_base": dict(resumen_base),
+            "datos": {campo: resumen.get(campo) for campo in _CAMPOS_OCR_RESUMEN if campo in resumen},
+            "resumen_completo": resumen_completo,
+        }
+    cache[eid] = entry
+    st.session_state.ocr_eventos_cache = cache
+    _sync_cola_item_desde_cache(eid, entry, config, placa_controlada)
+
+
+def _solicitar_ocr_desde_estado_frame(
+    estado_frame: dict,
+    fuente: str,
+    placa_controlada: str,
+    config: dict,
+) -> None:
+    """Encola OCR en segundo plano; no bloquea el video."""
+    ocr_pendiente = estado_frame.get("ocr_evento_pendiente")
+    if ocr_pendiente and ocr_pendiente.get("evento_id") and ocr_pendiente.get("ruta_recorte"):
+        eid = int(ocr_pendiente["evento_id"])
+        if _evento_ocr_listo_en_cache(eid):
+            return
+        base_ocr = _fusionar_resumen_live_monitoreo(estado_frame, fuente, placa_controlada)
+        base_ocr["evento_id"] = eid
+        base_ocr["ruta_snapshot_ocr_evento"] = ocr_pendiente["ruta_recorte"]
+        _encolar_ocr_evento_vivo_asincrono(eid, str(ocr_pendiente["ruta_recorte"]), base_ocr, config, placa_controlada)
+        return
+
+    evento_id = estado_frame.get("evento_id")
+    ruta = estado_frame.get("ruta_snapshot_ocr_evento") or estado_frame.get("ruta_recorte_evento_en_vivo")
+    if not evento_id or not ruta:
+        return
+    eid = int(evento_id)
+    if _evento_ocr_listo_en_cache(eid):
+        return
+    if not Path(str(ruta)).exists():
+        return
+    if int(estado_frame.get("detecciones_validas") or 0) <= 0 and not estado_frame.get("evento_activo"):
+        return
+    base_ocr = _fusionar_resumen_live_monitoreo(estado_frame, fuente, placa_controlada)
+    _encolar_ocr_evento_vivo_asincrono(eid, str(ruta), base_ocr, config, placa_controlada)
+
+
+def _poll_ocr_monitoreo_instantaneo(
+    config: dict,
+    placa_controlada: str,
+    resumen_live: dict | None,
+    *,
+    frame_actual: int | None = None,
+    forzar_cola: bool = False,
+) -> tuple[dict, bool]:
+    """Consulta resultados OCR listos sin bloquear el video."""
+    resumen = dict(resumen_live or {})
+    listos_antes = set(st.session_state.get("_ocr_eventos_listos") or [])
+    hubo = _actualizar_cache_ocr_eventos(config, placa_controlada)
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    listos_ahora = {int(eid) for eid, entry in cache.items() if entry.get("estado") == "listo"}
+    if listos_ahora - listos_antes:
+        hubo = True
+    st.session_state._ocr_eventos_listos = list(listos_ahora)
+    if forzar_cola or _hay_ocr_pendiente_en_cache():
+        _, hubo_cola = _procesar_cola_ocr_monitoreo(
+            config,
+            placa_controlada,
+            resumen,
+            forzar=True,
+            frame_actual=frame_actual,
+        )
+        hubo = hubo or hubo_cola
+    return resumen, hubo
+
+
+def _encolar_ocr_evento_vivo_asincrono(
+    evento_id: int,
+    ruta_recorte: str,
+    resumen_base: dict,
+    config: dict,
+    placa_controlada: str,
+) -> None:
     eid = int(evento_id)
     cache = st.session_state.setdefault("ocr_eventos_cache", {})
     if cache.get(eid, {}).get("estado") == "listo":
         return
     cache_key = _cache_key_ocr_evento_id(eid)
+    ruta_nueva = str(ruta_recorte)
     with _OCR_ASYNC_LOCK:
-        ya_pendiente = cache_key in _OCR_ASYNC_PENDIENTES
-        ya_listo = cache_key in _OCR_ASYNC_RESULTADOS
-    if cache.get(eid, {}).get("estado") == "pendiente" and (ya_pendiente or ya_listo):
+        en_vuelo = cache_key in _OCR_ASYNC_PENDIENTES
+    if en_vuelo:
+        entry = cache.get(eid) or {}
+        entry["ruta_recorte"] = ruta_nueva
+        entry["resumen_base"] = dict(resumen_base)
+        entry["_ocr_snapshot_mas_reciente"] = ruta_nueva
+        entry.setdefault("estado", "pendiente")
+        cache[eid] = entry
+        st.session_state.ocr_eventos_cache = cache
         return
+    with _OCR_ASYNC_LOCK:
+        if cache_key in _OCR_ASYNC_PENDIENTES:
+            return
     cache[eid] = {
         "estado": "pendiente",
-        "ruta_recorte": str(ruta_recorte),
+        "ruta_recorte": ruta_nueva,
         "resumen_base": dict(resumen_base),
     }
     st.session_state.ocr_eventos_cache = cache
-    encolados = st.session_state.setdefault("ocr_eventos_encolados", set())
-    if eid in encolados:
-        return
-    encolados.add(eid)
     with _OCR_ASYNC_LOCK:
-        if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
+        if cache_key in _OCR_ASYNC_PENDIENTES:
             return
         _OCR_ASYNC_PENDIENTES.add(cache_key)
     contexto = {
-        "funcion": "_solicitar_ocr_evento_tiempo_real",
+        "funcion": "_encolar_ocr_evento_vivo_asincrono",
         "evento_id": eid,
         "frame_actual": resumen_base.get("frame_actual"),
         "fuente": resumen_base.get("fuente"),
     }
     threading.Thread(
         target=_tarea_ocr_monitoreo_asincrona,
-        args=(cache_key, str(ruta_recorte), contexto, dict(resumen_base)),
+        args=(cache_key, ruta_nueva, contexto, dict(resumen_base)),
         daemon=True,
     ).start()
+
+
+def _solicitar_ocr_evento_tiempo_real(
+    evento_id: int,
+    ruta_recorte: str,
+    resumen_base: dict,
+    config: dict | None = None,
+    placa_controlada: str = "",
+) -> None:
+    if config is None:
+        config = {}
+    _encolar_ocr_evento_vivo_asincrono(int(evento_id), str(ruta_recorte), resumen_base, config, placa_controlada)
 
 
 def _sync_cola_item_desde_cache(evento_id: int, entry: dict, config: dict, placa_controlada: str) -> None:
@@ -1590,6 +1839,27 @@ def _actualizar_cache_ocr_eventos(config: dict, placa_controlada: str) -> bool:
                 "lector_cnn_ok": False,
             }
         else:
+            ruta_procesada = ruta_recorte
+            snapshot_mas_reciente = entry.pop("_ocr_snapshot_mas_reciente", None)
+            if (
+                snapshot_mas_reciente
+                and str(snapshot_mas_reciente) != str(ruta_procesada)
+                and Path(str(snapshot_mas_reciente)).exists()
+            ):
+                entry["estado"] = "pendiente"
+                entry["ruta_recorte"] = str(snapshot_mas_reciente)
+                base_reocr = dict(entry.get("resumen_base") or resumen)
+                base_reocr["evento_id"] = int(eid)
+                cache[int(eid)] = entry
+                st.session_state.ocr_eventos_cache = cache
+                _encolar_ocr_evento_vivo_asincrono(
+                    int(eid),
+                    str(snapshot_mas_reciente),
+                    base_reocr,
+                    config,
+                    placa_controlada,
+                )
+                continue
             resumen = _aplicar_resultado_ocr_monitoreo(
                 resumen,
                 payload["resultado_ocr"],
@@ -1677,7 +1947,7 @@ def _registrar_evento_cerrado_monitoreo(
 
     ruta_recorte = evento.get("ruta_mejor_recorte")
     if estado_ocr_inicial == "pendiente" and ruta_recorte and Path(str(ruta_recorte)).exists():
-        if not (cache_entry and cache_entry.get("estado") in ("pendiente", "listo")):
+        if not _evento_ocr_listo_en_cache(evento_id):
             _encolar_ocr_evento_cerrado(evento_id, resumen, str(ruta_recorte))
 
     _actualizar_historial_monitoreo(resumen)
@@ -2344,9 +2614,99 @@ def pestana_monitoreo(config: dict) -> None:
                 options=[0, 1, 2, 3],
                 index=0,
                 label_visibility="collapsed",
-                help="Indice de camara (0 = predeterminada).",
+                help="Indice de camara. Con Camo suele ser 0 o 1; use 'Probar camaras' abajo.",
                 key="monitoreo_indice_camara",
             )
+            with st.expander("Probar camaras (Camo / Iriun)", expanded=False):
+                resumen_sys = resumen_camaras_sistema()
+                nombres_sys = resumen_sys["nombres"]
+                if not nombres_sys:
+                    st.warning(
+                        "No se pudieron leer los nombres de camara en Windows. "
+                        "En la terminal del proyecto ejecute: `pip install pygrabber` y reinicie Streamlit."
+                    )
+                else:
+                    st.markdown(f"**{len(nombres_sys)} camara(s) registrada(s) en Windows:**")
+                    for i, nombre in enumerate(nombres_sys):
+                        st.caption(f"Indice **{i}** → `{nombre}`")
+                if resumen_sys["tiene_camo"]:
+                    st.success(
+                        f"Camo detectado en indice(s) **{resumen_sys['indices_camo']}**. "
+                        "Abra Camo Studio con el iPhone conectado antes de escanear o iniciar monitoreo."
+                    )
+                elif resumen_sys["tiene_iriun"]:
+                    st.warning(
+                        "Iriun esta instalado pero Camo no. Cierre Iriun Webcam en la PC, instale el driver "
+                        "virtual de Camo desde **camo.com** (no Microsoft Store) y vuelva a escanear."
+                    )
+                else:
+                    st.info(
+                        "**Camo Studio funciona, pero Windows aun no ve la camara virtual.** "
+                        "Ver video del iPhone dentro de Camo Studio es distinto a registrar una camara "
+                        "para otras apps (esta app, OBS, Zoom, etc.).\n\n"
+                        "En Camo Studio → **Galeria de complementos**:\n"
+                        "1. **Compatibilidad con dispositivos Apple** → debe estar **Activo** (conexion iPhone).\n"
+                        "2. **Complemento de camara** → debe estar **Activo** (camara virtual en Windows). "
+                        "Si dice *Disponible*, abralo e instalelo (pide permisos de administrador).\n\n"
+                        "Tambien revise el icono de **sobre/notificaciones** arriba a la derecha en Camo Studio "
+                        "por si falta otro driver. Tras instalar, reinicie Camo Studio (o la PC) y vuelva a escanear."
+                    )
+                indices_scan = indices_a_escanear(max_indice_fallback=3)
+                etiqueta_btn = (
+                    f"Escanear {len(indices_scan)} camara(s) registrada(s)"
+                    if nombres_sys
+                    else "Escanear indices 0-3"
+                )
+                if st.button(etiqueta_btn, use_container_width=True, key="monitoreo_btn_probar_camaras"):
+                    with st.spinner("Leyendo camaras..."):
+                        pruebas = probar_indices_camara(3, solo_registradas=True)
+                    if not pruebas:
+                        st.error("No hay camaras registradas para escanear.")
+                    for item in pruebas:
+                        idx = item["indice"]
+                        nombre = item.get("nombre") or f"Camara {idx}"
+                        if not item["abierta"]:
+                            st.warning(f"Indice {idx} (`{nombre}`): registrada en Windows pero no se pudo abrir")
+                            continue
+                        etiqueta = f"Indice {idx} · `{nombre}` · puntaje {item['puntaje']}"
+                        if item.get("tipo") == "camo" and item.get("tiene_senal"):
+                            etiqueta += " · Camo con video"
+                            st.success(etiqueta)
+                        elif item.get("tipo") == "iriun" and item.get("es_placeholder"):
+                            etiqueta += " · Iriun sin iniciar (abra la app Iriun o use Camo)"
+                            st.warning(etiqueta)
+                        elif item.get("tipo") == "integrada" and item.get("tiene_senal"):
+                            etiqueta += " · webcam del laptop (no es el iPhone)"
+                            st.info(etiqueta)
+                        elif item.get("tiene_senal"):
+                            etiqueta += " · video OK"
+                            st.success(etiqueta)
+                        else:
+                            etiqueta += " · sin video util"
+                            st.warning(etiqueta)
+                        if item.get("frame_rgb") is not None:
+                            st.image(item["frame_rgb"], use_container_width=True)
+                    camo_ok = [p for p in pruebas if p.get("tipo") == "camo" and p.get("tiene_senal")]
+                    otros_ok = [p for p in pruebas if p.get("tipo") != "camo" and p.get("tiene_senal")]
+                    if camo_ok:
+                        item_sugerido = max(camo_ok, key=lambda p: p["puntaje"])
+                        st.success(
+                            f"Use indice **{item_sugerido['indice']}** (`{item_sugerido['nombre']}`) "
+                            "en el selector de camara."
+                        )
+                    elif otros_ok and not resumen_sys["tiene_camo"]:
+                        item_sugerido = max(otros_ok, key=lambda p: p["puntaje"])
+                        st.warning(
+                            f"La unica camara con video es indice **{item_sugerido['indice']}** "
+                            f"(`{item_sugerido['nombre']}`): es la webcam del laptop, **no el iPhone**. "
+                            "Cuando instale el driver de Camo, deberia aparecer otro dispositivo en la lista "
+                            "de Windows (por ejemplo `Camo` o `Reincubate Camo`); escanee de nuevo y use ese indice."
+                        )
+                    elif not otros_ok and not camo_ok:
+                        st.error(
+                            "Ninguna camara devolvio video util. Revise Camo Studio, drivers virtuales "
+                            "y que el iPhone este conectado antes de escanear."
+                        )
 
         btn1, btn2, btn3 = st.columns(3)
         with btn1:
@@ -2395,7 +2755,12 @@ def pestana_monitoreo(config: dict) -> None:
         max_frames = 0
         velocidad_reproduccion = "Normal (1x)"
         placa_controlada = str(config.get("ocr", {}).get("manual_test_plate", "PBC1234"))
-        ancho_visual_max = int(config_rendimiento.get("preview_width", 640) or 640)
+        _opciones_ancho_visual = [360, 420, 480, 640, 800, 960]
+        ancho_visual_max = _snap_a_opcion_slider(
+            int(config_rendimiento.get("preview_width", 640) or 640),
+            _opciones_ancho_visual,
+            640,
+        )
         guardar_debug_monitoreo = False
         resolucion_camara = "1280x720"
         fps_camara_objetivo = 30
@@ -2445,8 +2810,17 @@ def pestana_monitoreo(config: dict) -> None:
             max_display_fps = st.slider(
                 "FPS maximo visual (0 = sin limite)", 0, 30, max_display_fps, 1, key="monitoreo_max_display_fps"
             )
+            if st.session_state.get("monitoreo_ancho_visual") not in (None, *_opciones_ancho_visual):
+                st.session_state["monitoreo_ancho_visual"] = _snap_a_opcion_slider(
+                    int(st.session_state["monitoreo_ancho_visual"]),
+                    _opciones_ancho_visual,
+                    640,
+                )
             ancho_visual_max = st.select_slider(
-                "Ancho maximo visual", options=[480, 640, 800, 960], value=ancho_visual_max, key="monitoreo_ancho_visual"
+                "Ancho maximo visual",
+                options=_opciones_ancho_visual,
+                value=ancho_visual_max,
+                key="monitoreo_ancho_visual",
             )
             if fuente_monitoreo == "Video de prueba":
                 max_frame_width = st.select_slider(
@@ -2759,51 +3133,41 @@ def pestana_monitoreo(config: dict) -> None:
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
         imagen_ui = _preparar_imagen_streamlit(frame_rgb, int(ancho_visual_max))
         if imagen_ui is not None:
-            frame_placeholder.image(imagen_ui, use_container_width=True)
+            frame_placeholder.image(imagen_ui, channels="RGB", use_container_width=True)
         if not estado_frame:
-            estado_placeholder.info(f"Procesando frame {numero_frame}")
             return
 
         ahora = time.perf_counter()
-        st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
-        ultimo_persistencia = float(st.session_state.get("ultimo_persistencia_ui_ts") or 0.0)
-        hubo_evento = bool(estado_frame.get("evento_recien_cerrado"))
-        if hubo_evento or (ahora - ultimo_persistencia) >= 0.5:
-            if estado_frame.get("estado_persistencia"):
-                st.session_state.estado_persistencia = estado_frame["estado_persistencia"]
-            st.session_state.ultimo_persistencia_ui_ts = ahora
-
-        resumen_live = dict(st.session_state.get("ultimo_resultado_parcial") or {})
-        for campo in (
-            "texto_ocr_crudo",
-            "texto_ocr_corregido",
-            "confianza_ocr",
-            "formato_ocr_valido",
-            "estado_ocr",
-            "mensaje_ocr",
-            "placa_consolidada_evento",
-            "placa_individual",
-        ):
-            resumen_live.pop(campo, None)
-        resumen_live.update(estado_frame)
-        resumen_live.setdefault("frames_procesados", estado_frame.get("frame_actual", numero_frame))
-        resumen_live.setdefault("fuente", fuente_monitoreo)
-        resumen_live.setdefault("placa_controlada", placa_controlada)
-        resumen_live = _reiniciar_ocr_vivo_si_cambio_evento(resumen_live)
-        st.session_state.ultimo_resultado_parcial = resumen_live
-
-        ocr_pendiente = estado_frame.get("ocr_evento_pendiente")
-        if ocr_pendiente and ocr_pendiente.get("evento_id") and ocr_pendiente.get("ruta_recorte"):
-            base_ocr = dict(resumen_live)
-            base_ocr["evento_id"] = int(ocr_pendiente["evento_id"])
-            base_ocr["ruta_snapshot_ocr_evento"] = ocr_pendiente["ruta_recorte"]
-            _solicitar_ocr_evento_tiempo_real(
-                int(ocr_pendiente["evento_id"]),
-                str(ocr_pendiente["ruta_recorte"]),
-                base_ocr,
-            )
-
+        solo_video = bool(estado_frame.get("_solo_video"))
         evento_cerrado = estado_frame.get("evento_recien_cerrado")
+        ocr_pendiente = estado_frame.get("ocr_evento_pendiente")
+        es_camara = fuente_monitoreo != "Video de prueba"
+
+        if solo_video and not ocr_pendiente and not evento_cerrado:
+            ultimo_poll = float(st.session_state.get("ultimo_poll_ocr_ts") or 0.0)
+            if _hay_ocr_pendiente_en_cache() and (ahora - ultimo_poll) >= 0.3:
+                resumen_live = _fusionar_resumen_live_monitoreo(estado_frame, fuente_monitoreo, placa_controlada)
+                _, hubo_ocr = _poll_ocr_monitoreo_instantaneo(
+                    config, placa_controlada, resumen_live, frame_actual=int(estado_frame.get("frame_actual") or numero_frame)
+                )
+                st.session_state.ultimo_poll_ocr_ts = ahora
+                if hubo_ocr:
+                    st.session_state.ultimo_resultado_parcial = resumen_live
+                    with panel_placeholder.container():
+                        _mostrar_panel_compacto_en_vivo(resumen_live)
+                    st.session_state.ultimo_panel_vivo_ts = ahora
+            ultimo_estado_ui = float(st.session_state.get("ultimo_estado_ui_ts") or 0.0)
+            intervalo_estado = 0.35 if es_camara else 0.5
+            if (ahora - ultimo_estado_ui) >= intervalo_estado:
+                fps_proc = estado_frame.get("fps_procesamiento", "—")
+                estado_placeholder.info(f"Monitoreo en vivo · {fps_proc} FPS")
+                st.session_state.ultimo_estado_ui_ts = ahora
+            st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
+            return
+
+        st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
+        frame_ref = int(estado_frame.get("frame_actual", numero_frame) or 0)
+
         if evento_cerrado:
             _registrar_evento_cerrado_monitoreo(
                 evento_cerrado,
@@ -2812,16 +3176,71 @@ def pestana_monitoreo(config: dict) -> None:
                 fuente_monitoreo,
             )
 
-        resumen_live, hubo_cola = _procesar_cola_ocr_monitoreo(
-            config,
-            placa_controlada,
-            resumen_live,
-            forzar=bool(evento_cerrado),
-            frame_actual=int(estado_frame.get("frame_actual", numero_frame) or 0),
+        if ocr_pendiente or not solo_video:
+            _solicitar_ocr_desde_estado_frame(
+                estado_frame, fuente_monitoreo, placa_controlada, config
+            )
+
+        resumen_live = _fusionar_resumen_live_monitoreo(estado_frame, fuente_monitoreo, placa_controlada)
+        ultimo_poll = float(st.session_state.get("ultimo_poll_ocr_ts") or 0.0)
+        debe_poll = (
+            not es_camara
+            or bool(evento_cerrado)
+            or bool(ocr_pendiente)
+            or (ahora - ultimo_poll) >= 0.25
         )
+        hubo_ocr = False
+        if debe_poll:
+            _, hubo_ocr = _poll_ocr_monitoreo_instantaneo(
+                config,
+                placa_controlada,
+                resumen_live,
+                frame_actual=frame_ref,
+                forzar_cola=bool(evento_cerrado),
+            )
+            st.session_state.ultimo_poll_ocr_ts = ahora
+
+        ultimo_panel = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
+        debe_mostrar_panel = (
+            hubo_ocr
+            or bool(evento_cerrado)
+            or bool(ocr_pendiente)
+            or int(estado_frame.get("detecciones_validas") or 0) > 0
+            or _hay_ocr_pendiente_en_cache()
+            or _evento_ocr_listo_en_cache(estado_frame.get("evento_id"))
+        )
+        if debe_mostrar_panel and (hubo_ocr or (ahora - ultimo_panel) >= (0.35 if es_camara else 0.15)):
+            st.session_state.ultimo_resultado_parcial = resumen_live
+            with panel_placeholder.container():
+                _mostrar_panel_compacto_en_vivo(resumen_live)
+            st.session_state.ultimo_panel_vivo_ts = ahora
+
+        if solo_video:
+            ultimo_estado_ui = float(st.session_state.get("ultimo_estado_ui_ts") or 0.0)
+            if (ahora - ultimo_estado_ui) >= 0.5:
+                placa_ui = _obtener_texto_placa_ui(_obtener_resumen_panel_vivo(resumen_live))
+                fps_proc = estado_frame.get("fps_procesamiento", "—")
+                if placa_ui.startswith("Capturando"):
+                    texto_placa = f" · {placa_ui}"
+                elif placa_ui == "Leyendo...":
+                    texto_placa = " · Leyendo placa..."
+                elif placa_ui != "—":
+                    texto_placa = f" · {placa_ui}"
+                else:
+                    texto_placa = ""
+                estado_placeholder.info(f"Monitoreo{texto_placa} · {fps_proc} FPS")
+                st.session_state.ultimo_estado_ui_ts = ahora
+            return
+
+        if evento_cerrado or hubo_ocr:
+            if estado_frame.get("estado_persistencia"):
+                st.session_state.estado_persistencia = estado_frame["estado_persistencia"]
+            st.session_state.ultimo_persistencia_ui_ts = ahora
+
+        st.session_state.ultimo_resultado_parcial = resumen_live
 
         ultimo_estado_ui = float(st.session_state.get("ultimo_estado_ui_ts") or 0.0)
-        if (ahora - ultimo_estado_ui) >= 0.4:
+        if (ahora - ultimo_estado_ui) >= 0.25:
             confianza = estado_frame.get("ultima_confianza")
             texto_confianza = f"{confianza:.0%}" if confianza is not None else "—"
             fps_proc = estado_frame.get("fps_procesamiento", "—")
@@ -2836,35 +3255,10 @@ def pestana_monitoreo(config: dict) -> None:
                 texto_placa = ""
             cola_n = len(st.session_state.get("eventos_monitoreo_cola") or [])
             texto_cola = f" · {cola_n} vehiculo(s) registrado(s)" if cola_n else ""
-            saltados = int(estado_frame.get("frames_saltados") or 0)
-            texto_saltos = f" · {saltados} frames recuperados" if saltados else ""
             estado_placeholder.info(
-                f"{estado_frame.get('estado_placa', '—')}{texto_placa} · YOLO {texto_confianza} · {fps_proc} FPS{texto_cola}{texto_saltos}"
+                f"{estado_frame.get('estado_placa', '—')}{texto_placa} · YOLO {texto_confianza} · {fps_proc} FPS{texto_cola}"
             )
             st.session_state.ultimo_estado_ui_ts = ahora
-
-        hubo_evento = bool(evento_cerrado)
-        ultimo_pesado = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
-        cache_pendiente = any(
-            entry.get("estado") == "pendiente"
-            for entry in (st.session_state.get("ocr_eventos_cache") or {}).values()
-        )
-        intervalo_panel = 0.35 if cache_pendiente else 0.8
-        debe_pesado = (
-            hubo_evento
-            or hubo_cola
-            or bool(ocr_pendiente)
-            or (ahora - ultimo_pesado) >= intervalo_panel
-        )
-
-        if not debe_pesado:
-            return
-
-        st.session_state.ultimo_resultado_parcial = resumen_live
-
-        with panel_placeholder.container():
-            _mostrar_panel_compacto_en_vivo(resumen_live)
-        st.session_state.ultimo_panel_vivo_ts = ahora
 
     def actualizar_progreso(valor: float) -> None:
         ahora = time.perf_counter()

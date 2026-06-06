@@ -9,3 +9,4 @@ scikit-fuzzy
 matplotlib
 tensorflow
 python-dotenv
+pygrabber

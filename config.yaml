@@ -37,11 +37,14 @@ monitoring_performance:
     inference_size: 416
     render_every_n_frames: 1
     max_display_fps: 0
-    max_frame_width: 960
-    preview_width: 640
+    max_frame_width: 854
+    preview_width: 420
   camara:
-    yolo_every_n_frames: 3
-    max_display_fps: 24
+    yolo_every_n_frames: 5
+    inference_size: 416
+    max_display_fps: 0
+    max_frame_width: 640
+    preview_width: 420
   rapido:
     yolo_every_n_frames: 5
     inference_size: 416
