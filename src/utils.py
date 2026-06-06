@@ -4,6 +4,21 @@ from uuid import uuid4
 import yaml
 
 
+def cargar_variables_entorno(ruta_env: str | Path | None = None) -> Path | None:
+    """Carga variables desde .env en la raiz del proyecto (sin pisar las ya definidas)."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return None
+
+    raiz = Path(__file__).resolve().parent.parent
+    ruta = Path(ruta_env) if ruta_env else raiz / ".env"
+    if ruta.exists():
+        load_dotenv(ruta, override=False, encoding="utf-8")
+        return ruta
+    return None
+
+
 def cargar_config(ruta_config: str = "config.yaml") -> dict:
     with open(ruta_config, "r", encoding="utf-8") as archivo:
         return yaml.safe_load(archivo)

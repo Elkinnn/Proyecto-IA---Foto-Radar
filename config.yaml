@@ -8,9 +8,6 @@ paths:
   output_dir: data/output
   reports_dir: reports/evidencias
 
-database:
-  path: data/database/fotorradar.db
-
 speed:
   default_distance_meters: 10.0
   default_time_seconds: 1.5
@@ -70,8 +67,28 @@ fuzzy:
     exceso_medio: 6
     exceso_alto: 12
 
-email:
-  simulation_mode: true
-  sender: fotorradar@example.com
-  smtp_host: smtp.example.com
+notificaciones:
+  # Velocidad/limite "quemados" para el mensaje difuso del correo (demo).
+  velocidad_demo_kmh: 47.0
+  limite_demo_kmh: 30.0
+  # Configuracion SMTP. Por seguridad, las credenciales se leen preferentemente
+  # de variables de entorno (ver .env.example):
+  #   FOTORRADAR_SMTP_HOST, FOTORRADAR_SMTP_PORT, FOTORRADAR_SMTP_USER,
+  #   FOTORRADAR_SMTP_PASSWORD, FOTORRADAR_SMTP_FROM, FOTORRADAR_SMTP_SECURITY
+  # Si no hay credenciales, el correo se genera en modo simulado (a disco).
+  smtp_host: smtp.gmail.com
   smtp_port: 587
+  smtp_seguridad: starttls   # starttls (587) o ssl (465)
+  remitente: ""
+  smtp_user: ""
+  smtp_password: ""
+  # Candado de calidad: evita enviar correos de placas incompletas / poco confiables.
+  calidad:
+    exigir_formato_valido: true
+    confianza_minima: 0.55
+    aspect_min: 1.8
+    aspect_max: 5.0
+    nitidez_minima: 30.0
+    longitud_min: 6
+    longitud_max: 7
+    permitir_envio_si_no_apto: false

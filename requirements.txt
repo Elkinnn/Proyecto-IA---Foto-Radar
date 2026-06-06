@@ -8,3 +8,4 @@ ultralytics
 scikit-fuzzy
 matplotlib
 tensorflow
+python-dotenv

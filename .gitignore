@@ -16,18 +16,21 @@ models/plate_detector/*.pt
 models/**/*.keras
 *.pt
 yolo*.pt
-data/database/*.sqlite3
-data/database/*.sqlite3-journal
-data/database/*.db
-data/database/*.db-journal
-data/database/*.db-journal.bak_*
-data/database/backup_sqlite_*/
-data/input/
+
+# Datos locales (videos, salidas, BD legacy) — no versionar
+data/
+!data/.gitkeep
+!data/input/.gitkeep
+!data/output/.gitkeep
+
 datasets/
 datasets/**/images/
 datasets/**/labels/
 datasets/placas_ecuador/
 datasets/placas_ecuador/images/
 datasets/placas_ecuador/labels/
-data/output/
+
+# Credenciales (solo subir .env.example)
 .env
+.env.*
+!.env.example

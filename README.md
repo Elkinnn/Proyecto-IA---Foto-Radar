@@ -4,7 +4,7 @@ Sistema integrado para reconocimiento de placas ecuatorianas y control de veloci
 
 ## Objetivo
 
-Construir una base limpia, organizada y funcional para un fotorradar controlado desde interfaz grafica. El proyecto integra deteccion de placa, reconocimiento de caracteres con CNN propia, estimacion de velocidad, clasificacion difusa, consulta de base de datos, registro de eventos y generacion de evidencia.
+Construir una base limpia, organizada y funcional para un fotorradar controlado desde interfaz grafica. El proyecto integra deteccion de placa, reconocimiento de caracteres con CNN propia, estimacion de velocidad, clasificacion difusa, notificacion por correo de la mejor lectura por evento y generacion de evidencia.
 
 ## Arquitectura
 
@@ -14,8 +14,7 @@ Construir una base limpia, organizada y funcional para un fotorradar controlado 
 - `src/plate_reader.py`: lector de placa con segmentacion OpenCV y clasificacion de caracteres mediante CNN propia.
 - `src/speed_estimator.py`: calculo de velocidad en km/h.
 - `src/fuzzy_system.py`: clasificacion de velocidad y sancion segun rangos configurables.
-- `src/database.py`: base SQLite con vehiculos y eventos.
-- `src/notifier.py`: notificaciones en modo simulacion.
+- `src/notifier.py`: envio de notificaciones por correo (SMTP) con control de calidad anti media-placa; cae en modo simulado si no hay credenciales.
 - `src/report_generator.py`: evidencia en JSON.
 - `scripts/`: utilidades conectadas al sistema final.
 

@@ -7,9 +7,7 @@ import time
 
 import cv2
 
-from src.database import buscar_vehiculo_por_placa, guardar_evento, inicializar_bd
 from src.fuzzy_system import clasificar_velocidad
-from src.notifier import enviar_notificacion_sancion
 from src.plate_detector import PlateDetector, dibujar_deteccion
 from src.plate_reader import (
     PlateReader,
@@ -47,26 +45,9 @@ def _obtener_detector_cache(model_path: str | None) -> PlateDetector:
 
 
 def _registrar_resultado(resultado: dict, config: dict) -> dict:
-    ruta_bd = config["database"]["path"]
-    clasificacion = resultado["clasificacion_difusa"]
-
-    sancion_aplica = bool(clasificacion.get("sancion_aplica"))
-
-    if sancion_aplica:
-        resultado["notificacion"] = enviar_notificacion_sancion(resultado.get("vehiculo"), resultado, config)
-
     ruta_reporte = guardar_reporte(resultado, config["paths"]["reports_dir"])
     resultado["ruta_reporte"] = ruta_reporte
-
-    evento = {
-        "fecha_hora": resultado["fecha_hora"],
-        "placa": resultado["texto_placa"],
-        "velocidad": resultado["velocidad_kmh"],
-        "estado": clasificacion["estado"],
-        "sancion": "SI" if sancion_aplica else "NO",
-        "evidencia": ruta_reporte,
-    }
-    resultado["id_evento"] = guardar_evento(evento, ruta_bd)
+    resultado["id_evento"] = None
     return resultado
 
 
@@ -77,9 +58,6 @@ def procesar_imagen_prueba(
     placa_manual: str | None = None,
     tiempo_segundos: float | None = None,
 ) -> dict:
-    ruta_bd = config["database"]["path"]
-    inicializar_bd(ruta_bd)
-
     detector = PlateDetector(config["models"].get("plate_detector_model", config["models"]["plate_detector_path"]))
     lector = PlateReader()
 
@@ -91,7 +69,7 @@ def procesar_imagen_prueba(
     )
     velocidad_kmh = estimar_velocidad(config, tiempo_segundos=tiempo_segundos)
     clasificacion = clasificar_velocidad(velocidad_kmh, config)
-    vehiculo = buscar_vehiculo_por_placa(lectura["texto"], ruta_bd)
+    vehiculo = None
     ruta_procesada = dibujar_deteccion(ruta_archivo, deteccion, config["paths"]["output_dir"])
 
     resultado = {
@@ -603,6 +581,7 @@ def _procesar_fuente_monitoreo(
                 "frame_mejor_evento": estado_frame["frame_mejor_evento"],
                 "frames_sin_deteccion": estado_frame["frames_sin_deteccion"],
                 "ruta_mejor_recorte_evento": estado_frame["ruta_mejor_recorte_evento"],
+                "ruta_recorte_evento_en_vivo": estado_frame.get("ruta_recorte_evento_en_vivo"),
                 "velocidad": estado_frame["velocidad"],
             }
             try:
@@ -735,6 +714,7 @@ def _crear_estado_persistencia() -> dict:
         "frames_sin_deteccion": 0,
         "ruta_mejor_frame_evento": None,
         "ruta_mejor_recorte_evento": None,
+        "ruta_recorte_evento_en_vivo": None,
         "speed_tracker": None,
         "buffer_recortes_placa": [],
         "ultimo_candidatos_recorte": [],
@@ -1636,6 +1616,7 @@ def _procesar_frame_monitoreo(
         "frame_mejor_evento": estado_persistencia["frame_mejor_evento"],
         "frames_sin_deteccion": estado_persistencia["frames_sin_deteccion"],
         "ruta_mejor_recorte_evento": estado_persistencia["ruta_mejor_recorte_evento"],
+        "ruta_recorte_evento_en_vivo": estado_persistencia.get("ruta_recorte_evento_en_vivo"),
         "velocidad": velocidad,
     }
 
@@ -1653,6 +1634,13 @@ def _iniciar_evento_placa(estado: dict, evento_id: int, numero_frame: int) -> No
     estado["frames_sin_deteccion"] = 0
     estado["ruta_mejor_frame_evento"] = None
     estado["ruta_mejor_recorte_evento"] = None
+    estado["ruta_recorte_evento_en_vivo"] = None
+    estado["buffer_recortes_placa"] = []
+    estado["ultimo_candidatos_recorte"] = []
+    estado["ruta_mejor_recorte_placa"] = None
+    estado["mejor_recorte_placa"] = None
+    estado["mejor_recorte_placa_info"] = None
+    estado["ultimo_frame_recorte"] = numero_frame - GUARDAR_RECORTE_CADA_N_FRAMES
 
 
 def _actualizar_mejor_evento_placa(
@@ -1673,6 +1661,13 @@ def _actualizar_mejor_evento_placa(
         estado["mejor_frame_evento"] = frame_visual.copy()
         estado["mejor_recorte_evento"] = recorte_placa.copy()
         estado["frame_mejor_evento"] = numero_frame
+        if recorte_placa is not None and recorte_placa.size > 0:
+            eventos_dir = Path("reports") / "evidencias" / "eventos_placa"
+            eventos_dir.mkdir(parents=True, exist_ok=True)
+            evento_id = int(estado.get("evento_id") or estado.get("eventos_placa") or 0)
+            ruta_en_vivo = eventos_dir / f"evento_{evento_id:04d}_recorte_en_vivo.jpg"
+            cv2.imwrite(str(ruta_en_vivo), recorte_placa)
+            estado["ruta_recorte_evento_en_vivo"] = str(ruta_en_vivo)
 
 
 def _cerrar_evento_placa(estado: dict, frame_fin: int) -> None:
