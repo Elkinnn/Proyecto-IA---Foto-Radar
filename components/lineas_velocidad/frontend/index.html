@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      font-family: "Segoe UI", sans-serif;
+      background: transparent;
+      overflow: hidden;
+    }
+    #wrap {
+      position: relative;
+      display: block;
+      width: 100%;
+      user-select: none;
+      touch-action: none;
+    }
+    #img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 6px;
+      pointer-events: none;
+    }
+    .line {
+      position: absolute;
+      left: 0;
+      right: 0;
+      height: 4px;
+      transform: translateY(-50%);
+      z-index: 5;
+      pointer-events: auto;
+    }
+    .line::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: -18px;
+      bottom: -18px;
+      cursor: ns-resize;
+    }
+    .line1 {
+      background: #00ffff;
+      box-shadow: 0 0 10px rgba(0, 255, 255, 0.9);
+    }
+    .line2 {
+      background: #0064ff;
+      box-shadow: 0 0 10px rgba(0, 100, 255, 0.9);
+    }
+    .handle {
+      position: absolute;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(0, 0, 0, 0.75);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 4px;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <img id="img" alt="Vista monitoreo" />
+    <div id="line1" class="line line1"><span class="handle">Linea 1</span></div>
+    <div id="line2" class="line line2"><span class="handle">Linea 2</span></div>
+  </div>
+  <div class="hint">Arrastre cada linea de arriba a abajo sobre el video o la camara en vivo.</div>
+  <script>
+    let line1 = 0.45;
+    let line2 = 0.65;
+    let dragging = null;
+    let imgLoaded = false;
+    let lastImageKey = "";
+
+    function sendMessage(type, data) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+    }
+
+    function setFrameHeight(height) {
+      sendMessage("streamlit:setFrameHeight", { height: height });
+    }
+
+    function setComponentValue(value) {
+      sendMessage("streamlit:setComponentValue", { value: value });
+    }
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function updateLines() {
+      document.getElementById("line1").style.top = (line1 * 100) + "%";
+      document.getElementById("line2").style.top = (line2 * 100) + "%";
+    }
+
+    function yFromEvent(e) {
+      const wrap = document.getElementById("wrap");
+      const rect = wrap.getBoundingClientRect();
+      if (!rect.height) return null;
+      return clamp((e.clientY - rect.top) / rect.height, 0.0, 1.0);
+    }
+
+    function startDrag(which, e) {
+      dragging = which;
+      e.preventDefault();
+      e.stopPropagation();
+    }
+
+    document.getElementById("line1").addEventListener("mousedown", (e) => startDrag(1, e));
+    document.getElementById("line2").addEventListener("mousedown", (e) => startDrag(2, e));
+    document.getElementById("line1").addEventListener("touchstart", (e) => startDrag(1, e.touches[0]), { passive: false });
+    document.getElementById("line2").addEventListener("touchstart", (e) => startDrag(2, e.touches[0]), { passive: false });
+
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const y = yFromEvent(e);
+      if (y === null) return;
+      if (dragging === 1) {
+        line1 = y;
+      } else {
+        line2 = y;
+      }
+      updateLines();
+    });
+
+    document.addEventListener("touchmove", (e) => {
+      if (!dragging) return;
+      const y = yFromEvent(e.touches[0]);
+      if (y === null) return;
+      if (dragging === 1) {
+        line1 = y;
+      } else {
+        line2 = y;
+      }
+      updateLines();
+      e.preventDefault();
+    }, { passive: false });
+
+    function endDrag() {
+      if (!dragging) return;
+      dragging = null;
+      setComponentValue({ line1: line1, line2: line2 });
+    }
+    document.addEventListener("mouseup", endDrag);
+    document.addEventListener("touchend", endDrag);
+
+    function resizeFrame() {
+      const img = document.getElementById("img");
+      const hint = document.querySelector(".hint");
+      const h = imgLoaded
+        ? Math.max(img.offsetHeight + (hint ? hint.offsetHeight : 0) + 12, 200)
+        : 240;
+      setFrameHeight(h);
+    }
+
+    function onRender(args) {
+      const img = document.getElementById("img");
+      if (!dragging && args && args.imageBase64) {
+        const key = String(args.imageBase64).slice(0, 96);
+        if (key !== lastImageKey) {
+          lastImageKey = key;
+          imgLoaded = false;
+          img.onload = function () {
+            imgLoaded = true;
+            updateLines();
+            resizeFrame();
+          };
+          img.onerror = function () {
+            imgLoaded = false;
+            resizeFrame();
+          };
+          img.src = "data:image/jpeg;base64," + args.imageBase64;
+        }
+      }
+      if (!dragging && args) {
+        if (typeof args.line1 === "number") line1 = clamp(args.line1, 0.0, 1.0);
+        if (typeof args.line2 === "number") line2 = clamp(args.line2, 0.0, 1.0);
+      }
+      updateLines();
+      resizeFrame();
+    }
+
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (!data || !data.isStreamlitMessage) return;
+      if (data.type === "streamlit:render") {
+        onRender(data.args || {});
+      }
+    });
+
+    sendMessage("streamlit:componentReady", { apiVersion: 1 });
+    updateLines();
+    resizeFrame();
+    window.addEventListener("resize", resizeFrame);
+  </script>
+</body>
+</html>

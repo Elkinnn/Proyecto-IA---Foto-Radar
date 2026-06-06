@@ -976,6 +976,59 @@ def _render_tabla_vehiculos_detectados(cola: list, config: dict | None = None, m
         st.caption(f"{enviados} correo(s) enviado(s) automaticamente en esta sesion.")
 
 
+def _formatear_metrica_velocidad(velocidad: dict, estado_placa: str = "") -> tuple[str, str | None]:
+    """Texto principal y detalle del tracker de velocidad para la UI."""
+    velocidad_kmh = velocidad.get("velocidad_kmh")
+    if velocidad_kmh is not None:
+        return f"{float(velocidad_kmh):.0f} km/h", "Medicion completa (Linea 1 y Linea 2)"
+
+    estado = str(velocidad.get("estado") or "esperando_linea_1")
+    etiquetas = {
+        "esperando_linea_1": "Esperando Linea 1",
+        "esperando_linea_2": "Esperando Linea 2",
+        "velocidad_calculada": "Calculando...",
+    }
+    principal = etiquetas.get(estado, "Sin medicion")
+
+    frame_l1 = velocidad.get("frame_cruce_linea_1")
+    frame_l2 = velocidad.get("frame_cruce_linea_2")
+    if estado == "esperando_linea_1":
+        if estado_placa in {"Detectada", "Mantenida"}:
+            detalle = "Placa detectada · aun no cruza Linea 1 (cian)"
+        else:
+            detalle = "Esperando vehiculo sobre Linea 1"
+    elif estado == "esperando_linea_2":
+        detalle = f"Linea 1 cruzada (frame {frame_l1}) · falta Linea 2 (azul)"
+    elif frame_l1 is not None and frame_l2 is not None:
+        detalle = f"Cruces: L1 frame {frame_l1} · L2 frame {frame_l2}"
+    else:
+        detalle = "Monitoreo de lineas activo"
+
+    return principal, detalle
+
+
+def _detalle_lineas_velocidad(velocidad: dict, resumen: dict) -> str:
+    """Linea de contexto con distancia, limites y posicion del centro de la placa."""
+    partes = []
+    distancia = velocidad.get("distancia_metros") or resumen.get("distancia_lineas_m")
+    if distancia is not None:
+        partes.append(f"Distancia real: {float(distancia):.1f} m")
+    limite = resumen.get("limite_velocidad_kmh")
+    if limite is not None:
+        partes.append(f"Limite: {float(limite):.0f} km/h")
+    l1 = resumen.get("posicion_linea_1")
+    l2 = resumen.get("posicion_linea_2")
+    if l1 is not None and l2 is not None:
+        partes.append(f"Lineas UI: {float(l1):.0%} / {float(l2):.0%}")
+    centro_y = velocidad.get("centro_y")
+    if centro_y is not None:
+        partes.append(f"Centro placa Y: {int(centro_y)} px")
+    tiempo = velocidad.get("tiempo_entre_lineas")
+    if tiempo is not None:
+        partes.append(f"Tiempo entre lineas: {float(tiempo):.3f} s")
+    return " · ".join(partes)
+
+
 def _render_panel_deteccion_esencial(
     resumen: dict,
     config: dict | None = None,
@@ -992,6 +1045,14 @@ def _render_panel_deteccion_esencial(
     conf_ocr = resumen.get("confianza_ocr")
     estado_placa = resumen.get("estado_placa") or "Esperando"
     difuso = resumen.get("clasificacion_difusa") or {}
+    if velocidad_kmh is not None and not difuso:
+        difuso = clasificar_velocidad(
+            float(velocidad_kmh),
+            float(resumen.get("limite_velocidad_kmh") or 30.0),
+        )
+
+    texto_velocidad, detalle_velocidad = _formatear_metrica_velocidad(velocidad, estado_placa)
+    texto_sancion = difuso.get("estado") or ("—" if velocidad_kmh is None else "Pendiente")
 
     col_img, col_main = st.columns([0.3, 0.7], gap="medium")
     with col_img:
@@ -1002,9 +1063,13 @@ def _render_panel_deteccion_esencial(
     with col_main:
         st.markdown(f"## {placa}")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Velocidad", f"{velocidad_kmh:.0f} km/h" if velocidad_kmh is not None else "—")
+        m1.metric("Velocidad", texto_velocidad, delta=detalle_velocidad)
         m2.metric("Deteccion", estado_placa)
-        m3.metric("Sancion", difuso.get("estado") or "—")
+        m3.metric("Sancion", texto_sancion)
+
+        detalle_lineas = _detalle_lineas_velocidad(velocidad, resumen)
+        if detalle_lineas:
+            st.caption(detalle_lineas)
 
         partes_conf = []
         if conf_yolo is not None:

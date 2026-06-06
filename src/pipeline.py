@@ -1604,6 +1604,11 @@ def _procesar_frame_monitoreo(
             }
             ultimo_recorte_placa = estado_persistencia["ultimo_recorte_placa"]
             ultimo_frame_deteccion = estado_persistencia["ultimo_frame_deteccion"]
+            if estado_persistencia.get("speed_tracker") is not None and estado_persistencia["ultima_bbox_valida"] is not None:
+                velocidad = estado_persistencia["speed_tracker"].actualizar(
+                    estado_persistencia["ultima_bbox_valida"],
+                    numero_frame,
+                )
         else:
             if estado_persistencia["evento_activo"] and estado_persistencia["frames_sin_deteccion"] > persistencia_frames:
                 _cerrar_evento_placa(estado_persistencia, numero_frame)
