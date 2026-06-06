@@ -65,6 +65,9 @@ PERFORMANCE_MODE_LABELS = {
 _OCR_ASYNC_LOCK = threading.Lock()
 _OCR_ASYNC_PENDIENTES: set[str] = set()
 _OCR_ASYNC_RESULTADOS: dict[str, dict] = {}
+_EMAIL_ASYNC_LOCK = threading.Lock()
+_EMAIL_ASYNC_PENDIENTES: set[str] = set()
+_EMAIL_ASYNC_RESULTADOS: dict[str, dict] = {}
 # Serializa la ejecucion real del OCR (CNN + escritura/lectura de imagenes de
 # debug). Sin esto, varios hilos OCR escriben y leen las mismas carpetas a la
 # vez y se producen archivos a medio escribir -> cv2.imdecode con buffer vacio
@@ -741,6 +744,7 @@ def _metricas_calidad_desde_resumen(resumen: dict, placa: str) -> dict:
 
 def _adjuntos_evento_desde_resumen(resumen: dict) -> list[str]:
     candidatos_frame = [
+        resumen.get("ruta_snapshot_frame_evento"),
         resumen.get("ruta_mejor_frame_evento"),
         resumen.get("mejor_frame_bbox_placa"),
         resumen.get("ruta_frame_evento_en_vivo"),
@@ -857,6 +861,259 @@ def enviar_notificacion_evento_monitoreo(
         "evaluacion_calidad_evento": evaluacion,
     }
     return resumen
+
+
+def _clave_email_evento(evento_id: int, placa: str) -> str:
+    placa_norm = str(placa or "").strip().upper().replace("-", "").replace(" ", "")
+    return f"{_id_ejecucion_monitoreo_actual()}|evento_{int(evento_id)}|placa_{placa_norm}"
+
+
+def _hay_email_asincrono_pendiente() -> bool:
+    with _EMAIL_ASYNC_LOCK:
+        return bool(_EMAIL_ASYNC_PENDIENTES or _EMAIL_ASYNC_RESULTADOS)
+
+
+def _tarea_email_evento_asincrona(clave: str, payload: dict) -> None:
+    try:
+        resultado = notificar_evento_placa(
+            destinatario=payload["destinatario"],
+            placa=payload["placa"],
+            metricas_calidad=payload["metricas_calidad"],
+            adjuntos=payload["adjuntos"],
+            config=payload["config"],
+            evento_id=payload["evento_id"],
+            contexto=payload["contexto"],
+            velocidad_kmh=payload["velocidad_kmh"],
+            limite_kmh=payload["limite_kmh"],
+        )
+        salida = {**payload, "resultado": resultado}
+    except Exception as exc:
+        salida = {**payload, "error": str(exc)}
+    with _EMAIL_ASYNC_LOCK:
+        if clave in _EMAIL_ASYNC_PENDIENTES:
+            _EMAIL_ASYNC_RESULTADOS[clave] = salida
+            _EMAIL_ASYNC_PENDIENTES.discard(clave)
+
+
+def _resumen_notificacion_desde_cache(evento_id: int, entry: dict) -> dict:
+    resumen = dict(entry.get("resumen_base") or {})
+    resumen["evento_id"] = int(evento_id)
+    if entry.get("datos"):
+        resumen.update({k: v for k, v in entry["datos"].items() if v is not None})
+    if entry.get("resumen_completo"):
+        resumen.update(entry["resumen_completo"])
+    ruta_recorte = entry.get("ruta_mejor_recorte_final") or entry.get("ruta_recorte")
+    if ruta_recorte and Path(str(ruta_recorte)).exists():
+        resumen["ruta_snapshot_ocr_evento"] = str(ruta_recorte)
+        resumen["ruta_mejor_recorte_evento"] = str(ruta_recorte)
+        resumen["mejor_recorte_placa"] = str(ruta_recorte)
+    ruta_frame = (
+        resumen.get("ruta_snapshot_frame_evento")
+        or resumen.get("ruta_frame_evento_en_vivo")
+        or resumen.get("ruta_mejor_frame_evento")
+    )
+    if ruta_frame and Path(str(ruta_frame)).exists():
+        resumen["ruta_mejor_frame_evento"] = str(ruta_frame)
+    if entry.get("notificacion_correo"):
+        resumen["notificacion_correo"] = entry["notificacion_correo"]
+    if entry.get("clasificacion_difusa"):
+        resumen["clasificacion_difusa"] = entry["clasificacion_difusa"]
+    return resumen
+
+
+def _evento_confirmado_para_email(resumen: dict, placa: str, config: dict, *, evento_cerrado: bool) -> bool:
+    resumen = preparar_estado_notificacion_evento(resumen, placa, config)
+    if not resumen.get("puede_enviar_notificacion"):
+        return False
+    notif_cfg = config.get("notificaciones") or {}
+    lecturas_min = int(notif_cfg.get("lecturas_minimas_confirmacion", 2))
+    confianza_inmediata = float(notif_cfg.get("confianza_envio_inmediato", 0.80))
+    lecturas = int(resumen.get("lecturas_usadas_evento") or resumen.get("recortes_usados_evento") or 0)
+    confianza = resumen.get("confianza_final_evento")
+    if confianza is None:
+        confianza = resumen.get("confianza_ocr")
+    return bool(
+        evento_cerrado
+        or lecturas >= lecturas_min
+        or (confianza is not None and float(confianza) >= confianza_inmediata)
+    )
+
+
+def _encolar_email_evento_asincrono(
+    evento_id: int,
+    resumen: dict,
+    placa: str,
+    correo_destino: str,
+    config: dict,
+) -> bool:
+    if not validar_correo(correo_destino):
+        return False
+    clave = _clave_email_evento(evento_id, placa)
+    procesadas = set(st.session_state.get("emails_evento_procesados") or [])
+    if clave in procesadas:
+        return False
+    with _EMAIL_ASYNC_LOCK:
+        if clave in _EMAIL_ASYNC_PENDIENTES or clave in _EMAIL_ASYNC_RESULTADOS:
+            return False
+
+    resumen = preparar_estado_notificacion_evento(dict(resumen), placa, config)
+    metricas = _metricas_calidad_desde_resumen(resumen, placa)
+    adjuntos = _adjuntos_evento_desde_resumen(resumen)
+    velocidad_kmh = _obtener_velocidad_kmh_desde_resumen(resumen)
+    limite_kmh = _obtener_limite_kmh_resumen(resumen, config)
+    payload = {
+        "evento_id": int(evento_id),
+        "placa": placa,
+        "destinatario": correo_destino,
+        "metricas_calidad": metricas,
+        "adjuntos": adjuntos,
+        "config": config,
+        "velocidad_kmh": velocidad_kmh,
+        "limite_kmh": limite_kmh,
+        "contexto": {
+            "fecha_hora": datetime.now().isoformat(timespec="seconds"),
+            "velocidad_kmh": velocidad_kmh,
+            "limite_kmh": limite_kmh,
+        },
+    }
+    with _EMAIL_ASYNC_LOCK:
+        _EMAIL_ASYNC_PENDIENTES.add(clave)
+    threading.Thread(
+        target=_tarea_email_evento_asincrona,
+        args=(clave, payload),
+        daemon=True,
+    ).start()
+
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    entry = cache.get(int(evento_id)) or {}
+    entry["email_clave"] = clave
+    entry["email_placa"] = placa
+    entry["email_estado"] = "enviando"
+    cache[int(evento_id)] = entry
+    st.session_state.ocr_eventos_cache = cache
+    return True
+
+
+def _fusionar_emails_asincronos_monitoreo() -> bool:
+    with _EMAIL_ASYNC_LOCK:
+        resultados = dict(_EMAIL_ASYNC_RESULTADOS)
+        _EMAIL_ASYNC_RESULTADOS.clear()
+    if not resultados:
+        return False
+
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+    procesadas = set(st.session_state.get("emails_evento_procesados") or [])
+    recientes = dict(st.session_state.get("placas_email_recientes") or {})
+
+    for clave, payload in resultados.items():
+        evento_id = int(payload.get("evento_id") or 0)
+        placa = str(payload.get("placa") or "")
+        resultado = payload.get("resultado") or {
+            "enviado": False,
+            "modo": "error",
+            "estado": "fallo_envio",
+            "error": payload.get("error"),
+            "mensaje_estado": f"No se pudo enviar el correo: {payload.get('error')}",
+        }
+        entry = cache.get(evento_id) or {}
+        entry["email_clave"] = clave
+        entry["email_placa"] = placa
+        entry["email_estado"] = "procesado"
+        entry["email_procesado"] = True
+        entry["notificacion_correo"] = resultado
+        entry["clasificacion_difusa"] = resultado.get("clasificacion_difusa")
+        if entry.get("resumen_completo"):
+            entry["resumen_completo"]["notificacion_correo"] = resultado
+            entry["resumen_completo"]["clasificacion_difusa"] = resultado.get("clasificacion_difusa")
+        cache[evento_id] = entry
+        procesadas.add(clave)
+        recientes[placa] = {
+            "evento_id": evento_id,
+            "frame": int((entry.get("resumen_base") or {}).get("frame_actual") or 0),
+        }
+        for item in cola:
+            if int(item.get("evento_id") or 0) != evento_id:
+                continue
+            item["notificacion_enviada"] = bool(resultado.get("enviado"))
+            item["notificacion_procesada"] = True
+            item["resumen"] = _resumen_notificacion_desde_cache(evento_id, entry)
+            break
+
+    st.session_state.ocr_eventos_cache = cache
+    st.session_state.eventos_monitoreo_cola = cola
+    st.session_state.emails_evento_procesados = list(procesadas)
+    st.session_state.placas_email_recientes = recientes
+    return True
+
+
+def _procesar_email_inmediato_eventos_reconocidos(config: dict, placa_controlada: str) -> bool:
+    """Encola un unico correo apenas una lectura viva queda confirmada."""
+    notif_cfg = config.get("notificaciones") or {}
+    if not notif_cfg.get("envio_automatico", True):
+        return _fusionar_emails_asincronos_monitoreo()
+    correo = (st.session_state.get("correo_destino_monitoreo") or "").strip()
+    if not validar_correo(correo):
+        return _fusionar_emails_asincronos_monitoreo()
+
+    hubo_cambio = _fusionar_emails_asincronos_monitoreo()
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    recientes = dict(st.session_state.get("placas_email_recientes") or {})
+    placas_enviando = {
+        str(entry.get("email_placa") or "")
+        for entry in cache.values()
+        if entry.get("email_estado") == "enviando" and entry.get("email_placa")
+    }
+    ventana = int(notif_cfg.get("ventana_frames_mismo_vehiculo", notif_cfg.get("ventana_frames_mismo_paso", 150)))
+
+    for evento_id, entry in list(cache.items()):
+        if entry.get("email_procesado") or entry.get("email_estado") == "enviando":
+            continue
+        if not _entrada_ocr_tiene_texto_util(entry):
+            continue
+        resumen = _resumen_notificacion_desde_cache(int(evento_id), entry)
+        placa = _obtener_placa_para_evento(resumen, placa_controlada)
+        if not _evento_confirmado_para_email(
+            resumen,
+            placa,
+            config,
+            evento_cerrado=bool(entry.get("evento_cerrado")),
+        ):
+            continue
+
+        frame_actual = int(resumen.get("frame_actual") or resumen.get("frame_mejor_evento") or 0)
+        reciente = recientes.get(placa) or {}
+        misma_placa_enviando = placa in placas_enviando
+        if (
+            misma_placa_enviando
+            or (
+                reciente
+                and int(reciente.get("evento_id") or 0) != int(evento_id)
+                and abs(frame_actual - int(reciente.get("frame") or 0)) <= ventana
+            )
+        ):
+            entry["email_procesado"] = True
+            entry["email_estado"] = "suprimido_duplicado"
+            entry["notificacion_correo"] = {
+                "enviado": False,
+                "modo": "duplicado",
+                "estado": "suprimido_duplicado",
+                "mensaje_estado": "Correo omitido: la misma placa ya fue notificada recientemente.",
+            }
+            cache[int(evento_id)] = entry
+            hubo_cambio = True
+            continue
+
+        if _encolar_email_evento_asincrono(int(evento_id), resumen, placa, correo, config):
+            entry["email_clave"] = _clave_email_evento(int(evento_id), placa)
+            entry["email_placa"] = placa
+            entry["email_estado"] = "enviando"
+            cache[int(evento_id)] = entry
+            placas_enviando.add(placa)
+            hubo_cambio = True
+
+    st.session_state.ocr_eventos_cache = cache
+    return hubo_cambio
 
 
 _ERRORES_LECTURA_OCR_UI = frozenset(
@@ -1103,6 +1360,10 @@ def _resumen_panel_desde_cache(entry: dict, resumen_live: dict) -> dict:
         out.update(entry.get("datos") or {})
     if entry.get("resumen_completo"):
         out.update(entry["resumen_completo"])
+    if entry.get("notificacion_correo"):
+        out["notificacion_correo"] = entry["notificacion_correo"]
+    if entry.get("clasificacion_difusa"):
+        out["clasificacion_difusa"] = entry["clasificacion_difusa"]
     return out
 
 
@@ -1188,16 +1449,32 @@ def _agrupar_cola_por_paso_vehiculo(cola: list, ventana_frames: int) -> list[dic
     grupos: list[dict] = []
     for item in ordenados:
         frame = int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0)
+        evento_id = int(item.get("evento_id") or 0)
+        placa = _extraer_placa_desde_resumen(item.get("resumen") or {})
         ubicado = False
         for grupo in grupos:
-            if abs(frame - int(grupo["frame_fin"])) <= ventana_frames:
+            mismo_evento = bool(evento_id and evento_id in grupo["eventos"])
+            misma_placa = bool(placa and placa in grupo["placas"])
+            if (mismo_evento or misma_placa) and abs(frame - int(grupo["frame_fin"])) <= ventana_frames:
                 grupo["items"].append(item)
                 grupo["frame_fin"] = max(int(grupo["frame_fin"]), frame)
                 grupo["frame_inicio"] = min(int(grupo["frame_inicio"]), frame)
+                if evento_id:
+                    grupo["eventos"].add(evento_id)
+                if placa:
+                    grupo["placas"].add(placa)
                 ubicado = True
                 break
         if not ubicado:
-            grupos.append({"frame_inicio": frame, "frame_fin": frame, "items": [item]})
+            grupos.append(
+                {
+                    "frame_inicio": frame,
+                    "frame_fin": frame,
+                    "items": [item],
+                    "eventos": {evento_id} if evento_id else set(),
+                    "placas": {placa} if placa else set(),
+                }
+            )
     return grupos
 
 
@@ -1242,6 +1519,14 @@ def _consolidar_marcas_paso_vehiculo(cola: list, config: dict | None) -> None:
 def _estado_correo_item(item: dict) -> str:
     if item.get("notificacion_enviada"):
         return "Enviado"
+    notif = (item.get("resumen") or {}).get("notificacion_correo") or {}
+    if notif.get("modo") == "simulado":
+        return "Simulado"
+    if item.get("notificacion_procesada"):
+        return "Procesado"
+    entry = _entrada_cache_ocr_evento(int(item.get("evento_id") or 0))
+    if entry.get("email_estado") == "enviando":
+        return "Enviando..."
     if item.get("suprimido_duplicado"):
         return "Duplicado"
     if item.get("estado_ocr") == "pendiente":
@@ -1264,15 +1549,16 @@ def _procesar_envio_automatico_cola(
     forzar: bool = False,
 ) -> bool:
     """Agrupa pasos, elige la mejor lectura y envia un solo correo por vehiculo."""
+    hubo_email_async = _fusionar_emails_asincronos_monitoreo()
     notif_cfg = (config.get("notificaciones") or {})
     if not notif_cfg.get("envio_automatico", True):
-        return False
+        return hubo_email_async
     correo = (st.session_state.get("correo_destino_monitoreo") or "").strip()
     if not validar_correo(correo):
-        return False
+        return hubo_email_async
     cola = st.session_state.get("eventos_monitoreo_cola") or []
     if not cola:
-        return False
+        return hubo_email_async
 
     ventana = int(notif_cfg.get("ventana_frames_mismo_paso", 150))
     cooldown = int(notif_cfg.get("cooldown_frames_envio", 60))
@@ -1281,7 +1567,7 @@ def _procesar_envio_automatico_cola(
     _consolidar_marcas_paso_vehiculo(cola, config)
     enviados: set[str] = set(st.session_state.get("pasos_grupo_notificados") or [])
     descartados: set[str] = set(st.session_state.get("pasos_grupo_descartados") or [])
-    hubo_cambio = False
+    hubo_cambio = hubo_email_async
 
     for grupo in _agrupar_cola_por_paso_vehiculo(cola, ventana):
         paso_id = f"paso_{grupo['frame_inicio']}"
@@ -1305,8 +1591,11 @@ def _procesar_envio_automatico_cola(
                 item["es_mejor_del_paso"] = False
                 item["suprimido_duplicado"] = True
 
-        if mejor.get("notificacion_enviada"):
+        entry_mejor = _entrada_cache_ocr_evento(int(mejor.get("evento_id") or 0))
+        if mejor.get("notificacion_procesada") or entry_mejor.get("email_procesado"):
             enviados.add(paso_id)
+            continue
+        if entry_mejor.get("email_estado") == "enviando":
             continue
 
         candidatos_apto = [
@@ -1325,7 +1614,8 @@ def _procesar_envio_automatico_cola(
         notif = resumen.get("notificacion_correo") or {}
         enviado = bool(notif.get("enviado"))
         mejor["notificacion_enviada"] = enviado
-        if enviado:
+        mejor["notificacion_procesada"] = True
+        if enviado or notif.get("modo") == "simulado" or notif.get("estado") == "generada_sin_credenciales":
             enviados.add(paso_id)
         elif notif.get("estado") in {"no_apto", "correo_no_ingresado", "fallo_envio", "correo_invalido"}:
             descartados.add(paso_id)
@@ -1697,7 +1987,7 @@ def _render_panel_deteccion_esencial(
             config,
         )
         if resumen.get("puede_enviar_notificacion"):
-            st.success("Captura apta. El correo se enviara automaticamente al cerrar el paso del vehiculo.")
+            st.success("Captura apta. El correo se enviara automaticamente al confirmar la lectura.")
         elif ruta_recorte:
             razones = (resumen.get("evaluacion_calidad_evento") or {}).get("razones") or []
             if razones:
@@ -1782,9 +2072,10 @@ def _render_sidebar_envio_correo(config: dict, placa_controlada: str) -> None:
     notif_cfg = (config.get("notificaciones") or {})
     correo = (st.session_state.get("correo_destino_monitoreo") or "").strip()
     cola = st.session_state.get("eventos_monitoreo_cola") or []
+    cache_email = st.session_state.get("ocr_eventos_cache") or {}
 
     if notif_cfg.get("envio_automatico", True):
-        st.caption("Envio automatico activo: un correo por paso de vehiculo (mejor lectura).")
+        st.caption("Envio automatico activo al confirmar la placa; un correo por vehiculo.")
     else:
         st.caption("Envio automatico desactivado en config.")
 
@@ -1793,6 +2084,15 @@ def _render_sidebar_envio_correo(config: dict, placa_controlada: str) -> None:
         return
 
     enviados = [item for item in cola if item.get("notificacion_enviada")]
+    enviados_ids = {int(item.get("evento_id") or 0) for item in enviados}
+    enviados_ids.update(
+        int(eid)
+        for eid, entry in cache_email.items()
+        if (entry.get("notificacion_correo") or {}).get("enviado")
+    )
+    emails_enviando = [
+        int(eid) for eid, entry in cache_email.items() if entry.get("email_estado") == "enviando"
+    ]
     pendientes = [
         item
         for item in cola
@@ -1807,7 +2107,9 @@ def _render_sidebar_envio_correo(config: dict, placa_controlada: str) -> None:
         and not (item.get("resumen") or {}).get("puede_enviar_notificacion")
     ]
 
-    st.metric("Correos enviados", len(enviados))
+    st.metric("Correos enviados", len(enviados_ids))
+    if emails_enviando:
+        st.info("Enviando correo para evento(s): " + ", ".join(f"#{eid:03d}" for eid in emails_enviando))
     if enviados:
         ultimo = enviados[0]
         res_u = ultimo.get("resumen") or {}
@@ -2001,6 +2303,10 @@ def _finalizar_ocr_evento_en_cache(evento_id: int, config: dict, placa_controlad
         resumen_base["mejor_recorte_placa"] = str(ruta_final)
     placa = _obtener_placa_para_evento(resumen_base, placa_controlada)
     entry["resumen_completo"] = preparar_estado_notificacion_evento(resumen_base, placa, config)
+    if entry.get("notificacion_correo"):
+        entry["resumen_completo"]["notificacion_correo"] = entry["notificacion_correo"]
+    if entry.get("clasificacion_difusa"):
+        entry["resumen_completo"]["clasificacion_difusa"] = entry["clasificacion_difusa"]
     entry["estado"] = "listo"
     cache[eid] = entry
     st.session_state.ocr_eventos_cache = cache
@@ -2061,7 +2367,8 @@ def _hay_ocr_pendiente_en_cache() -> bool:
     ):
         return True
     with _OCR_ASYNC_LOCK:
-        return bool(_OCR_ASYNC_PENDIENTES or _OCR_ASYNC_RESULTADOS)
+        hay_ocr = bool(_OCR_ASYNC_PENDIENTES or _OCR_ASYNC_RESULTADOS)
+    return hay_ocr or _hay_email_asincrono_pendiente()
 
 
 def _fusionar_resumen_live_monitoreo(estado_frame: dict, fuente: str, placa_controlada: str) -> dict:
@@ -2174,6 +2481,9 @@ def _solicitar_ocr_desde_estado_frame(
     base_ocr = _fusionar_resumen_live_monitoreo(estado_frame, fuente, placa_controlada)
     base_ocr["evento_id"] = eid
     base_ocr["ruta_snapshot_ocr_evento"] = ocr_pendiente["ruta_recorte"]
+    if ocr_pendiente.get("ruta_frame"):
+        base_ocr["ruta_snapshot_frame_evento"] = ocr_pendiente["ruta_frame"]
+        base_ocr["ruta_frame_evento_en_vivo"] = ocr_pendiente["ruta_frame"]
     _encolar_ocr_evento_vivo_asincrono(eid, str(ocr_pendiente["ruta_recorte"]), base_ocr, config, placa_controlada)
 
 
@@ -2189,6 +2499,8 @@ def _poll_ocr_monitoreo_instantaneo(
     resumen = dict(resumen_live or {})
     listos_antes = set(st.session_state.get("_ocr_eventos_listos") or [])
     hubo = _actualizar_cache_ocr_eventos(config, placa_controlada)
+    hubo_email = _procesar_email_inmediato_eventos_reconocidos(config, placa_controlada)
+    hubo = hubo or hubo_email
     cache = st.session_state.get("ocr_eventos_cache") or {}
     listos_ahora = {int(eid) for eid, entry in cache.items() if entry.get("estado") == "listo"}
     if listos_ahora - listos_antes:
@@ -2285,7 +2597,7 @@ def _sync_cola_item_desde_cache(evento_id: int, entry: dict, config: dict, placa
             continue
         if entry.get("estado") == "listo" and entry.get("resumen_completo"):
             item["estado_ocr"] = "listo"
-            item["resumen"] = dict(entry["resumen_completo"])
+            item["resumen"] = _resumen_notificacion_desde_cache(int(evento_id), entry)
             _actualizar_historial_monitoreo(item["resumen"])
         elif entry.get("datos"):
             res_item = dict(item.get("resumen") or {})
@@ -2298,6 +2610,9 @@ def _sync_cola_item_desde_cache(evento_id: int, entry: dict, config: dict, placa
         elif entry.get("estado") == "error":
             item["estado_ocr"] = "error"
             item["resumen"].update(entry.get("datos") or {})
+        if entry.get("email_procesado"):
+            item["notificacion_procesada"] = True
+            item["notificacion_enviada"] = bool((entry.get("notificacion_correo") or {}).get("enviado"))
         break
     st.session_state.eventos_monitoreo_cola = cola
 
@@ -2442,6 +2757,10 @@ def _registrar_evento_cerrado_monitoreo(
     elif cache_entry.get("estado") == "error":
         resumen.update(cache_entry.get("datos") or {})
         estado_ocr_inicial = "error"
+    if cache_entry.get("notificacion_correo"):
+        resumen["notificacion_correo"] = cache_entry["notificacion_correo"]
+    if cache_entry.get("clasificacion_difusa"):
+        resumen["clasificacion_difusa"] = cache_entry["clasificacion_difusa"]
 
     item = {
         "evento_id": evento_id,
@@ -2450,7 +2769,8 @@ def _registrar_evento_cerrado_monitoreo(
         "ruta_recorte": str(ruta_recorte) if ruta_recorte else None,
         "frame_mejor": evento.get("frame_mejor"),
         "estado_ocr": estado_ocr_inicial,
-        "notificacion_enviada": False,
+        "notificacion_enviada": bool((cache_entry.get("notificacion_correo") or {}).get("enviado")),
+        "notificacion_procesada": bool(cache_entry.get("email_procesado")),
     }
     cola.insert(0, item)
     max_eventos = int(st.session_state.get("historial_maximo_monitoreo", 15) or 15)
@@ -2598,7 +2918,8 @@ def _procesar_cola_ocr_monitoreo(
     st.session_state.ultimo_cola_ocr_ts = ahora
     hubo_cache = _actualizar_cache_ocr_eventos(config, placa_controlada)
     hubo_cola = _procesar_ocr_cola_eventos(config, placa_controlada)
-    hubo = hubo_cache or hubo_cola
+    hubo_email = _procesar_email_inmediato_eventos_reconocidos(config, placa_controlada)
+    hubo = hubo_cache or hubo_cola or hubo_email
     if hubo and frame_actual is not None:
         _procesar_envio_automatico_cola(config, placa_controlada, int(frame_actual), forzar=True)
     elif hubo:
@@ -2621,6 +2942,9 @@ def _limpiar_ocr_asincrono_monitoreo() -> None:
     with _OCR_ASYNC_LOCK:
         _OCR_ASYNC_PENDIENTES.clear()
         _OCR_ASYNC_RESULTADOS.clear()
+    with _EMAIL_ASYNC_LOCK:
+        _EMAIL_ASYNC_PENDIENTES.clear()
+        _EMAIL_ASYNC_RESULTADOS.clear()
 
 
 def _iniciar_contexto_lectura_monitoreo() -> None:
@@ -2637,6 +2961,8 @@ def _iniciar_contexto_lectura_monitoreo() -> None:
     st.session_state.ultimo_resultado_parcial = None
     st.session_state.eventos_monitoreo_cola = []
     st.session_state.ultimo_evento_cerrado_registrado = 0
+    st.session_state.emails_evento_procesados = []
+    st.session_state.placas_email_recientes = {}
     _limpiar_ocr_asincrono_monitoreo()
 
 
@@ -3227,6 +3553,8 @@ def _inicializar_estado_monitoreo() -> None:
         "ocr_eventos_encolados": set(),
         "pasos_grupo_notificados": [],
         "pasos_grupo_descartados": [],
+        "emails_evento_procesados": [],
+        "placas_email_recientes": {},
     }
     for clave, valor in valores_iniciales.items():
         if clave not in st.session_state:

@@ -114,4 +114,9 @@ notificaciones:
   # Agrupa eventos cercanos en frames (mismo paso de vehiculo) y envia solo la mejor lectura.
   envio_automatico: true
   ventana_frames_mismo_paso: 150
+  # En vivo: enviar al tener 2 lecturas consistentes o una lectura de confianza >= 0.80.
+  lecturas_minimas_confirmacion: 2
+  confianza_envio_inmediato: 0.80
+  # Evita doble correo si el tracker divide accidentalmente la misma placa.
+  ventana_frames_mismo_vehiculo: 150
   cooldown_frames_envio: 60
