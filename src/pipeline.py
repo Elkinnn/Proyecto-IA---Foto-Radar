@@ -6,8 +6,9 @@ import json
 import time
 
 import cv2
+import numpy as np
 
-from src.camera_utils import abrir_captura_camara, frame_tiene_senal, probar_indices_camara, resolucion_real_captura, _configurar_captura
+from src.camera_utils import abrir_captura_camara, frame_tiene_senal, probar_indices_camara, resolucion_real_captura, _configurar_captura, mensaje_error_apertura_camara, liberar_captura_camara_activa
 from src.fuzzy_system import clasificar_velocidad
 from src.plate_detector import PlateDetector, dibujar_deteccion
 from src.plate_reader import (
@@ -21,7 +22,7 @@ from src.plate_reader import (
     leer_placa_desde_recorte,
 )
 from src.report_generator import guardar_reporte
-from src.speed_estimator import SpeedTracker, estimar_velocidad
+from src.speed_estimator import METODO_MEDICION, SpeedTracker, estimar_velocidad
 
 
 EXCLUIR_ZONA_SUPERIOR_PORCENTAJE = 0.20
@@ -42,6 +43,10 @@ def _guardar_jpeg_calidad(ruta, imagen, calidad: int = JPEG_CALIDAD_EVIDENCIA) -
 
 OCR_MAX_DISPAROS_EVENTO_VIVO = 3
 SALTO_CENTRO_NUEVO_VEHICULO = 0.12
+TRACK_IOU_MIN = 0.08
+TRACK_DISTANCIA_CENTRO_MAX_REL = 0.16
+TRACK_APARIENCIA_MIN = 0.22
+TRACK_TIMEOUT_MIN_SEGUNDOS = 0.60
 DEFAULT_PLATE_CROP_SELECTION = {
     "enabled": True,
     "buffer_frames": 25,  # FIX-BUFFER: mas frames = mejor chance de recorte nitido
@@ -170,6 +175,7 @@ def procesar_video_monitoreo(
 
 def procesar_camara_monitoreo(
     indice_camara=0,
+    nombre_dispositivo: str = "",
     distancia_lineas_m: float = 10.0,
     limite_velocidad_kmh: float = 30.0,
     posicion_linea_1: float = 0.45,
@@ -198,6 +204,7 @@ def procesar_camara_monitoreo(
 ) -> dict:
     return _procesar_fuente_monitoreo(
         fuente=int(indice_camara),
+        nombre_dispositivo=str(nombre_dispositivo or ""),
         nombre_fuente="Camara en vivo",
         mensaje_error="No se pudo abrir la camara. Pruebe con otro indice de camara o verifique permisos.",
         evidencia_subdir="monitoreo_camara",
@@ -343,6 +350,9 @@ def procesar_frame_video_monitoreo(
         "velocidad": estado_frame["velocidad"],
         "evento_activo": estado_frame["evento_activo"],
         "evento_id": estado_frame["evento_id"],
+        "tracks_activos": estado_frame.get("tracks_activos", 0),
+        "track_ids_activos": estado_frame.get("track_ids_activos", []),
+        "track_id_principal": estado_frame.get("track_id_principal"),
         "mejor_confianza_evento": estado_frame["mejor_confianza_evento"],
         "frame_mejor_evento": estado_frame["frame_mejor_evento"],
         "frames_sin_deteccion": estado_frame["frames_sin_deteccion"],
@@ -377,6 +387,7 @@ def _procesar_fuente_monitoreo(
     camera_width: int | None = None,
     camera_height: int | None = None,
     camera_fps: int | None = None,
+    nombre_dispositivo: str = "",
     guardar_debug: bool = False,
     frame_callback=None,
     progreso_callback=None,
@@ -390,15 +401,19 @@ def _procesar_fuente_monitoreo(
             camera_width=camera_width,
             camera_height=camera_height,
             camera_fps=camera_fps,
+            nombre_dispositivo=str(nombre_dispositivo or ""),
         )
     else:
         captura = cv2.VideoCapture(fuente)
     detector = _obtener_detector_cache(str(model_path) if model_path else None)
 
     if not captura.isOpened():
+        msg = mensaje_error
+        if isinstance(fuente, int):
+            msg = mensaje_error_apertura_camara(int(fuente))
         return {
             "estado": "error",
-            "mensaje_estado": mensaje_error,
+            "mensaje_estado": msg,
             "frames_procesados": 0,
             "fps": 0.0,
             "ancho": 0,
@@ -434,7 +449,7 @@ def _procesar_fuente_monitoreo(
         if fps_real > 0:
             fps = fps_real
         if camera_width and ancho < int(camera_width) * 0.85:
-            _configurar_captura(captura, camera_width, camera_height, camera_fps)
+            _configurar_captura(captura, camera_width, camera_height, camera_fps, nombre_dispositivo)
             ancho_real, alto_real, fps_real = resolucion_real_captura(captura)
             if ancho_real > 0 and alto_real > 0:
                 ancho, alto = ancho_real, alto_real
@@ -549,41 +564,29 @@ def _procesar_fuente_monitoreo(
                 posicion_linea_1,
                 posicion_linea_2,
             )
-            tracker_ligero = estado_persistencia.get("speed_tracker")
-            velocidad_ligera = tracker_ligero.resumen() if tracker_ligero is not None else {}
             bbox_mantenida = False
-            if estado_persistencia.get("ultima_bbox_valida") is not None or estado_persistencia.get("evento_activo"):
-                estado_persistencia["frames_desde_ultima_deteccion"] = (
-                    int(estado_persistencia.get("frames_desde_ultima_deteccion") or 0) + 1
+            tracks_multi = estado_persistencia.get("_multi_tracks") or {}
+            if tracks_multi:
+                for track_id, track in tracks_multi.items():
+                    bbox_m = track.get("ultima_bbox_valida")
+                    if bbox_m is None:
+                        continue
+                    conf_m = float(track.get("ultima_confianza_valida") or 0.0)
+                    _dibujar_bbox_placa(frame_visual, bbox_m, f"placa #{track_id} {conf_m:.2f}", (0, 220, 220))
+                    _dibujar_centro_placa(frame_visual, bbox_m)
+                    bbox_mantenida = True
+                principal_ligero = max(
+                    tracks_multi.values(),
+                    key=lambda track: (
+                        int(track.get("ultimo_frame_visto") or 0),
+                        float(track.get("ultima_confianza_valida") or 0.0),
+                    ),
                 )
-                estado_persistencia["frames_sin_deteccion"] = (
-                    int(estado_persistencia.get("frames_sin_deteccion") or 0) + 1
-                )
-            if (
-                estado_persistencia.get("ultima_bbox_valida") is not None
-                and estado_persistencia.get("bbox_persistente_activa")
-                and int(estado_persistencia.get("frames_desde_ultima_deteccion") or 999) <= persistencia_frames
-            ):
-                bbox_m = estado_persistencia["ultima_bbox_valida"]
-                conf_m = float(estado_persistencia.get("ultima_confianza_valida") or 0.0)
-                _dibujar_bbox_placa(
-                    frame_visual,
-                    bbox_m,
-                    f"placa mantenida {conf_m:.2f}",
-                    (0, 220, 220),
-                )
-                _dibujar_centro_placa(frame_visual, bbox_m)
-                if tracker_ligero is not None:
-                    velocidad_ligera = tracker_ligero.actualizar(bbox_m, numero_frame_actual)
-                bbox_mantenida = True
-            elif (
-                estado_persistencia.get("evento_activo")
-                and int(estado_persistencia.get("frames_sin_deteccion") or 0) > persistencia_frames
-            ):
-                _cerrar_evento_placa(estado_persistencia, numero_frame_actual)
-                _limpiar_seguimiento_bbox(estado_persistencia)
-            elif int(estado_persistencia.get("frames_desde_ultima_deteccion") or 0) > persistencia_frames:
-                _limpiar_seguimiento_bbox(estado_persistencia)
+                _sincronizar_estado_raiz_desde_tracks(estado_persistencia, principal_ligero)
+                tracker_ligero = principal_ligero.get("speed_tracker")
+            else:
+                tracker_ligero = estado_persistencia.get("speed_tracker")
+            velocidad_ligera = tracker_ligero.resumen() if tracker_ligero is not None else {}
             if tracker_ligero is not None:
                 _dibujar_info_velocidad(frame_visual, velocidad_ligera)
             if frame_callback:
@@ -602,6 +605,9 @@ def _procesar_fuente_monitoreo(
                         "resolucion_captura": f"{ancho_actual}x{alto_actual}",
                         "evento_id": estado_persistencia.get("evento_id"),
                         "evento_activo": bool(estado_persistencia.get("evento_activo")),
+                        "tracks_activos": len(estado_persistencia.get("_multi_tracks") or {}),
+                        "track_ids_activos": sorted((estado_persistencia.get("_multi_tracks") or {}).keys()),
+                        "track_id_principal": estado_persistencia.get("_track_principal_id"),
                         "estado_placa": (
                             "Mantenida"
                             if bbox_mantenida
@@ -611,8 +617,16 @@ def _procesar_fuente_monitoreo(
                         "ruta_recorte_evento_en_vivo": estado_persistencia.get("ruta_recorte_evento_en_vivo"),
                         "ruta_snapshot_ocr_evento": estado_persistencia.get("ruta_snapshot_ocr_evento"),
                         "velocidad": velocidad_ligera,
-                        "evento_recien_cerrado": estado_persistencia.pop("_ultimo_evento_cerrado", None),
-                        "ocr_evento_pendiente": estado_persistencia.pop("_ocr_evento_pendiente", None),
+                        "evento_recien_cerrado": (
+                            estado_persistencia.setdefault("_eventos_recien_cerrados", []).pop(0)
+                            if estado_persistencia.get("_eventos_recien_cerrados")
+                            else None
+                        ),
+                        "ocr_evento_pendiente": (
+                            estado_persistencia.setdefault("_ocr_eventos_pendientes", []).pop(0)
+                            if estado_persistencia.get("_ocr_eventos_pendientes")
+                            else None
+                        ),
                     },
                 )
                 frames_mostrados += 1
@@ -750,6 +764,9 @@ def _procesar_fuente_monitoreo(
                 "estado_persistencia": estado_persistencia,
                 "evento_activo": estado_frame["evento_activo"],
                 "evento_id": estado_frame["evento_id"],
+                "tracks_activos": estado_frame.get("tracks_activos", 0),
+                "track_ids_activos": estado_frame.get("track_ids_activos", []),
+                "track_id_principal": estado_frame.get("track_id_principal"),
                 "mejor_confianza_evento": estado_frame["mejor_confianza_evento"],
                 "frame_mejor_evento": estado_frame["frame_mejor_evento"],
                 "frames_sin_deteccion": estado_frame["frames_sin_deteccion"],
@@ -790,14 +807,25 @@ def _procesar_fuente_monitoreo(
         if max_frames > 0 and frames_procesados >= max_frames:
             break
 
-    captura.release()
+    if isinstance(fuente, int):
+        liberar_captura_camara_activa(captura)
+    else:
+        captura.release()
 
     frame_final = start_frame + frames_procesados
 
     if estado_persistencia.get("buffer_recortes_placa") and not estado_persistencia.get("_tiempo_real"):
         _seleccionar_mejor_recorte_buffer(estado_persistencia)
 
-    if estado_persistencia["evento_activo"]:
+    tracks_finales = estado_persistencia.get("_multi_tracks") or {}
+    if tracks_finales:
+        for track in list(tracks_finales.values()):
+            _cerrar_evento_placa(track, frame_final)
+            _encolar_salidas_track(estado_persistencia, track)
+            ruta_mejor_recorte_evento = track.get("ruta_mejor_recorte_evento") or ruta_mejor_recorte_evento
+        tracks_finales.clear()
+        _sincronizar_estado_raiz_desde_tracks(estado_persistencia, None)
+    elif estado_persistencia["evento_activo"]:
         if estado_persistencia.get("_tiempo_real"):
             _flush_recorte_en_vivo(estado_persistencia, forzar=True)
         _cerrar_evento_placa(estado_persistencia, frame_final)
@@ -867,6 +895,9 @@ def _procesar_fuente_monitoreo(
         "mejor_frame_bbox_placa": estado_persistencia.get("ruta_mejor_frame_bbox_placa"),
         "evento_activo": estado_persistencia["evento_activo"],
         "evento_id": estado_persistencia["evento_id"],
+        "tracks_activos": len(estado_persistencia.get("_multi_tracks") or {}),
+        "track_ids_activos": sorted((estado_persistencia.get("_multi_tracks") or {}).keys()),
+        "track_id_principal": estado_persistencia.get("_track_principal_id"),
         "mejor_confianza_evento": estado_persistencia["mejor_confianza_evento"] if estado_persistencia["mejor_confianza_evento"] is not None else mejor_confianza_evento,
         "frame_mejor_evento": estado_persistencia["frame_mejor_evento"] or frame_mejor_evento,
         "frames_sin_deteccion": estado_persistencia["frames_sin_deteccion"],
@@ -911,6 +942,10 @@ def _crear_estado_persistencia() -> dict:
         "ultimo_tiempo_lector_cnn_ms": None,
         "eventos_cerrados": [],
         "_ultimo_evento_cerrado": None,
+        "_multi_tracks": {},
+        "_eventos_recien_cerrados": [],
+        "_ocr_eventos_pendientes": [],
+        "_track_principal_id": None,
     }
 
 
@@ -1799,149 +1834,45 @@ def _procesar_frame_monitoreo(
 
     _dibujar_marcas_monitoreo(frame_visual, distancia_lineas_m, limite_velocidad_kmh, nombre_fuente, posicion_linea_1, posicion_linea_2)
 
-    if detecciones_validas:
-        detecciones_frame = len(detecciones_validas)
-        deteccion = max(detecciones_validas, key=lambda item: item["confianza"])
-        bbox_nueva = deteccion["bbox"]
-        bbox_anterior = estado_persistencia["ultima_bbox_valida"]
-
-        if (
-            estado_persistencia["bbox_persistente_activa"]
-            and estado_persistencia["evento_activo"]
-            and bbox_anterior is not None
-            and _es_nuevo_vehiculo_placa(bbox_nueva, bbox_anterior, frame_limpio.shape[1])
-        ):
-            _cerrar_evento_placa(estado_persistencia, numero_frame)
-            estado_persistencia["bbox_persistente_activa"] = False
-            estado_persistencia["ultima_bbox_valida"] = None
-
-        bbox_suavizada = _suavizar_bbox(bbox_nueva, estado_persistencia["ultima_bbox_valida"])
-
-        if not estado_persistencia["bbox_persistente_activa"]:
-            eventos_placa += 1
-            _iniciar_evento_placa(estado_persistencia, eventos_placa, numero_frame)
-            _reiniciar_speed_tracker(
-                estado_persistencia,
-                frame_visual.shape[0],
-                distancia_lineas_m,
-                fps,
-                posicion_linea_1,
-                posicion_linea_2,
-            )
-
-        estado_persistencia["ultima_bbox_valida"] = bbox_suavizada
-        estado_persistencia["ultima_confianza_valida"] = float(deteccion["confianza"])
-        estado_persistencia["frames_desde_ultima_deteccion"] = 0
-        estado_persistencia["frames_sin_deteccion"] = 0
-        estado_persistencia["frame_ultimo_evento"] = numero_frame
-        estado_persistencia["eventos_placa"] = eventos_placa
-        estado_persistencia["bbox_persistente_activa"] = True
-        estado_placa = "Detectada"
-
-        x1, y1, x2, y2 = bbox_suavizada
-        confianza = float(deteccion["confianza"])
-        _dibujar_bbox_placa(frame_visual, bbox_suavizada, f"placa {confianza:.2f}", (0, 180, 0))
-        _registrar_candidato_recorte(
-            estado_persistencia,
-            frame_limpio,
-            frame_visual,
-            bbox_suavizada,
-            deteccion["recorte_placa"],
-            confianza,
-            numero_frame,
-            fps,
-            plate_crop_selection,
+    detecciones_frame = len(detecciones_validas)
+    principal, estado_placa, datos_track = _actualizar_tracks_multiobjeto(
+        estado_persistencia,
+        detecciones_validas,
+        frame_limpio,
+        frame_visual,
+        numero_frame,
+        fps,
+        frecuencia_deteccion,
+        persistencia_frames,
+        distancia_lineas_m,
+        posicion_linea_1,
+        posicion_linea_2,
+        plate_crop_selection,
+        yolo_ejecutado,
+    )
+    eventos_placa = int(estado_persistencia.get("eventos_placa") or eventos_placa)
+    ultima_deteccion = datos_track.get("ultima_deteccion")
+    velocidad = datos_track.get("velocidad") or (
+        principal.get("speed_tracker").resumen()
+        if principal and principal.get("speed_tracker") is not None
+        else velocidad
+    )
+    if principal:
+        ultimo_recorte_placa = (
+            principal.get("ruta_recorte_evento_en_vivo")
+            or principal.get("ruta_mejor_recorte_evento")
+            or principal.get("ultimo_recorte_placa")
         )
-        _actualizar_mejor_evento_placa(
-            estado_persistencia,
-            confianza,
-            bbox_suavizada,
-            frame_visual,
-            deteccion["recorte_placa"],
-            numero_frame,
-        )
-        evento_id_actual = int(estado_persistencia.get("evento_id") or eventos_placa or 0)
-        _intentar_disparar_ocr_snapshot_evento(
-            estado_persistencia,
-            evento_id_actual,
-            deteccion["recorte_placa"],
-            frame_visual,
-            confianza,
-            numero_frame,
-        )
-        velocidad = estado_persistencia["speed_tracker"].actualizar(bbox_suavizada, numero_frame)
-        _dibujar_centro_placa(frame_visual, bbox_suavizada)
-        _guardar_evidencia_velocidad(frame_visual, velocidad)
-
-        if numero_frame - estado_persistencia["ultimo_frame_recorte"] >= GUARDAR_RECORTE_CADA_N_FRAMES:
-            if not _tiempo_real_activo(estado_persistencia):
-                recorte_path = placas_dir / f"placa_{numero_frame:06d}_{eventos_placa:03d}.jpg"
-                _guardar_jpeg_calidad(recorte_path, deteccion["recorte_placa"])
-                ultimo_recorte_placa = str(recorte_path)
-                estado_persistencia["ultimo_recorte_placa"] = str(recorte_path)
-                estado_persistencia["ultimo_frame_recorte"] = numero_frame
-            else:
-                ultimo_recorte_placa = estado_persistencia.get("ruta_recorte_evento_en_vivo")
-        else:
-            ultimo_recorte_placa = estado_persistencia["ultimo_recorte_placa"]
-
-        ultima_deteccion = {
-            "bbox": bbox_suavizada,
-            "confianza": confianza,
-            "recorte_placa": ultimo_recorte_placa,
-            "frame_deteccion": estado_persistencia.get("ultimo_frame_deteccion"),
-        }
-
-        if ultimo_recorte_placa and guardar_debug:
-            frame_deteccion_path = placas_dir / f"frame_deteccion_{numero_frame:06d}.jpg"
-            cv2.imwrite(str(frame_deteccion_path), frame_visual)
-            ultimo_frame_deteccion = str(frame_deteccion_path)
-            estado_persistencia["ultimo_frame_deteccion"] = ultimo_frame_deteccion
-            cv2.imwrite(str(evidencia_dir / "ultimo_frame_con_deteccion.jpg"), frame_visual)
-            ultima_deteccion["frame_deteccion"] = ultimo_frame_deteccion
-        else:
-            ultimo_frame_deteccion = estado_persistencia["ultimo_frame_deteccion"]
-    else:
-        estado_persistencia["frames_desde_ultima_deteccion"] += 1
-        estado_persistencia["frames_sin_deteccion"] += 1
-        if (
-            estado_persistencia["ultima_bbox_valida"] is not None
-            and estado_persistencia["frames_desde_ultima_deteccion"] <= persistencia_frames
-        ):
-            estado_placa = "Mantenida"
-            confianza = estado_persistencia["ultima_confianza_valida"] or 0.0
-            _dibujar_bbox_placa(
-                frame_visual,
-                estado_persistencia["ultima_bbox_valida"],
-                f"placa mantenida {confianza:.2f}",
-                (0, 220, 220),
-            )
-            ultima_deteccion = {
-                "bbox": estado_persistencia["ultima_bbox_valida"],
-                "confianza": confianza,
-                "recorte_placa": estado_persistencia["ultimo_recorte_placa"],
-                "frame_deteccion": estado_persistencia["ultimo_frame_deteccion"],
-            }
-            ultimo_recorte_placa = estado_persistencia["ultimo_recorte_placa"]
-            ultimo_frame_deteccion = estado_persistencia["ultimo_frame_deteccion"]
-            if estado_persistencia.get("speed_tracker") is not None and estado_persistencia["ultima_bbox_valida"] is not None:
-                velocidad = estado_persistencia["speed_tracker"].actualizar(
-                    estado_persistencia["ultima_bbox_valida"],
-                    numero_frame,
-                )
-        else:
-            if estado_persistencia["evento_activo"] and estado_persistencia["frames_sin_deteccion"] > persistencia_frames:
-                _cerrar_evento_placa(estado_persistencia, numero_frame)
-            estado_persistencia["bbox_persistente_activa"] = False
-            if int(estado_persistencia.get("frames_desde_ultima_deteccion") or 0) > persistencia_frames:
-                _limpiar_seguimiento_bbox(estado_persistencia)
-            if frecuencia_deteccion > 0 and numero_frame % frecuencia_deteccion == 0 and detector.model is not None:
-                mensaje_detector = "No se detecto placa valida fuera de la zona superior excluida."
+        ultimo_frame_deteccion = principal.get("ultimo_frame_deteccion")
+    elif frecuencia_deteccion > 0 and numero_frame % frecuencia_deteccion == 0 and detector.model is not None:
+        mensaje_detector = "No se detecto placa valida fuera de la zona superior excluida."
 
     _dibujar_info_velocidad(frame_visual, velocidad)
 
-    evento_recien_cerrado = estado_persistencia.pop("_ultimo_evento_cerrado", None)
-    ocr_evento_pendiente = estado_persistencia.pop("_ocr_evento_pendiente", None)
+    eventos_cerrados_pendientes = estado_persistencia.setdefault("_eventos_recien_cerrados", [])
+    ocr_pendientes = estado_persistencia.setdefault("_ocr_eventos_pendientes", [])
+    evento_recien_cerrado = eventos_cerrados_pendientes.pop(0) if eventos_cerrados_pendientes else None
+    ocr_evento_pendiente = ocr_pendientes.pop(0) if ocr_pendientes else None
 
     return {
         "frame_visual": frame_visual,
@@ -1966,6 +1897,9 @@ def _procesar_frame_monitoreo(
         "estado_persistencia": estado_persistencia,
         "evento_activo": estado_persistencia["evento_activo"],
         "evento_id": estado_persistencia["evento_id"],
+        "tracks_activos": len(estado_persistencia.get("_multi_tracks") or {}),
+        "track_ids_activos": sorted((estado_persistencia.get("_multi_tracks") or {}).keys()),
+        "track_id_principal": estado_persistencia.get("_track_principal_id"),
         "mejor_confianza_evento": estado_persistencia["mejor_confianza_evento"],
         "frame_mejor_evento": estado_persistencia["frame_mejor_evento"],
         "frames_sin_deteccion": estado_persistencia["frames_sin_deteccion"],
@@ -2086,6 +2020,242 @@ def _es_nuevo_vehiculo_placa(bbox_nueva: list[int], bbox_anterior: list[int] | N
     cx_n, _ = _centro_bbox_xy(bbox_nueva)
     cx_a, _ = _centro_bbox_xy(bbox_anterior)
     return abs(cx_n - cx_a) > max(int(ancho_frame), 1) * SALTO_CENTRO_NUEVO_VEHICULO
+
+
+def _crear_estado_track_placa(evento_id: int, numero_frame: int, tiempo_real: bool) -> dict:
+    track = _crear_estado_persistencia()
+    for clave in ("_multi_tracks", "_eventos_recien_cerrados", "_ocr_eventos_pendientes", "_track_principal_id"):
+        track.pop(clave, None)
+    track["_tiempo_real"] = bool(tiempo_real)
+    track["track_id"] = int(evento_id)
+    track["eventos_placa"] = int(evento_id)
+    track["detecciones_track"] = 0
+    track["ultimo_frame_visto"] = int(numero_frame)
+    track["apariencia_placa"] = None
+    _iniciar_evento_placa(track, int(evento_id), int(numero_frame))
+    return track
+
+
+def _firma_apariencia_placa(recorte) -> np.ndarray | None:
+    if recorte is None or getattr(recorte, "size", 0) == 0:
+        return None
+    try:
+        gris = asegurar_grayscale(recorte)
+        firma = cv2.resize(gris, (32, 16), interpolation=cv2.INTER_AREA).astype(np.float32).reshape(-1)
+        firma -= float(firma.mean())
+        norma = float(np.linalg.norm(firma))
+        return firma / norma if norma > 1e-6 else firma
+    except Exception:
+        return None
+
+
+def _similitud_apariencia_placa(firma_a, firma_b) -> float:
+    if firma_a is None or firma_b is None:
+        return 0.5
+    try:
+        correlacion = float(np.clip(np.dot(firma_a, firma_b), -1.0, 1.0))
+        return (correlacion + 1.0) / 2.0
+    except Exception:
+        return 0.5
+
+
+def _distancia_centros_relativa(bbox_a: list[int], bbox_b: list[int], ancho: int, alto: int) -> float:
+    ax, ay = _centro_bbox_xy(bbox_a)
+    bx, by = _centro_bbox_xy(bbox_b)
+    diagonal = max(float(np.hypot(ancho, alto)), 1.0)
+    return float(np.hypot(ax - bx, ay - by) / diagonal)
+
+
+def _asociar_detecciones_a_tracks(
+    tracks: dict[int, dict],
+    detecciones: list[dict],
+    ancho_frame: int,
+    alto_frame: int,
+) -> tuple[dict[int, int], set[int]]:
+    candidatos = []
+    firmas = {idx: _firma_apariencia_placa(det.get("recorte_placa")) for idx, det in enumerate(detecciones)}
+    for track_id, track in tracks.items():
+        bbox_track = track.get("ultima_bbox_valida")
+        if bbox_track is None:
+            continue
+        for idx, deteccion in enumerate(detecciones):
+            bbox = deteccion["bbox"]
+            iou = _iou_xyxy(bbox_track, bbox)
+            distancia = _distancia_centros_relativa(bbox_track, bbox, ancho_frame, alto_frame)
+            apariencia = _similitud_apariencia_placa(track.get("apariencia_placa"), firmas[idx])
+            coincide_geometria = iou >= TRACK_IOU_MIN or distancia <= TRACK_DISTANCIA_CENTRO_MAX_REL
+            if not coincide_geometria:
+                continue
+            if iou >= 0.45 and apariencia < TRACK_APARIENCIA_MIN:
+                continue
+            puntaje = (iou * 2.0) + max(0.0, 1.0 - distancia / TRACK_DISTANCIA_CENTRO_MAX_REL) + apariencia * 0.35
+            candidatos.append((puntaje, int(track_id), idx))
+
+    asignaciones: dict[int, int] = {}
+    detecciones_usadas: set[int] = set()
+    for _, track_id, idx in sorted(candidatos, reverse=True):
+        if track_id in asignaciones or idx in detecciones_usadas:
+            continue
+        asignaciones[track_id] = idx
+        detecciones_usadas.add(idx)
+    return asignaciones, detecciones_usadas
+
+
+def _encolar_salidas_track(estado_raiz: dict, track: dict) -> None:
+    pendiente = track.pop("_ocr_evento_pendiente", None)
+    if pendiente:
+        cola_ocr = estado_raiz.setdefault("_ocr_eventos_pendientes", [])
+        clave = (int(pendiente.get("evento_id") or 0), str(pendiente.get("ruta_recorte") or ""))
+        if not any((int(item.get("evento_id") or 0), str(item.get("ruta_recorte") or "")) == clave for item in cola_ocr):
+            cola_ocr.append(pendiente)
+
+    cerrado = track.pop("_ultimo_evento_cerrado", None)
+    if cerrado:
+        estado_raiz.setdefault("_eventos_recien_cerrados", []).append(cerrado)
+        estado_raiz.setdefault("eventos_cerrados", []).append(cerrado)
+
+
+def _sincronizar_estado_raiz_desde_tracks(estado: dict, track_principal: dict | None) -> None:
+    tracks = estado.get("_multi_tracks") or {}
+    estado["evento_activo"] = bool(tracks)
+    if not track_principal:
+        estado["bbox_persistente_activa"] = False
+        estado["ultima_bbox_valida"] = None
+        estado["ultima_confianza_valida"] = None
+        estado["frames_desde_ultima_deteccion"] = 0
+        estado["frames_sin_deteccion"] = 0
+        return
+    estado["_track_principal_id"] = track_principal.get("track_id")
+    for clave in (
+        "evento_id",
+        "ultima_bbox_valida",
+        "ultima_confianza_valida",
+        "frames_desde_ultima_deteccion",
+        "ultimo_recorte_placa",
+        "ultimo_frame_deteccion",
+        "bbox_persistente_activa",
+        "mejor_confianza_evento",
+        "mejor_bbox_evento",
+        "frame_inicio_evento",
+        "frame_mejor_evento",
+        "frame_ultimo_evento",
+        "frames_sin_deteccion",
+        "ruta_mejor_frame_evento",
+        "ruta_mejor_recorte_evento",
+        "ruta_recorte_evento_en_vivo",
+        "ruta_snapshot_ocr_evento",
+        "speed_tracker",
+    ):
+        estado[clave] = track_principal.get(clave)
+
+
+def _actualizar_tracks_multiobjeto(
+    estado: dict,
+    detecciones: list[dict],
+    frame_limpio,
+    frame_visual,
+    numero_frame: int,
+    fps: float,
+    frecuencia_deteccion: int,
+    persistencia_frames: int,
+    distancia_lineas_m: float,
+    posicion_linea_1: float,
+    posicion_linea_2: float,
+    plate_crop_selection: dict | None,
+    yolo_ejecutado: bool,
+) -> tuple[dict | None, str, dict]:
+    tracks: dict[int, dict] = estado.setdefault("_multi_tracks", {})
+    asignaciones, usadas = _asociar_detecciones_a_tracks(
+        tracks, detecciones, frame_limpio.shape[1], frame_limpio.shape[0]
+    )
+
+    for idx, deteccion in enumerate(detecciones):
+        if idx in usadas:
+            continue
+        estado["eventos_placa"] = int(estado.get("eventos_placa") or 0) + 1
+        track_id = int(estado["eventos_placa"])
+        tracks[track_id] = _crear_estado_track_placa(track_id, numero_frame, bool(estado.get("_tiempo_real")))
+        asignaciones[track_id] = idx
+
+    tracks_detectados: set[int] = set()
+    velocidades: dict[int, dict] = {}
+    for track_id, idx in asignaciones.items():
+        track = tracks.get(track_id)
+        if not track:
+            continue
+        deteccion = detecciones[idx]
+        bbox = _suavizar_bbox(deteccion["bbox"], track.get("ultima_bbox_valida"))
+        confianza = float(deteccion["confianza"])
+        recorte = deteccion.get("recorte_placa")
+        track["ultima_bbox_valida"] = bbox
+        track["ultima_confianza_valida"] = confianza
+        track["frames_desde_ultima_deteccion"] = 0
+        track["frames_sin_deteccion"] = 0
+        track["frame_ultimo_evento"] = numero_frame
+        track["ultimo_frame_visto"] = numero_frame
+        track["bbox_persistente_activa"] = True
+        track["detecciones_track"] = int(track.get("detecciones_track") or 0) + 1
+        firma = _firma_apariencia_placa(recorte)
+        if firma is not None and (track.get("apariencia_placa") is None or confianza >= float(track.get("mejor_confianza_evento") or 0.0)):
+            track["apariencia_placa"] = firma
+        if track.get("speed_tracker") is None:
+            _reiniciar_speed_tracker(track, frame_visual.shape[0], distancia_lineas_m, fps, posicion_linea_1, posicion_linea_2)
+
+        _registrar_candidato_recorte(
+            track, frame_limpio, frame_visual, bbox, recorte, confianza, numero_frame, fps, plate_crop_selection
+        )
+        _actualizar_mejor_evento_placa(track, confianza, bbox, frame_visual, recorte, numero_frame)
+        _intentar_disparar_ocr_snapshot_evento(track, track_id, recorte, frame_visual, confianza, numero_frame)
+        velocidades[track_id] = track["speed_tracker"].actualizar(bbox, numero_frame)
+        _dibujar_bbox_placa(frame_visual, bbox, f"placa #{track_id} {confianza:.2f}", (0, 180, 0))
+        _dibujar_centro_placa(frame_visual, bbox)
+        tracks_detectados.add(track_id)
+        _encolar_salidas_track(estado, track)
+
+    incremento = max(int(frecuencia_deteccion or 1), 1) if yolo_ejecutado else 0
+    timeout = max(int(persistencia_frames), int(max(fps, 1.0) * TRACK_TIMEOUT_MIN_SEGUNDOS), incremento * 2)
+    cerrar_ids = []
+    for track_id, track in tracks.items():
+        if track_id in tracks_detectados:
+            continue
+        track["frames_desde_ultima_deteccion"] = int(track.get("frames_desde_ultima_deteccion") or 0) + incremento
+        track["frames_sin_deteccion"] = int(track.get("frames_sin_deteccion") or 0) + incremento
+        if track["frames_desde_ultima_deteccion"] <= int(persistencia_frames):
+            bbox = track.get("ultima_bbox_valida")
+            if bbox is not None:
+                _dibujar_bbox_placa(
+                    frame_visual, bbox, f"placa #{track_id} mantenida", (0, 220, 220)
+                )
+        if incremento > 0 and track["frames_sin_deteccion"] > timeout:
+            _cerrar_evento_placa(track, numero_frame)
+            _encolar_salidas_track(estado, track)
+            cerrar_ids.append(track_id)
+    for track_id in cerrar_ids:
+        tracks.pop(track_id, None)
+
+    visibles = [tracks[tid] for tid in tracks_detectados if tid in tracks]
+    candidatos_principal = visibles or list(tracks.values())
+    principal = max(
+        candidatos_principal,
+        key=lambda track: (
+            int(track.get("ultimo_frame_visto") or 0),
+            float(track.get("ultima_confianza_valida") or 0.0),
+        ),
+        default=None,
+    )
+    _sincronizar_estado_raiz_desde_tracks(estado, principal)
+    velocidad = velocidades.get(int(principal.get("track_id"))) if principal else None
+    estado_placa = "Detectada" if tracks_detectados else ("Mantenida" if tracks else "Pendiente")
+    ultima = None
+    if principal:
+        ultima = {
+            "bbox": principal.get("ultima_bbox_valida"),
+            "confianza": principal.get("ultima_confianza_valida"),
+            "recorte_placa": principal.get("ruta_recorte_evento_en_vivo") or principal.get("ruta_mejor_recorte_evento"),
+            "frame_deteccion": principal.get("ultimo_frame_deteccion"),
+            "track_id": principal.get("track_id"),
+        }
+    return principal, estado_placa, {"velocidad": velocidad, "ultima_deteccion": ultima}
 
 
 def _intentar_disparar_ocr_snapshot_evento(

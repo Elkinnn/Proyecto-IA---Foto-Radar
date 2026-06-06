@@ -115,6 +115,19 @@ def _crear_snapshot_ocr_inmutable(
     return str(destino)
 
 
+def _opciones_camara_monitoreo() -> list[dict]:
+    """Camara(s) registradas en Windows para el selector de monitoreo en vivo."""
+    resumen = resumen_camaras_sistema()
+    nombres = resumen.get("nombres") or []
+    indice_default = (resumen.get("indices_camo") or resumen.get("indices_iriun") or [0])[0]
+    if not nombres:
+        return [{"indice": i, "etiqueta": f"Camara {i}", "default": i == 0} for i in range(4)]
+    opciones = [{"indice": i, "nombre": nombre, "etiqueta": f"{i} — {nombre}"} for i, nombre in enumerate(nombres)]
+    for item in opciones:
+        item["default"] = item["indice"] == indice_default
+    return opciones
+
+
 def _config_modo_rendimiento(config: dict, modo: str) -> dict:
     clave = PERFORMANCE_MODE_LABELS.get(modo, "balanceado")
     defaults = {
@@ -890,6 +903,27 @@ def _extraer_placa_desde_resumen(resumen: dict) -> str:
     return ""
 
 
+def _extraer_placa_individual_desde_resumen(resumen: dict) -> str:
+    """Lectura que corresponde al recorte y predicciones CNN mostrados."""
+    predicciones = resumen.get("predicciones_caracteres_ocr") or []
+    texto_predicciones = "".join(
+        str(pred.get("caracter_predicho") or "").strip()
+        for pred in predicciones
+    )
+    candidatos = (
+        texto_predicciones,
+        resumen.get("placa_individual_ultimo_frame"),
+        resumen.get("placa_individual"),
+    )
+    for candidato in candidatos:
+        texto = str(candidato or "").strip().upper().replace("-", "").replace(" ", "")
+        if _es_codigo_error_lectura(texto):
+            continue
+        if len(texto) in (6, 7) and texto.isalnum():
+            return texto
+    return ""
+
+
 def _entrada_cache_ocr_evento(evento_id: int | None) -> dict:
     if evento_id is None:
         return {}
@@ -1572,7 +1606,8 @@ def _render_panel_deteccion_esencial(
     mostrar_historial: bool = False,
 ) -> dict:
     """Vista principal del operador: placa, velocidad, estado y recorte."""
-    placa = _obtener_texto_placa_ui(resumen)
+    placa_individual_visible = _extraer_placa_individual_desde_resumen(resumen)
+    placa = placa_individual_visible or _obtener_texto_placa_ui(resumen)
     ruta_recorte = _obtener_ruta_recorte_ui(resumen)
     velocidad = resumen.get("velocidad") or {}
     velocidad_kmh = velocidad.get("velocidad_kmh")
@@ -1646,11 +1681,12 @@ def _render_panel_deteccion_esencial(
         lecturas_n = int(resumen.get("lecturas_usadas_evento") or resumen.get("recortes_usados_evento") or 0)
         if lecturas_n > 0:
             st.caption(f"Lectura consolidada · {lecturas_n} frame(s) analizados")
-        ultima_frame = resumen.get("placa_individual_ultimo_frame") or resumen.get("placa_individual")
-        placa_mostrada = _extraer_placa_desde_resumen(resumen)
-        ultima_norm = _extraer_placa_desde_resumen({"texto_ocr_corregido": ultima_frame}) if ultima_frame else ""
-        if ultima_norm and placa_mostrada and ultima_norm != placa_mostrada:
-            st.caption(f"Ultimo frame descartado: {ultima_norm}")
+        placa_consolidada = _extraer_placa_desde_resumen(resumen)
+        if placa_individual_visible and placa_consolidada and placa_individual_visible != placa_consolidada:
+            st.caption(
+                f"Lectura consolidada previa: {placa_consolidada}. "
+                "El titulo corresponde al recorte y a las predicciones por caracter mostradas."
+            )
 
     _render_pipeline_preprocesamiento_ocr(resumen)
 
@@ -1914,6 +1950,22 @@ def _puntaje_consolidado_evento(consolidado: dict | None) -> float:
     usadas = int(consolidado.get("cantidad_lecturas_usadas") or 0)
     puntaje += min(usadas, 5) * 4.0
     return puntaje
+
+
+def _debe_usar_nuevo_consolidado(nuevo: dict | None, previo: dict | None) -> bool:
+    """Evita conservar una placa vieja cuando la votacion actual ya es valida."""
+    if not nuevo:
+        return False
+    texto_nuevo = str(nuevo.get("texto_final") or "").strip()
+    if not texto_nuevo:
+        return False
+    if not previo or not str(previo.get("texto_final") or "").strip():
+        return True
+    if nuevo.get("formato_valido"):
+        return True
+    if previo.get("formato_valido"):
+        return False
+    return _puntaje_consolidado_evento(nuevo) >= _puntaje_consolidado_evento(previo)
 
 
 def _lectura_existe_para_ruta(lecturas: list, ruta_recorte: str) -> bool:
@@ -2686,8 +2738,9 @@ def _aplicar_resultado_ocr_monitoreo(
     st.session_state.lecturas_evento_placa_monitoreo = lecturas
     consolidado = consolidar_lecturas_evento_placa(list(reversed(lecturas)), max_lecturas=5)
     puntaje_nuevo = _puntaje_consolidado_evento(consolidado)
+    consolidado_previo = entry_cache.get("mejor_consolidado") if evento_id is not None else None
     puntaje_previo = float(entry_cache.get("mejor_puntaje_consolidado") or -1.0) if evento_id is not None else -1.0
-    usar_nuevo = puntaje_nuevo >= puntaje_previo
+    usar_nuevo = _debe_usar_nuevo_consolidado(consolidado, consolidado_previo)
     if evento_id is not None and usar_nuevo:
         entry_cache["mejor_puntaje_consolidado"] = puntaje_nuevo
         entry_cache["mejor_consolidado"] = consolidado
@@ -2746,6 +2799,7 @@ def _aplicar_resultado_ocr_monitoreo(
             }
         else:
             prev_datos = dict(entry_cache.get("datos") or {})
+            prev_datos["placa_individual"] = texto_individual
             prev_datos["placa_individual_ultimo_frame"] = texto_individual
             prev_datos["recortes_usados_evento"] = len(lecturas)
             prev_datos["lecturas_usadas_evento"] = datos_ocr.get("lecturas_usadas_evento")
@@ -2895,7 +2949,13 @@ def _mostrar_panel_compacto_en_vivo(resumen: dict) -> None:
     resumen_panel = _obtener_resumen_panel_vivo(resumen)
     cola = st.session_state.get("eventos_monitoreo_cola") or []
     otro = resumen_panel.get("capturando_otro_vehiculo")
-    if otro:
+    tracks_activos = int(resumen.get("tracks_activos") or 0)
+    if tracks_activos > 1:
+        st.caption(
+            f"{tracks_activos} placas seguidas en paralelo · "
+            f"vehiculo principal #{int(resumen.get('track_id_principal') or resumen.get('evento_id') or 0):03d}"
+        )
+    elif otro:
         st.caption(f"Leyendo vehiculo anterior · capturando #{int(otro):03d} en camara")
     elif cola:
         st.caption(f"{len(cola)} vehiculo(s) registrado(s) · evento actual #{int(resumen.get('evento_id') or 0):03d}")
@@ -3189,18 +3249,32 @@ def pestana_monitoreo(config: dict) -> None:
         )
         video = None
         indice_camara = 0
+        nombre_camara = ""
 
         if fuente_monitoreo == "Video de prueba":
             video = st.file_uploader("Video", type=["mp4", "avi", "mov", "mkv"], key="video_monitoreo", label_visibility="collapsed")
         else:
-            indice_camara = st.selectbox(
-                "Camara",
-                options=[0, 1, 2, 3],
-                index=0,
-                label_visibility="collapsed",
-                help="Indice de camara. Con Camo suele ser 0 o 1; use 'Probar camaras' abajo.",
-                key="monitoreo_indice_camara",
+            opciones_cam = _opciones_camara_monitoreo()
+            etiquetas_cam = [item["etiqueta"] for item in opciones_cam]
+            indice_default = next(
+                (i for i, item in enumerate(opciones_cam) if item.get("default")),
+                0,
             )
+            seleccion_cam = st.selectbox(
+                "Camara",
+                options=etiquetas_cam,
+                index=min(indice_default, max(len(etiquetas_cam) - 1, 0)),
+                label_visibility="collapsed",
+                help="Solo se listan camaras registradas en Windows. Con Camo use el indice que diga 'Camo'.",
+                key="monitoreo_camara_etiqueta",
+                disabled=bool(st.session_state.get("monitoreo_activo")),
+            )
+            indice_camara = opciones_cam[etiquetas_cam.index(seleccion_cam)]["indice"]
+            nombre_camara = opciones_cam[etiquetas_cam.index(seleccion_cam)].get("nombre") or ""
+            if st.session_state.get("monitoreo_activo"):
+                st.caption(f"Camara en uso: **{seleccion_cam}** · pulse Reiniciar para cambiar.")
+            elif "camo" in nombre_camara.lower():
+                st.caption("Camo: active el **Complemento de camara** en Camo Studio antes de Iniciar.")
             with st.expander("Probar camaras (Camo / Iriun)", expanded=False):
                 resumen_sys = resumen_camaras_sistema()
                 nombres_sys = resumen_sys["nombres"]
@@ -3943,6 +4017,7 @@ def pestana_monitoreo(config: dict) -> None:
         else:
             resumen = procesar_camara_monitoreo(
                 indice_camara=int(indice_camara),
+                nombre_dispositivo=str(nombre_camara or ""),
                 distancia_lineas_m=float(distancia_metros),
                 limite_velocidad_kmh=float(limite_velocidad),
                 posicion_linea_1=float(posicion_linea_1),

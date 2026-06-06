@@ -87,6 +87,24 @@ def main() -> None:
                 _lectura("ABC0123", 0.82),
             ],
         },
+        {
+            "nombre": "caso_5_no_conservar_lectura_antigua",
+            "esperado": "TBH4543",
+            "lecturas": [
+                {
+                    **_lectura("BTA8990", 0.62),
+                    "puntaje_recorte": 0.60,
+                    "puntaje_segmentacion": 62.0,
+                },
+                {
+                    **_lectura("TBH4543", 0.96),
+                    "puntaje_recorte": 1.0,
+                    "puntaje_segmentacion": 100.0,
+                    "estado_lectura": "lectura_completa",
+                    "formato_valido": True,
+                },
+            ],
+        },
     ]
 
     resultados = []

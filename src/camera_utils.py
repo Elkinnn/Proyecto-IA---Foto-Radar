@@ -3,9 +3,36 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 
 import cv2
 import numpy as np
+
+
+_CAPTURA_ACTIVA_LOCK = threading.Lock()
+_CAPTURA_CAMARA_ACTIVA = None
+
+
+def liberar_captura_camara_activa(captura=None) -> None:
+    """Libera la captura anterior, incluso tras un rerun de Streamlit."""
+    global _CAPTURA_CAMARA_ACTIVA
+    with _CAPTURA_ACTIVA_LOCK:
+        objetivo = captura if captura is not None else _CAPTURA_CAMARA_ACTIVA
+        if objetivo is not None:
+            try:
+                objetivo.release()
+            except Exception:
+                pass
+        if captura is None or captura is _CAPTURA_CAMARA_ACTIVA:
+            _CAPTURA_CAMARA_ACTIVA = None
+
+
+def _registrar_captura_camara_activa(captura):
+    global _CAPTURA_CAMARA_ACTIVA
+    with _CAPTURA_ACTIVA_LOCK:
+        _CAPTURA_CAMARA_ACTIVA = captura
+    return captura
 
 
 def listar_nombres_camara_dshow() -> list[str] | None:
@@ -78,8 +105,15 @@ def _set_prop_seguro(captura, prop: int, value) -> bool:
         return False
 
 
-def _configurar_captura(captura, camera_width: int | None, camera_height: int | None, camera_fps: int | None) -> None:
-    if sys.platform == "win32":
+def _configurar_captura(
+    captura,
+    camera_width: int | None,
+    camera_height: int | None,
+    camera_fps: int | None,
+    nombre_dispositivo: str | None = None,
+) -> None:
+    tipo = _clasificar_dispositivo(nombre_dispositivo or "")
+    if sys.platform == "win32" and tipo not in {"camo", "iriun"}:
         _set_prop_seguro(captura, cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     if camera_width:
         _set_prop_seguro(captura, cv2.CAP_PROP_FRAME_WIDTH, int(camera_width))
@@ -98,27 +132,33 @@ def resolucion_real_captura(captura) -> tuple[int, int, float]:
     return ancho, alto, fps
 
 
-def _leer_frame_muestra(captura):
-    for _ in range(5):
+def _leer_frame_muestra(captura, intentos: int = 12, pausa_s: float = 0.08):
+    for _ in range(max(1, int(intentos))):
         try:
             ok, frame = captura.read()
-            if ok and frame is not None:
+            if ok and frame is not None and getattr(frame, "size", 0) > 0:
                 return frame
         except cv2.error:
             break
+        if pausa_s > 0:
+            time.sleep(pausa_s)
     return None
 
 
-def _probar_backend(indice: int, backend: int, camera_width, camera_height, camera_fps):
+def _probar_backend(indice: int, backend: int, camera_width, camera_height, camera_fps, nombre_dispositivo=None):
     captura = None
     try:
         captura = cv2.VideoCapture(int(indice), backend)
         if not captura.isOpened():
             return None, None, -1.0
-        _configurar_captura(captura, camera_width, camera_height, camera_fps)
+        _configurar_captura(captura, camera_width, camera_height, camera_fps, nombre_dispositivo)
         frame = _leer_frame_muestra(captura)
         puntaje = puntaje_senal_frame(frame)
         if frame is None:
+            # Algunas camaras virtuales (Camo) abren bien pero tardan en entregar el
+            # primer frame; conservar la captura abierta en lugar de descartarla.
+            if captura.isOpened():
+                return captura, None, 0.0
             captura.release()
             return None, None, -1.0
         return captura, frame, puntaje
@@ -128,37 +168,71 @@ def _probar_backend(indice: int, backend: int, camera_width, camera_height, came
         return None, None, -1.0
 
 
+def _abrir_captura_backend(indice: int, backend: int, camera_width, camera_height, camera_fps, nombre_dispositivo=None):
+    try:
+        captura = cv2.VideoCapture(int(indice), backend)
+        if not captura.isOpened():
+            if captura is not None:
+                captura.release()
+            return None
+        _configurar_captura(captura, camera_width, camera_height, camera_fps, nombre_dispositivo)
+        return captura
+    except cv2.error:
+        return None
+
+
 def abrir_captura_camara(
     indice: int,
     *,
     camera_width: int | None = None,
     camera_height: int | None = None,
     camera_fps: int | None = None,
+    nombre_dispositivo: str | None = None,
 ) -> cv2.VideoCapture:
-    """Prueba DirectShow y Media Foundation; elige el backend con mejor senal real."""
-    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF] if sys.platform == "win32" else [cv2.CAP_ANY]
-    mejor_cap = None
-    mejor_puntaje = -1.0
-    for backend in backends:
-        captura, _frame, puntaje = _probar_backend(indice, backend, camera_width, camera_height, camera_fps)
-        if captura is None:
-            continue
-        if puntaje > mejor_puntaje:
-            if mejor_cap is not None:
-                mejor_cap.release()
-            mejor_cap = captura
-            mejor_puntaje = puntaje
-        else:
-            captura.release()
-    if mejor_cap is not None:
-        return mejor_cap
-    try:
-        captura = cv2.VideoCapture(int(indice), cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
-        if captura.isOpened():
-            _configurar_captura(captura, camera_width, camera_height, camera_fps)
-        return captura
-    except cv2.error:
+    """Abre la camara solicitada.
+
+    En Windows usa SOLO DirectShow (CAP_DSHOW): el indice coincide con la lista
+    de pygrabber. MSMF no respeta ese orden; si se elige backend por "mejor senal",
+    indice 0 (Camo) termina abriendo la webcam integrada.
+    """
+    liberar_captura_camara_activa()
+    nombres = listar_nombres_camara_dshow() or []
+    if nombre_dispositivo and nombres and nombre_dispositivo not in nombres:
+        # El nombre ayuda a diagnosticar; el indice sigue siendo la fuente de verdad.
+        nombre_dispositivo = _nombre_dispositivo(int(indice), nombres)
+    elif not nombre_dispositivo and nombres and 0 <= int(indice) < len(nombres):
+        nombre_dispositivo = nombres[int(indice)]
+
+    if sys.platform == "win32":
+        for intento in range(3):
+            captura = _abrir_captura_backend(
+                int(indice),
+                cv2.CAP_DSHOW,
+                camera_width,
+                camera_height,
+                camera_fps,
+                nombre_dispositivo,
+            )
+            if captura is not None:
+                return _registrar_captura_camara_activa(captura)
+            if intento < 2:
+                time.sleep(0.35)
         return cv2.VideoCapture()
+
+    for intento in range(3):
+        captura = _abrir_captura_backend(
+            int(indice),
+            cv2.CAP_ANY,
+            camera_width,
+            camera_height,
+            camera_fps,
+            nombre_dispositivo,
+        )
+        if captura is not None:
+            return _registrar_captura_camara_activa(captura)
+        if intento < 2:
+            time.sleep(0.35)
+    return cv2.VideoCapture()
 
 
 def _nombre_dispositivo(indice: int, nombres: list[str] | None) -> str:
@@ -209,6 +283,7 @@ def probar_indices_camara(
             camera_width,
             camera_height,
             None,
+            nombre,
         )
         if captura is None:
             resultados.append(
@@ -254,3 +329,48 @@ def resumen_camaras_sistema() -> dict:
         "tiene_camo": bool(camo),
         "tiene_iriun": bool(iriun),
     }
+
+
+def opciones_camara_para_ui() -> list[dict]:
+    """Lista de camaras registradas en Windows para el selector de Streamlit."""
+    nombres = listar_nombres_camara_dshow() or []
+    resumen = resumen_camaras_sistema()
+    indice_default = (resumen.get("indices_camo") or resumen.get("indices_iriun") or [0])[0]
+    if not nombres:
+        return [{"indice": i, "etiqueta": f"Camara {i}"} for i in range(4)]
+    opciones = []
+    for i, nombre in enumerate(nombres):
+        opciones.append({"indice": i, "etiqueta": f"{i} — {nombre}"})
+    for item in opciones:
+        item["default"] = item["indice"] == indice_default
+    return opciones
+
+
+def mensaje_error_apertura_camara(indice: int) -> str:
+    nombres = listar_nombres_camara_dshow() or []
+    base = (
+        "No se pudo abrir la camara. Cierre otras apps que la usen (Zoom, Camo Studio preview duplicado, OBS) "
+        "y vuelva a intentar."
+    )
+    if not nombres:
+        return f"{base} Indice solicitado: {indice}."
+    lista = " · ".join(f"{i}={nombre}" for i, nombre in enumerate(nombres))
+    if indice >= len(nombres):
+        return (
+            f"{base} Windows solo reporta {len(nombres)} camara(s): {lista}. "
+            f"El indice {indice} no existe; elija 0–{len(nombres) - 1}."
+        )
+    nombre = nombres[indice]
+    tipo = _clasificar_dispositivo(nombre)
+    ayuda_tipo = ""
+    if tipo == "camo":
+        ayuda_tipo = (
+            " Abra Camo Studio, conecte el iPhone y confirme que la imagen se vea dentro de Camo "
+            "antes de iniciar Monitoreo."
+        )
+    elif tipo == "iriun":
+        ayuda_tipo = (
+            " Abra Iriun Webcam tanto en el telefono como en Windows y espere a que muestre video "
+            "antes de iniciar Monitoreo."
+        )
+    return f"{base}{ayuda_tipo} Camaras disponibles: {lista}. Indice solicitado: {indice} ({nombre})."
