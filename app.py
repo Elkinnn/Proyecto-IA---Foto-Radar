@@ -633,6 +633,11 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
         st.caption(f"Formula: {velocidad['formula_medicion']}")
     elif velocidad.get("motivo_invalido"):
         st.warning(velocidad["motivo_invalido"])
+    fuente_tiempo = velocidad.get("fuente_tiempo")
+    if fuente_tiempo == "reloj_monotonico":
+        st.caption("Tiempo tic-toc medido con reloj monotonico real de la camara.")
+    elif fuente_tiempo == "frames_fps":
+        st.caption("Tiempo tic-toc calculado con frames y FPS originales del video.")
 
     col_vel7, col_vel8, col_vel9 = st.columns(3)
     col_vel7.metric("Posicion Linea 1", f"{resumen.get('posicion_linea_1', 0.45):.2f}")
@@ -1706,7 +1711,11 @@ def _formatear_metrica_velocidad(velocidad: dict, estado_placa: str = "", difuso
     """Texto principal y detalle del tracker de velocidad para la UI."""
     velocidad_kmh = velocidad.get("velocidad_kmh")
     if velocidad_kmh is not None:
-        detalle = "Tic-toc L1→L2 (cruce geometrico + sub-frame)"
+        detalle = (
+            "Tic-toc L1→L2 con reloj real"
+            if velocidad.get("fuente_tiempo") == "reloj_monotonico"
+            else "Tic-toc L1→L2 con frames/FPS"
+        )
         if difuso and difuso.get("multa_texto"):
             detalle = f"{difuso.get('multa_texto')} · {difuso.get('estado', '')}"
         return f"{float(velocidad_kmh):.1f} km/h", detalle
@@ -1751,9 +1760,13 @@ def _detalle_lineas_velocidad(velocidad: dict, resumen: dict) -> str:
     limite = resumen.get("limite_velocidad_kmh")
     if limite is not None:
         partes.append(f"Limite: {float(limite):.0f} km/h")
-    fps = velocidad.get("fps") or resumen.get("fps")
-    if fps:
-        partes.append(f"FPS video: {float(fps):.2f}")
+    fuente_tiempo = velocidad.get("fuente_tiempo")
+    if fuente_tiempo == "reloj_monotonico":
+        partes.append("Tiempo: reloj real de camara")
+    else:
+        fps = velocidad.get("fps") or resumen.get("fps")
+        if fps:
+            partes.append(f"Tiempo: frames a {float(fps):.2f} FPS")
     l1 = resumen.get("posicion_linea_1")
     l2 = resumen.get("posicion_linea_2")
     if l1 is not None and l2 is not None:

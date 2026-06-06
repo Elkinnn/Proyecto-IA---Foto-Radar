@@ -538,6 +538,7 @@ def _procesar_fuente_monitoreo(
             ok, frame = _leer_frame_camara_vivo(captura, max_grabs=2)
         else:
             ok, frame = captura.read()
+        timestamp_medicion = time.perf_counter() if isinstance(fuente, int) and ok else None
         tiempos_etapa["lectura_frame_ms"] = round((time.perf_counter() - t_lectura) * 1000, 3)
         if not ok:
             break
@@ -669,6 +670,7 @@ def _procesar_fuente_monitoreo(
             plate_crop_selection,
             inference_size,
             guardar_debug,
+            timestamp_medicion,
         )
         tiempos_etapa["procesamiento_frame_ms"] = round((time.perf_counter() - t_procesamiento) * 1000, 3)
         frame = estado_frame["frame_visual"]
@@ -1750,6 +1752,7 @@ def _procesar_frame_monitoreo(
     plate_crop_selection: dict | None = None,
     inference_size: int = 640,
     guardar_debug: bool = False,
+    timestamp_medicion: float | None = None,
 ) -> dict:
     frame_visual = frame_original
     frame_limpio = frame_original
@@ -1849,6 +1852,7 @@ def _procesar_frame_monitoreo(
         posicion_linea_2,
         plate_crop_selection,
         yolo_ejecutado,
+        timestamp_medicion,
     )
     eventos_placa = int(estado_persistencia.get("eventos_placa") or eventos_placa)
     ultima_deteccion = datos_track.get("ultima_deteccion")
@@ -2163,6 +2167,7 @@ def _actualizar_tracks_multiobjeto(
     posicion_linea_2: float,
     plate_crop_selection: dict | None,
     yolo_ejecutado: bool,
+    timestamp_medicion: float | None = None,
 ) -> tuple[dict | None, str, dict]:
     tracks: dict[int, dict] = estado.setdefault("_multi_tracks", {})
     asignaciones, usadas = _asociar_detecciones_a_tracks(
@@ -2184,7 +2189,8 @@ def _actualizar_tracks_multiobjeto(
         if not track:
             continue
         deteccion = detecciones[idx]
-        bbox = _suavizar_bbox(deteccion["bbox"], track.get("ultima_bbox_valida"))
+        bbox_medicion = [int(valor) for valor in deteccion["bbox"]]
+        bbox = _suavizar_bbox(bbox_medicion, track.get("ultima_bbox_valida"))
         confianza = float(deteccion["confianza"])
         recorte = deteccion.get("recorte_placa")
         track["ultima_bbox_valida"] = bbox
@@ -2206,7 +2212,11 @@ def _actualizar_tracks_multiobjeto(
         )
         _actualizar_mejor_evento_placa(track, confianza, bbox, frame_visual, recorte, numero_frame)
         _intentar_disparar_ocr_snapshot_evento(track, track_id, recorte, frame_visual, confianza, numero_frame)
-        velocidades[track_id] = track["speed_tracker"].actualizar(bbox, numero_frame)
+        velocidades[track_id] = track["speed_tracker"].actualizar(
+            bbox_medicion,
+            numero_frame,
+            timestamp_segundos=timestamp_medicion,
+        )
         _dibujar_bbox_placa(frame_visual, bbox, f"placa #{track_id} {confianza:.2f}", (0, 180, 0))
         _dibujar_centro_placa(frame_visual, bbox)
         tracks_detectados.add(track_id)
@@ -2474,6 +2484,7 @@ def _resumen_velocidad_vacio(distancia_metros: float, fps: float) -> dict:
         "tiempo_entre_lineas": None,
         "distancia_metros": distancia_metros,
         "fps": fps,
+        "fuente_tiempo": "pendiente",
         "velocidad_kmh": None,
         "motivo_invalido": None,
         "formula_medicion": None,
@@ -2524,6 +2535,7 @@ def _guardar_evidencia_velocidad(frame, velocidad: dict) -> None:
             "metodo_medicion": velocidad.get("metodo_medicion"),
             "distancia_metros": velocidad.get("distancia_metros"),
             "fps": velocidad.get("fps"),
+            "fuente_tiempo": velocidad.get("fuente_tiempo"),
             "frame_linea_1": velocidad.get("frame_cruce_linea_1"),
             "frame_linea_2": velocidad.get("frame_cruce_linea_2"),
             "frame_linea_1_exacto": velocidad.get("frame_cruce_linea_1_exacto"),
