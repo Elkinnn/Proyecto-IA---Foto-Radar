@@ -1017,6 +1017,8 @@ def _grupo_listo_para_envio(grupo: dict, frame_actual: int, cooldown_frames: int
         return False
     if any(item.get("estado_ocr") == "pendiente" for item in items):
         return False
+    if int(cooldown_frames) <= 0:
+        return True
     ultimo_frame = max(
         int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0)
         for item in items
@@ -1131,10 +1133,12 @@ def _procesar_envio_automatico_cola(
         resumen = enviar_notificacion_evento_monitoreo(resumen, placa, correo, config)
         mejor["resumen"] = resumen
         notif = resumen.get("notificacion_correo") or {}
-        enviado = bool(notif.get("enviado") or notif.get("modo") == "simulado")
+        enviado = bool(notif.get("enviado"))
         mejor["notificacion_enviada"] = enviado
         if enviado:
             enviados.add(paso_id)
+        elif notif.get("estado") in {"no_apto", "correo_no_ingresado", "fallo_envio", "correo_invalido"}:
+            descartados.add(paso_id)
         hubo_cambio = True
 
     st.session_state.pasos_grupo_notificados = list(enviados)
@@ -1466,6 +1470,14 @@ def _render_sidebar_envio_correo(config: dict, placa_controlada: str) -> None:
         for item in cola
         if item.get("es_mejor_del_paso") and not item.get("notificacion_enviada") and not item.get("suprimido_duplicado")
     ]
+    no_apto = [
+        item
+        for item in cola
+        if item.get("es_mejor_del_paso")
+        and item.get("estado_ocr") == "listo"
+        and not item.get("notificacion_enviada")
+        and not (item.get("resumen") or {}).get("puede_enviar_notificacion")
+    ]
 
     st.metric("Correos enviados", len(enviados))
     if enviados:
@@ -1473,11 +1485,41 @@ def _render_sidebar_envio_correo(config: dict, placa_controlada: str) -> None:
         res_u = ultimo.get("resumen") or {}
         notif = res_u.get("notificacion_correo") or {}
         placa_u = _obtener_texto_placa_ui(res_u)
-        st.caption(f"Ultimo: **{placa_u}** → {notif.get('destinatario') or correo}")
+        st.success(f"Ultimo enviado: **{placa_u}** → {notif.get('destinatario') or correo}")
     elif pendientes:
-        st.caption("Esperando cierre del paso del vehiculo para enviar la mejor lectura.")
+        item_p = pendientes[0]
+        estado = _estado_correo_item(item_p)
+        st.info(f"Pendiente: **{estado}** (placa {_obtener_texto_placa_ui(item_p.get('resumen') or {})})")
+    elif no_apto:
+        item_n = no_apto[0]
+        res_n = item_n.get("resumen") or {}
+        razones = (res_n.get("evaluacion_calidad_evento") or {}).get("razones") or []
+        texto = razones[0] if razones else "Lectura no apta para correo."
+        st.warning(f"No se envio: {texto}")
     else:
         st.caption("Sin envios en esta sesion.")
+
+    ultimo_intento = next(
+        (
+            (item.get("resumen") or {}).get("notificacion_correo")
+            for item in cola
+            if (item.get("resumen") or {}).get("notificacion_correo")
+        ),
+        None,
+    )
+    if ultimo_intento and not ultimo_intento.get("enviado"):
+        msg = ultimo_intento.get("mensaje_estado") or ultimo_intento.get("error")
+        if msg:
+            st.caption(f"Detalle: {msg}")
+
+    if cola:
+        with st.expander("Estado por vehiculo", expanded=False):
+            _consolidar_marcas_paso_vehiculo(cola, config)
+            for item in cola[:8]:
+                res_item = item.get("resumen") or {}
+                estado = _estado_correo_item(item)
+                placa_item = _obtener_texto_placa_ui(res_item)
+                st.caption(f"#{int(item.get('evento_id') or 0):03d} · {placa_item} · **{estado}**")
 
     if enviados:
         with st.expander("Historial de envios", expanded=False):
@@ -2048,7 +2090,12 @@ def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
         hubo_cambio = True
     if hubo_cambio:
         st.session_state.eventos_monitoreo_cola = cola
-        _procesar_envio_automatico_cola(config, placa_controlada)
+        _procesar_envio_automatico_cola(
+            config,
+            placa_controlada,
+            int(st.session_state.get("frame_actual") or 0),
+            forzar=True,
+        )
     return hubo_cambio
 
 
@@ -2074,9 +2121,9 @@ def _procesar_cola_ocr_monitoreo(
     hubo_cola = _procesar_ocr_cola_eventos(config, placa_controlada)
     hubo = hubo_cache or hubo_cola
     if hubo and frame_actual is not None:
-        _procesar_envio_automatico_cola(config, placa_controlada, int(frame_actual))
+        _procesar_envio_automatico_cola(config, placa_controlada, int(frame_actual), forzar=True)
     elif hubo:
-        _procesar_envio_automatico_cola(config, placa_controlada)
+        _procesar_envio_automatico_cola(config, placa_controlada, forzar=True)
     return resumen, hubo
 
 
