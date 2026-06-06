@@ -152,6 +152,15 @@ def evaluar_calidad_evento(metricas: dict, config: dict | None = None) -> dict:
     }
 
 
+def _texto_velocidad_kmh(valor, *, pendiente: str = "No medida") -> str:
+    if valor is None:
+        return pendiente
+    try:
+        return f"{float(valor):.2f} km/h"
+    except (TypeError, ValueError):
+        return pendiente
+
+
 def construir_mensaje_sancion(placa: str, resultado_difuso: dict, contexto: dict | None = None) -> str:
     contexto = contexto or {}
     sancion_aplica = bool(resultado_difuso.get("sancion_aplica"))
@@ -166,8 +175,8 @@ def construir_mensaje_sancion(placa: str, resultado_difuso: dict, contexto: dict
         "Datos del evento:\n"
         f"  Fecha y hora: {fecha}\n"
         f"  Placa reconocida: {placa}\n"
-        f"  Velocidad registrada: {float(resultado_difuso.get('velocidad_kmh', 0.0)):.2f} km/h\n"
-        f"  Limite permitido: {float(resultado_difuso.get('limite_kmh', 0.0)):.2f} km/h\n"
+        f"  Velocidad registrada: {_texto_velocidad_kmh(resultado_difuso.get('velocidad_kmh'))}\n"
+        f"  Limite permitido: {_texto_velocidad_kmh(resultado_difuso.get('limite_kmh'), pendiente='Pendiente')}\n"
         f"  Clasificacion: {resultado_difuso.get('estado', 'Pendiente')}\n\n"
     )
 

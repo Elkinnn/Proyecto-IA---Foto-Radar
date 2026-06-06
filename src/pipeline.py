@@ -1622,15 +1622,18 @@ def _puede_saltar_frames_video(estado_persistencia: dict) -> bool:
 
 def _leer_frame_camara_vivo(captura, *, max_grabs: int = 1) -> tuple[bool, object | None]:
     """Descarta frames viejos con grab (barato) y decodifica solo el ultimo."""
-    for _ in range(max(0, int(max_grabs))):
-        if not captura.grab():
-            break
-    ok, frame = captura.retrieve()
-    if not ok or frame is None:
-        ok, frame = captura.read()
-    if not ok or frame is None:
+    try:
+        for _ in range(max(0, int(max_grabs))):
+            if not captura.grab():
+                break
+        ok, frame = captura.retrieve()
+        if not ok or frame is None:
+            ok, frame = captura.read()
+        if not ok or frame is None:
+            return False, None
+        return True, frame
+    except cv2.error:
         return False, None
-    return True, frame
 
 
 def _esperar_reproduccion_frame(

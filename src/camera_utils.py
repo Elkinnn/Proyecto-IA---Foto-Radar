@@ -68,36 +68,54 @@ def frame_tiene_senal(frame, *, umbral: float = 35.0) -> bool:
     return puntaje_senal_frame(frame) >= umbral
 
 
+def _set_prop_seguro(captura, prop: int, value) -> bool:
+    """Algunas camaras virtuales (Camo, Iriun) lanzan cv2.error al fijar FPS/resolucion."""
+    try:
+        return bool(captura.set(prop, value))
+    except cv2.error:
+        return False
+    except Exception:
+        return False
+
+
 def _configurar_captura(captura, camera_width: int | None, camera_height: int | None, camera_fps: int | None) -> None:
     if camera_width:
-        captura.set(cv2.CAP_PROP_FRAME_WIDTH, int(camera_width))
+        _set_prop_seguro(captura, cv2.CAP_PROP_FRAME_WIDTH, int(camera_width))
     if camera_height:
-        captura.set(cv2.CAP_PROP_FRAME_HEIGHT, int(camera_height))
+        _set_prop_seguro(captura, cv2.CAP_PROP_FRAME_HEIGHT, int(camera_height))
     if camera_fps:
-        captura.set(cv2.CAP_PROP_FPS, int(camera_fps))
-    captura.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        _set_prop_seguro(captura, cv2.CAP_PROP_FPS, int(camera_fps))
+    _set_prop_seguro(captura, cv2.CAP_PROP_BUFFERSIZE, 1)
 
 
 def _leer_frame_muestra(captura):
     for _ in range(5):
-        ok, frame = captura.read()
-        if ok and frame is not None:
-            return frame
+        try:
+            ok, frame = captura.read()
+            if ok and frame is not None:
+                return frame
+        except cv2.error:
+            break
     return None
 
 
 def _probar_backend(indice: int, backend: int, camera_width, camera_height, camera_fps):
-    captura = cv2.VideoCapture(int(indice), backend)
-    if not captura.isOpened():
-        captura.release()
+    captura = None
+    try:
+        captura = cv2.VideoCapture(int(indice), backend)
+        if not captura.isOpened():
+            return None, None, -1.0
+        _configurar_captura(captura, camera_width, camera_height, camera_fps)
+        frame = _leer_frame_muestra(captura)
+        puntaje = puntaje_senal_frame(frame)
+        if frame is None:
+            captura.release()
+            return None, None, -1.0
+        return captura, frame, puntaje
+    except cv2.error:
+        if captura is not None:
+            captura.release()
         return None, None, -1.0
-    _configurar_captura(captura, camera_width, camera_height, camera_fps)
-    frame = _leer_frame_muestra(captura)
-    puntaje = puntaje_senal_frame(frame)
-    if frame is None:
-        captura.release()
-        return None, None, -1.0
-    return captura, frame, puntaje
 
 
 def abrir_captura_camara(
@@ -124,10 +142,13 @@ def abrir_captura_camara(
             captura.release()
     if mejor_cap is not None:
         return mejor_cap
-    captura = cv2.VideoCapture(int(indice), cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
-    if captura.isOpened():
-        _configurar_captura(captura, camera_width, camera_height, camera_fps)
-    return captura
+    try:
+        captura = cv2.VideoCapture(int(indice), cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
+        if captura.isOpened():
+            _configurar_captura(captura, camera_width, camera_height, camera_fps)
+        return captura
+    except cv2.error:
+        return cv2.VideoCapture()
 
 
 def _nombre_dispositivo(indice: int, nombres: list[str] | None) -> str:
