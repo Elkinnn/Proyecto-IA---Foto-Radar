@@ -52,14 +52,24 @@ def validar_correo(correo: str | None) -> bool:
     return bool(_EMAIL_REGEX.match(correo.strip()))
 
 
+def construir_resultado_difuso(
+    velocidad_kmh: float,
+    limite_kmh: float | None = None,
+    config: dict | None = None,
+) -> dict:
+    """Clasificacion difusa real para correo y panel (entrada: km/h, salida: multa)."""
+    from src.fuzzy_system import clasificar_velocidad
+
+    return clasificar_velocidad(float(velocidad_kmh), limite_kmh, config)
+
+
 def construir_resultado_difuso_demo(
     velocidad_kmh: float = VELOCIDAD_DEMO_KMH,
     limite_kmh: float = LIMITE_DEMO_KMH,
+    config: dict | None = None,
 ) -> dict:
-    """Devuelve la clasificacion difusa para el correo (velocidad quemada)."""
-    from src.fuzzy_system import clasificar_velocidad
-
-    return clasificar_velocidad(float(velocidad_kmh), float(limite_kmh))
+    """Compatibilidad: usa clasificacion difusa con config si se provee."""
+    return construir_resultado_difuso(velocidad_kmh, limite_kmh, config)
 
 
 def _config_calidad(config: dict | None) -> dict:
@@ -165,6 +175,7 @@ def construir_mensaje_sancion(placa: str, resultado_difuso: dict, contexto: dict
         cuerpo_sancion = (
             "Resultado de la evaluacion (logica difusa):\n"
             f"  Nivel de infraccion: {resultado_difuso.get('nivel_infraccion', 'Pendiente')}\n"
+            f"  Multa: {resultado_difuso.get('multa_texto', 'Pendiente')}\n"
             f"  Sancion: {resultado_difuso.get('sancion', 'Pendiente')}\n"
             f"  Horas de suspension: {resultado_difuso.get('horas_suspension', 0)}\n\n"
             f"Detalle: {resultado_difuso.get('mensaje', '')}\n\n"
@@ -366,10 +377,36 @@ def notificar_evento_placa(
         }
 
     notif_cfg = (config or {}).get("notificaciones") or {}
-    velocidad = velocidad_kmh if velocidad_kmh is not None else notif_cfg.get("velocidad_demo_kmh", VELOCIDAD_DEMO_KMH)
-    limite = limite_kmh if limite_kmh is not None else notif_cfg.get("limite_demo_kmh", LIMITE_DEMO_KMH)
+    velocidad_medida = velocidad_kmh
+    if velocidad_medida is None:
+        velocidad_medida = (contexto or {}).get("velocidad_kmh")
 
-    difuso = construir_resultado_difuso_demo(velocidad, limite)
+    limite = limite_kmh
+    if limite is None:
+        limite = (contexto or {}).get("limite_kmh")
+    if limite is None:
+        limite = float((config or {}).get("speed", {}).get("campus_speed_limit_kmh", LIMITE_DEMO_KMH))
+
+    if velocidad_medida is None:
+        difuso = {
+            "velocidad_kmh": None,
+            "limite_kmh": float(limite),
+            "estado": "Sin medicion",
+            "categoria_fuzzy": None,
+            "nivel_infraccion": "No evaluada",
+            "sancion": "No aplica",
+            "multa_usd": 0.0,
+            "multa_texto": "Sin multa (velocidad no medida)",
+            "horas_suspension": 0,
+            "sancion_aplica": False,
+            "mensaje": "No se registro velocidad en el evento; no se calcula multa.",
+            "grados": {},
+            "metodo": "sin_velocidad",
+            "velocidad_es_medida": False,
+        }
+    else:
+        difuso = construir_resultado_difuso(float(velocidad_medida), float(limite), config)
+        difuso["velocidad_es_medida"] = True
     mensaje = construir_mensaje_sancion(placa, difuso, contexto)
     asunto = f"Fotorradar Ecuador IA - Notificacion de placa {placa}"
 

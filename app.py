@@ -63,13 +63,21 @@ _OCR_ASYNC_RESULTADOS: dict[str, dict] = {}
 def _config_modo_rendimiento(config: dict, modo: str) -> dict:
     clave = PERFORMANCE_MODE_LABELS.get(modo, "balanceado")
     defaults = {
-        "rapido": {"yolo_every_n_frames": 5, "inference_size": 416, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 24},
-        "balanceado": {"yolo_every_n_frames": 5, "inference_size": 512, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 24},
-        "preciso": {"yolo_every_n_frames": 3, "inference_size": 640, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 24},
+        "rapido": {"yolo_every_n_frames": 5, "inference_size": 416, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 0},
+        "balanceado": {"yolo_every_n_frames": 5, "inference_size": 512, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 0},
+        "preciso": {"yolo_every_n_frames": 3, "inference_size": 640, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 0},
     }
     salida = defaults[clave].copy()
     salida.update((config.get("monitoring_performance") or {}).get(clave, {}))
     return salida
+
+
+def _config_rendimiento_monitoreo(config: dict, modo: str, fuente_monitoreo: str) -> dict:
+    base = _config_modo_rendimiento(config, modo)
+    perf = config.get("monitoring_performance") or {}
+    clave_fuente = "video" if fuente_monitoreo == "Video de prueba" else "camara"
+    base.update(perf.get(clave_fuente, {}) or {})
+    return base
 
 
 def _redimensionar_frame_rgb(frame_rgb, ancho_maximo: int = 800):
@@ -81,6 +89,20 @@ def _redimensionar_frame_rgb(frame_rgb, ancho_maximo: int = 800):
     escala = ancho_maximo / float(ancho)
     nuevo_alto = max(1, int(alto * escala))
     return cv2.resize(frame_rgb, (ancho_maximo, nuevo_alto), interpolation=cv2.INTER_AREA)
+
+
+def _preparar_imagen_streamlit(frame_rgb, ancho_maximo: int = 640):
+    frame = _redimensionar_frame_rgb(frame_rgb, ancho_maximo)
+    if frame is None:
+        return None
+    ok, buf = cv2.imencode(
+        ".jpg",
+        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+        [int(cv2.IMWRITE_JPEG_QUALITY), 72],
+    )
+    if ok:
+        return buf.tobytes()
+    return frame
 
 
 st.set_page_config(
@@ -377,9 +399,15 @@ def ejecutar_simulacion_velocidad(
         "posicion_linea_2": posicion_linea_2,
         "frame_cruce_linea_1": resumen.get("frame_cruce_linea_1"),
         "frame_cruce_linea_2": resumen.get("frame_cruce_linea_2"),
+        "frame_cruce_linea_1_exacto": resumen.get("frame_cruce_linea_1_exacto"),
+        "frame_cruce_linea_2_exacto": resumen.get("frame_cruce_linea_2_exacto"),
+        "tiempo_cruce_linea_1": resumen.get("tiempo_cruce_linea_1"),
+        "tiempo_cruce_linea_2": resumen.get("tiempo_cruce_linea_2"),
         "tiempo_segundos": resumen.get("tiempo_entre_lineas"),
         "velocidad_kmh": resumen.get("velocidad_kmh"),
         "estado": resumen.get("estado"),
+        "metodo_medicion": resumen.get("metodo_medicion"),
+        "formula_medicion": resumen.get("formula_medicion"),
         "ruta_frame_cruce_linea_1": str(rutas["linea_1"]) if guardo_linea_1 else None,
         "ruta_frame_cruce_linea_2": str(rutas["linea_2"]) if guardo_linea_2 else None,
         "ruta_frame_velocidad_calculada": str(rutas["calculada"]) if guardo_calculada else None,
@@ -394,8 +422,11 @@ def ejecutar_simulacion_velocidad(
                 "nivel_infraccion": difuso["nivel_infraccion"],
                 "sancion": difuso["sancion"],
                 "horas_suspension": difuso["horas_suspension"],
+                "multa_usd": difuso.get("multa_usd"),
+                "multa_texto": difuso.get("multa_texto"),
                 "mensaje_difuso": difuso["mensaje"],
                 "grados_pertenencia": difuso["grados"],
+                "metodo_difuso": difuso.get("metodo"),
             }
         )
     else:
@@ -496,18 +527,32 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
         "esperando_linea_1": "Esperando linea 1",
         "esperando_linea_2": "Esperando linea 2",
         "velocidad_calculada": "Calculada",
+        "medicion_invalida": "Invalida",
     }
     col_vel1, col_vel2, col_vel3 = st.columns(3)
     col_vel1.metric("Estado de velocidad", etiquetas_estado.get(estado_velocidad, estado_velocidad))
-    col_vel2.metric("Frame cruce linea 1", velocidad.get("frame_cruce_linea_1") or "Pendiente")
-    col_vel3.metric("Frame cruce linea 2", velocidad.get("frame_cruce_linea_2") or "Pendiente")
+    frame_l1_x = velocidad.get("frame_cruce_linea_1_exacto")
+    frame_l2_x = velocidad.get("frame_cruce_linea_2_exacto")
+    col_vel2.metric(
+        "TIC (Linea 1)",
+        f"frame {frame_l1_x:.2f}" if frame_l1_x is not None else (velocidad.get("frame_cruce_linea_1") or "Pendiente"),
+    )
+    col_vel3.metric(
+        "TOC (Linea 2)",
+        f"frame {frame_l2_x:.2f}" if frame_l2_x is not None else (velocidad.get("frame_cruce_linea_2") or "Pendiente"),
+    )
 
     col_vel4, col_vel5, col_vel6 = st.columns(3)
     tiempo_entre = velocidad.get("tiempo_entre_lineas")
     velocidad_kmh = velocidad.get("velocidad_kmh")
-    col_vel4.metric("Tiempo entre lineas", f"{tiempo_entre:.3f} s" if tiempo_entre is not None else "Pendiente")
-    col_vel5.metric("Distancia configurada", f"{velocidad.get('distancia_metros', resumen.get('distancia_lineas_m', 0)):.1f} m")
+    col_vel4.metric("Delta t (tic-toc)", f"{tiempo_entre:.4f} s" if tiempo_entre is not None else "Pendiente")
+    col_vel5.metric("Distancia calibrada", f"{velocidad.get('distancia_metros', resumen.get('distancia_lineas_m', 0)):.1f} m")
     col_vel6.metric("Velocidad estimada", f"{velocidad_kmh:.2f} km/h" if velocidad_kmh is not None else "Pendiente")
+
+    if velocidad.get("formula_medicion"):
+        st.caption(f"Formula: {velocidad['formula_medicion']}")
+    elif velocidad.get("motivo_invalido"):
+        st.warning(velocidad["motivo_invalido"])
 
     col_vel7, col_vel8, col_vel9 = st.columns(3)
     col_vel7.metric("Posicion Linea 1", f"{resumen.get('posicion_linea_1', 0.45):.2f}")
@@ -518,16 +563,28 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
 
     st.subheader("ClasificaciÃ³n difusa")
     if velocidad_kmh is not None:
-        difuso = resumen.get("clasificacion_difusa") or clasificar_velocidad(velocidad_kmh, resumen.get("limite_velocidad_kmh", 30.0))
+        try:
+            from src.utils import cargar_config
+
+            cfg_fuzzy = cargar_config()
+        except OSError:
+            cfg_fuzzy = None
+        difuso = resumen.get("clasificacion_difusa") or clasificar_velocidad(
+            float(velocidad_kmh),
+            _obtener_limite_kmh_resumen(resumen, cfg_fuzzy),
+            cfg_fuzzy,
+        )
         col_dif1, col_dif2, col_dif3 = st.columns(3)
         col_dif1.metric("Estado difuso", difuso["estado"])
-        col_dif2.metric("Nivel de infracciÃ³n", difuso["nivel_infraccion"])
+        col_dif2.metric("Multa USD", f"${difuso.get('multa_usd', 0):.2f}")
         col_dif3.metric("Horas de suspensiÃ³n", difuso["horas_suspension"])
 
-        col_dif4, col_dif5 = st.columns(2)
-        col_dif4.metric("SanciÃ³n", difuso["sancion"])
-        col_dif5.metric("LÃ­mite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
+        col_dif4, col_dif5, col_dif6 = st.columns(3)
+        col_dif4.metric("Nivel de infracciÃ³n", difuso["nivel_infraccion"])
+        col_dif5.metric("SanciÃ³n", difuso["sancion"])
+        col_dif6.metric("LÃ­mite evaluado", f"{difuso['limite_kmh']:.1f} km/h")
         st.info(difuso["mensaje"])
+        st.caption(f"Metodo: {difuso.get('metodo', '—')} · {difuso.get('multa_texto', '')}")
     else:
         col_dif1, col_dif2, col_dif3 = st.columns(3)
         col_dif1.metric("Estado difuso", "Pendiente")
@@ -606,21 +663,37 @@ def _metricas_calidad_desde_resumen(resumen: dict, placa: str) -> dict:
 
 
 def _adjuntos_evento_desde_resumen(resumen: dict) -> list[str]:
-    frame = (
-        resumen.get("mejor_frame_recorte_placa")
-        or resumen.get("ruta_mejor_frame_evento")
-        or resumen.get("mejor_frame_bbox_placa")
-        or resumen.get("ultimo_frame_deteccion")
-    )
-    recorte = (
-        resumen.get("mejor_recorte_placa")
-        or resumen.get("ruta_mejor_recorte_evento")
-        or resumen.get("ultimo_recorte_placa")
-    )
-    adjuntos = []
-    for ruta in (frame, recorte):
-        if ruta and ruta not in adjuntos:
-            adjuntos.append(ruta)
+    candidatos_frame = [
+        resumen.get("ruta_mejor_frame_evento"),
+        resumen.get("mejor_frame_bbox_placa"),
+        resumen.get("ruta_frame_evento_en_vivo"),
+        resumen.get("mejor_frame_recorte_placa"),
+        resumen.get("ultimo_frame_deteccion"),
+    ]
+    candidatos_recorte = [
+        resumen.get("ruta_mejor_recorte_evento"),
+        resumen.get("mejor_recorte_placa"),
+        resumen.get("ruta_recorte_evento_en_vivo"),
+        resumen.get("ultimo_recorte_placa"),
+    ]
+
+    def _primera_ruta_valida(rutas: list) -> str | None:
+        for ruta in rutas:
+            if not ruta:
+                continue
+            ruta_str = str(ruta)
+            if Path(ruta_str).exists():
+                return ruta_str
+        return None
+
+    frame = _primera_ruta_valida(candidatos_frame)
+    recorte = _primera_ruta_valida(candidatos_recorte)
+
+    adjuntos: list[str] = []
+    if frame:
+        adjuntos.append(frame)
+    if recorte and recorte not in adjuntos:
+        adjuntos.append(recorte)
     return adjuntos
 
 
@@ -655,6 +728,7 @@ def enviar_notificacion_evento_monitoreo(
     """Envia correo para un evento (usado por el envio automatico)."""
     placa = (placa_evento or "").strip().upper()
     resumen = preparar_estado_notificacion_evento(resumen, placa, config)
+    resumen = _aplicar_multa_difusa_resumen(resumen, config)
     evaluacion = resumen.get("evaluacion_calidad_evento") or {}
 
     if not validar_correo(correo_destino):
@@ -679,6 +753,8 @@ def enviar_notificacion_evento_monitoreo(
 
     metricas = _metricas_calidad_desde_resumen(resumen, placa)
     adjuntos = _adjuntos_evento_desde_resumen(resumen)
+    velocidad_kmh = _obtener_velocidad_kmh_desde_resumen(resumen)
+    limite_kmh = _obtener_limite_kmh_resumen(resumen, config)
     notificacion = notificar_evento_placa(
         destinatario=correo_destino,
         placa=placa,
@@ -686,7 +762,13 @@ def enviar_notificacion_evento_monitoreo(
         adjuntos=adjuntos,
         config=config,
         evento_id=resumen.get("evento_id") or resumen.get("eventos_placa") or "monitoreo",
-        contexto={"fecha_hora": datetime.now().isoformat(timespec="seconds")},
+        contexto={
+            "fecha_hora": datetime.now().isoformat(timespec="seconds"),
+            "velocidad_kmh": velocidad_kmh,
+            "limite_kmh": limite_kmh,
+        },
+        velocidad_kmh=velocidad_kmh,
+        limite_kmh=limite_kmh,
     )
 
     resumen["clasificacion_difusa"] = notificacion.get("clasificacion_difusa")
@@ -722,21 +804,101 @@ def _extraer_placa_desde_resumen(resumen: dict) -> str:
 
 
 def _obtener_texto_placa_ui(resumen: dict) -> str:
+    placa = _extraer_placa_desde_resumen(resumen)
+    if placa:
+        return placa
+    if resumen.get("capturando_vehiculo_activo"):
+        evento_id = int(resumen.get("evento_id") or 0)
+        return f"Capturando #{evento_id:03d}..." if evento_id else "Capturando..."
     if resumen.get("estado_ocr") == "pendiente":
         return "Leyendo..."
     texto_pendiente = str(resumen.get("texto_ocr_corregido") or resumen.get("texto_ocr_crudo") or "")
     if "Analizando placa" in texto_pendiente:
         return "Leyendo..."
-    placa = _extraer_placa_desde_resumen(resumen)
-    if placa:
-        return placa
-    if resumen.get("estado_placa") in ("Detectada", "Mantenida"):
-        return "Leyendo..."
+    if resumen.get("evento_activo") and resumen.get("estado_placa") in ("Detectada", "Mantenida"):
+        evento_id = int(resumen.get("evento_id") or 0)
+        return f"Capturando #{evento_id:03d}..." if evento_id else "Capturando..."
     return "—"
+
+
+def _obtener_resumen_panel_vivo(resumen_live: dict) -> dict:
+    """Muestra placa bloqueada por evento_id; el recorte snapshot no cambia con cada frame."""
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    evento_activo_id = int(resumen_live.get("evento_id") or 0) if resumen_live.get("evento_activo") else None
+
+    if evento_activo_id and evento_activo_id in cache:
+        entry = cache[evento_activo_id]
+        out = _resumen_panel_desde_cache(entry, resumen_live)
+        if entry.get("estado") == "listo":
+            return out
+        if entry.get("estado") == "pendiente":
+            out["estado_ocr"] = "pendiente"
+            out["texto_ocr_corregido"] = "Analizando placa..."
+            return out
+
+    for eid in sorted((int(k) for k in cache.keys()), reverse=True):
+        if evento_activo_id and eid == evento_activo_id:
+            continue
+        entry = cache[eid]
+        if entry.get("estado") != "listo":
+            continue
+        out = _resumen_panel_desde_cache(entry, resumen_live)
+        if evento_activo_id:
+            out["capturando_otro_vehiculo"] = evento_activo_id
+        return out
+
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+    if cola:
+        item = cola[0]
+        res_cerrado = dict(item.get("resumen") or {})
+        if item.get("estado_ocr") == "listo":
+            if evento_activo_id and evento_activo_id != int(item.get("evento_id") or 0):
+                res_cerrado["capturando_otro_vehiculo"] = evento_activo_id
+            return res_cerrado
+        if item.get("estado_ocr") == "pendiente":
+            res_cerrado.setdefault("estado_ocr", "pendiente")
+            res_cerrado.setdefault("texto_ocr_corregido", "Analizando placa...")
+            if evento_activo_id and evento_activo_id != int(item.get("evento_id") or 0):
+                res_cerrado["capturando_otro_vehiculo"] = evento_activo_id
+            return res_cerrado
+
+    if resumen_live.get("evento_activo"):
+        out = dict(resumen_live)
+        for campo in (
+            "texto_ocr_crudo",
+            "texto_ocr_corregido",
+            "confianza_ocr",
+            "formato_ocr_valido",
+            "estado_ocr",
+            "mensaje_ocr",
+        ):
+            out.pop(campo, None)
+        ruta_snap = resumen_live.get("ruta_snapshot_ocr_evento") or resumen_live.get("ruta_recorte_evento_en_vivo")
+        if ruta_snap:
+            out["ruta_recorte_evento_en_vivo"] = ruta_snap
+            out["mejor_recorte_placa"] = ruta_snap
+        out["capturando_vehiculo_activo"] = True
+        return out
+    return resumen_live
+
+
+def _resumen_panel_desde_cache(entry: dict, resumen_live: dict) -> dict:
+    out = dict(entry.get("resumen_base") or resumen_live)
+    ruta = entry.get("ruta_recorte")
+    if ruta:
+        out["ruta_recorte_evento_en_vivo"] = ruta
+        out["mejor_recorte_placa"] = ruta
+        out["ruta_mejor_recorte_evento"] = ruta
+    if entry.get("estado") == "listo":
+        out.update(entry.get("datos") or {})
+        if entry.get("resumen_completo"):
+            out.update(entry["resumen_completo"])
+    return out
 
 
 def _obtener_ruta_recorte_ui(resumen: dict) -> str | None:
     for clave in (
+        "ruta_snapshot_ocr_evento",
         "mejor_recorte_placa",
         "ruta_recorte_evento_en_vivo",
         "ruta_mejor_recorte_evento",
@@ -976,13 +1138,49 @@ def _render_tabla_vehiculos_detectados(cola: list, config: dict | None = None, m
         st.caption(f"{enviados} correo(s) enviado(s) automaticamente en esta sesion.")
 
 
-def _formatear_metrica_velocidad(velocidad: dict, estado_placa: str = "") -> tuple[str, str | None]:
+def _obtener_velocidad_kmh_desde_resumen(resumen: dict) -> float | None:
+    if resumen.get("velocidad_kmh") is not None:
+        return float(resumen["velocidad_kmh"])
+    velocidad = resumen.get("velocidad") or {}
+    if velocidad.get("velocidad_kmh") is not None:
+        return float(velocidad["velocidad_kmh"])
+    return None
+
+
+def _obtener_limite_kmh_resumen(resumen: dict, config: dict | None) -> float:
+    if resumen.get("limite_velocidad_kmh") is not None:
+        return float(resumen["limite_velocidad_kmh"])
+    if config:
+        return float((config.get("speed") or {}).get("campus_speed_limit_kmh", 30.0))
+    return 30.0
+
+
+def _aplicar_multa_difusa_resumen(resumen: dict, config: dict | None) -> dict:
+    kmh = _obtener_velocidad_kmh_desde_resumen(resumen)
+    if kmh is None:
+        return resumen
+    salida = dict(resumen)
+    limite = _obtener_limite_kmh_resumen(salida, config)
+    salida["clasificacion_difusa"] = clasificar_velocidad(kmh, limite, config)
+    salida["velocidad_kmh"] = kmh
+    salida.setdefault("limite_velocidad_kmh", limite)
+    return salida
+
+
+def _formatear_metrica_velocidad(velocidad: dict, estado_placa: str = "", difuso: dict | None = None) -> tuple[str, str | None]:
     """Texto principal y detalle del tracker de velocidad para la UI."""
     velocidad_kmh = velocidad.get("velocidad_kmh")
     if velocidad_kmh is not None:
-        return f"{float(velocidad_kmh):.0f} km/h", "Medicion completa (Linea 1 y Linea 2)"
+        detalle = "Tic-toc L1→L2 (cruce geometrico + sub-frame)"
+        if difuso and difuso.get("multa_texto"):
+            detalle = f"{difuso.get('multa_texto')} · {difuso.get('estado', '')}"
+        return f"{float(velocidad_kmh):.1f} km/h", detalle
 
     estado = str(velocidad.get("estado") or "esperando_linea_1")
+    if estado == "medicion_invalida":
+        motivo = velocidad.get("motivo_invalido") or "Medicion rechazada"
+        return "Medicion invalida", motivo
+
     etiquetas = {
         "esperando_linea_1": "Esperando Linea 1",
         "esperando_linea_2": "Esperando Linea 2",
@@ -992,17 +1190,19 @@ def _formatear_metrica_velocidad(velocidad: dict, estado_placa: str = "") -> tup
 
     frame_l1 = velocidad.get("frame_cruce_linea_1")
     frame_l2 = velocidad.get("frame_cruce_linea_2")
+    frame_l1_x = velocidad.get("frame_cruce_linea_1_exacto")
     if estado == "esperando_linea_1":
         if estado_placa in {"Detectada", "Mantenida"}:
             detalle = "Placa detectada · aun no cruza Linea 1 (cian)"
         else:
             detalle = "Esperando vehiculo sobre Linea 1"
     elif estado == "esperando_linea_2":
-        detalle = f"Linea 1 cruzada (frame {frame_l1}) · falta Linea 2 (azul)"
+        tic = f"{frame_l1_x:.2f}" if frame_l1_x is not None else str(frame_l1)
+        detalle = f"TIC en frame {tic} · esperando TOC en Linea 2 (azul)"
     elif frame_l1 is not None and frame_l2 is not None:
         detalle = f"Cruces: L1 frame {frame_l1} · L2 frame {frame_l2}"
     else:
-        detalle = "Monitoreo de lineas activo"
+        detalle = "Monitoreo tic-toc entre lineas activo"
 
     return principal, detalle
 
@@ -1012,10 +1212,13 @@ def _detalle_lineas_velocidad(velocidad: dict, resumen: dict) -> str:
     partes = []
     distancia = velocidad.get("distancia_metros") or resumen.get("distancia_lineas_m")
     if distancia is not None:
-        partes.append(f"Distancia real: {float(distancia):.1f} m")
+        partes.append(f"Distancia calibrada: {float(distancia):.1f} m")
     limite = resumen.get("limite_velocidad_kmh")
     if limite is not None:
         partes.append(f"Limite: {float(limite):.0f} km/h")
+    fps = velocidad.get("fps") or resumen.get("fps")
+    if fps:
+        partes.append(f"FPS video: {float(fps):.2f}")
     l1 = resumen.get("posicion_linea_1")
     l2 = resumen.get("posicion_linea_2")
     if l1 is not None and l2 is not None:
@@ -1023,10 +1226,22 @@ def _detalle_lineas_velocidad(velocidad: dict, resumen: dict) -> str:
     centro_y = velocidad.get("centro_y")
     if centro_y is not None:
         partes.append(f"Centro placa Y: {int(centro_y)} px")
+    t1 = velocidad.get("tiempo_cruce_linea_1")
+    t2 = velocidad.get("tiempo_cruce_linea_2")
     tiempo = velocidad.get("tiempo_entre_lineas")
+    if t1 is not None and t2 is not None:
+        partes.append(f"TIC {float(t1):.4f} s · TOC {float(t2):.4f} s")
     if tiempo is not None:
-        partes.append(f"Tiempo entre lineas: {float(tiempo):.3f} s")
+        partes.append(f"Delta t: {float(tiempo):.4f} s")
     return " · ".join(partes)
+
+
+def _mostrar_formula_velocidad(velocidad: dict) -> None:
+    formula = velocidad.get("formula_medicion")
+    if formula:
+        st.caption(f"Formula: {formula}")
+    elif velocidad.get("estado") == "medicion_invalida" and velocidad.get("motivo_invalido"):
+        st.warning(velocidad["motivo_invalido"])
 
 
 def _render_panel_deteccion_esencial(
@@ -1048,11 +1263,17 @@ def _render_panel_deteccion_esencial(
     if velocidad_kmh is not None and not difuso:
         difuso = clasificar_velocidad(
             float(velocidad_kmh),
-            float(resumen.get("limite_velocidad_kmh") or 30.0),
+            _obtener_limite_kmh_resumen(resumen, config),
+            config,
         )
+        resumen["clasificacion_difusa"] = difuso
 
-    texto_velocidad, detalle_velocidad = _formatear_metrica_velocidad(velocidad, estado_placa)
-    texto_sancion = difuso.get("estado") or ("—" if velocidad_kmh is None else "Pendiente")
+    texto_velocidad, detalle_velocidad = _formatear_metrica_velocidad(velocidad, estado_placa, difuso)
+    texto_sancion = (
+        difuso.get("multa_texto")
+        or difuso.get("estado")
+        or ("—" if velocidad_kmh is None else "Pendiente")
+    )
 
     col_img, col_main = st.columns([0.3, 0.7], gap="medium")
     with col_img:
@@ -1065,11 +1286,14 @@ def _render_panel_deteccion_esencial(
         m1, m2, m3 = st.columns(3)
         m1.metric("Velocidad", texto_velocidad, delta=detalle_velocidad)
         m2.metric("Deteccion", estado_placa)
-        m3.metric("Sancion", texto_sancion)
+        m3.metric("Multa / sancion", texto_sancion)
 
         detalle_lineas = _detalle_lineas_velocidad(velocidad, resumen)
         if detalle_lineas:
             st.caption(detalle_lineas)
+        _mostrar_formula_velocidad(velocidad)
+        if difuso.get("metodo"):
+            st.caption(f"Logica difusa: {difuso['metodo']} · categoria {difuso.get('categoria_fuzzy', '—')}")
 
         partes_conf = []
         if conf_yolo is not None:
@@ -1266,22 +1490,126 @@ def _reiniciar_ocr_vivo_si_cambio_evento(resumen: dict) -> dict:
         st.session_state.ocr_evento_vivo_id = evento_id
         st.session_state.lecturas_evento_id = evento_id
         st.session_state.lecturas_evento_placa_monitoreo = []
-        st.session_state.ultimo_recorte_ocr_procesado = None
-        st.session_state.ultimo_resultado_ocr_monitoreo = None
-        st.session_state.ultima_clave_panel_monitoreo = None
-        return _limpiar_campos_ocr_resumen(resumen)
-    if prev is None:
+    elif prev is None:
         st.session_state.ocr_evento_vivo_id = evento_id
         st.session_state.lecturas_evento_id = evento_id
-    return resumen
+    limpio = dict(resumen)
+    for campo in _CAMPOS_OCR_RESUMEN:
+        limpio.pop(campo, None)
+    return limpio
 
 
-def _cache_key_ocr_evento_cerrado(evento_id: int, ruta_recorte: str) -> str:
-    return f"evt{int(evento_id)}|{ruta_recorte}"
+def _cache_key_ocr_evento_id(evento_id: int) -> str:
+    return f"evento_{int(evento_id)}"
 
 
-def _construir_resumen_evento_cerrado(evento: dict, fuente: str) -> dict:
-    return {
+def _cache_key_ocr_evento_cerrado(evento_id: int, ruta_recorte: str = "") -> str:
+    return _cache_key_ocr_evento_id(evento_id)
+
+
+def _solicitar_ocr_evento_tiempo_real(evento_id: int, ruta_recorte: str, resumen_base: dict) -> None:
+    eid = int(evento_id)
+    cache = st.session_state.setdefault("ocr_eventos_cache", {})
+    if cache.get(eid, {}).get("estado") == "listo":
+        return
+    cache_key = _cache_key_ocr_evento_id(eid)
+    with _OCR_ASYNC_LOCK:
+        ya_pendiente = cache_key in _OCR_ASYNC_PENDIENTES
+        ya_listo = cache_key in _OCR_ASYNC_RESULTADOS
+    if cache.get(eid, {}).get("estado") == "pendiente" and (ya_pendiente or ya_listo):
+        return
+    cache[eid] = {
+        "estado": "pendiente",
+        "ruta_recorte": str(ruta_recorte),
+        "resumen_base": dict(resumen_base),
+    }
+    st.session_state.ocr_eventos_cache = cache
+    encolados = st.session_state.setdefault("ocr_eventos_encolados", set())
+    if eid in encolados:
+        return
+    encolados.add(eid)
+    with _OCR_ASYNC_LOCK:
+        if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
+            return
+        _OCR_ASYNC_PENDIENTES.add(cache_key)
+    contexto = {
+        "funcion": "_solicitar_ocr_evento_tiempo_real",
+        "evento_id": eid,
+        "frame_actual": resumen_base.get("frame_actual"),
+        "fuente": resumen_base.get("fuente"),
+    }
+    threading.Thread(
+        target=_tarea_ocr_monitoreo_asincrona,
+        args=(cache_key, str(ruta_recorte), contexto, dict(resumen_base)),
+        daemon=True,
+    ).start()
+
+
+def _sync_cola_item_desde_cache(evento_id: int, entry: dict, config: dict, placa_controlada: str) -> None:
+    cola = st.session_state.get("eventos_monitoreo_cola") or []
+    for item in cola:
+        if int(item.get("evento_id") or 0) != int(evento_id):
+            continue
+        if entry.get("estado") == "listo" and entry.get("resumen_completo"):
+            item["estado_ocr"] = "listo"
+            item["resumen"] = dict(entry["resumen_completo"])
+            _actualizar_historial_monitoreo(item["resumen"])
+        elif entry.get("estado") == "error":
+            item["estado_ocr"] = "error"
+            item["resumen"].update(entry.get("datos") or {})
+        break
+    st.session_state.eventos_monitoreo_cola = cola
+
+
+def _actualizar_cache_ocr_eventos(config: dict, placa_controlada: str) -> bool:
+    cache = st.session_state.setdefault("ocr_eventos_cache", {})
+    if not cache:
+        return False
+    hubo_cambio = False
+    for eid, entry in list(cache.items()):
+        if entry.get("estado") != "pendiente":
+            continue
+        cache_key = _cache_key_ocr_evento_id(int(eid))
+        with _OCR_ASYNC_LOCK:
+            payload = _OCR_ASYNC_RESULTADOS.pop(cache_key, None)
+        if not payload:
+            continue
+        hubo_cambio = True
+        resumen = dict(entry.get("resumen_base") or {})
+        resumen["evento_id"] = int(eid)
+        ruta_recorte = str(entry.get("ruta_recorte") or payload.get("ruta_recorte") or "")
+        if payload.get("error"):
+            entry["estado"] = "error"
+            entry["datos"] = {
+                "texto_ocr_crudo": "Sin lectura",
+                "texto_ocr_corregido": "Sin lectura",
+                "confianza_ocr": None,
+                "formato_ocr_valido": False,
+                "estado_ocr": "error",
+                "mensaje_ocr": payload["error"],
+                "lector_cnn_ok": False,
+            }
+        else:
+            resumen = _aplicar_resultado_ocr_monitoreo(
+                resumen,
+                payload["resultado_ocr"],
+                float(payload.get("tiempo_lector_ms") or 0.0),
+                ruta_recorte,
+                cache_key,
+                registrar_metricas=False,
+            )
+            entry["estado"] = "listo"
+            entry["datos"] = {campo: resumen.get(campo) for campo in _CAMPOS_OCR_RESUMEN if campo in resumen}
+            placa = _obtener_placa_para_evento(resumen, placa_controlada)
+            entry["resumen_completo"] = preparar_estado_notificacion_evento(resumen, placa, config)
+        _sync_cola_item_desde_cache(int(eid), entry, config, placa_controlada)
+    if hubo_cambio:
+        st.session_state.ocr_eventos_cache = cache
+    return hubo_cambio
+
+
+def _construir_resumen_evento_cerrado(evento: dict, fuente: str, config: dict | None = None) -> dict:
+    resumen = {
         "evento_id": evento.get("evento_id"),
         "eventos_placa": evento.get("evento_id"),
         "frame_mejor_evento": evento.get("frame_mejor"),
@@ -1290,15 +1618,19 @@ def _construir_resumen_evento_cerrado(evento: dict, fuente: str) -> dict:
         "mejor_confianza_evento": evento.get("mejor_confianza"),
         "ruta_mejor_recorte_evento": evento.get("ruta_mejor_recorte"),
         "ruta_mejor_frame_evento": evento.get("ruta_mejor_frame"),
+        "ruta_frame_evento_en_vivo": evento.get("ruta_frame_evento_en_vivo"),
+        "mejor_recorte_placa": evento.get("ruta_mejor_recorte"),
         "ultima_deteccion": {
             "confianza": evento.get("mejor_confianza"),
             "bbox": evento.get("mejor_bbox"),
         },
         "velocidad": evento.get("velocidad") or {},
+        "limite_velocidad_kmh": evento.get("limite_velocidad_kmh"),
         "fuente": fuente,
         "estado_placa": "Cerrado",
         "evento_activo": False,
     }
+    return _aplicar_multa_difusa_resumen(resumen, config)
 
 
 def _registrar_evento_cerrado_monitoreo(
@@ -1314,15 +1646,25 @@ def _registrar_evento_cerrado_monitoreo(
     if any(item.get("evento_id") == evento_id for item in cola):
         return
 
-    resumen = _construir_resumen_evento_cerrado(evento, fuente)
+    resumen = _construir_resumen_evento_cerrado(evento, fuente, config)
     ruta_recorte = evento.get("ruta_mejor_recorte")
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    cache_entry = cache.get(evento_id)
+    estado_ocr_inicial = "pendiente"
+    if cache_entry and cache_entry.get("estado") == "listo" and cache_entry.get("resumen_completo"):
+        resumen = dict(cache_entry["resumen_completo"])
+        estado_ocr_inicial = "listo"
+    elif cache_entry and cache_entry.get("estado") == "error":
+        resumen.update(cache_entry.get("datos") or {})
+        estado_ocr_inicial = "error"
+
     item = {
         "evento_id": evento_id,
         "hora": datetime.now().strftime("%H:%M:%S"),
         "resumen": resumen,
         "ruta_recorte": str(ruta_recorte) if ruta_recorte else None,
         "frame_mejor": evento.get("frame_mejor"),
-        "estado_ocr": "pendiente",
+        "estado_ocr": estado_ocr_inicial,
         "notificacion_enviada": False,
     }
     cola.insert(0, item)
@@ -1334,18 +1676,28 @@ def _registrar_evento_cerrado_monitoreo(
     )
 
     ruta_recorte = evento.get("ruta_mejor_recorte")
-    if ruta_recorte and Path(str(ruta_recorte)).exists():
-        _encolar_ocr_evento_cerrado(evento_id, resumen, str(ruta_recorte))
+    if estado_ocr_inicial == "pendiente" and ruta_recorte and Path(str(ruta_recorte)).exists():
+        if not (cache_entry and cache_entry.get("estado") in ("pendiente", "listo")):
+            _encolar_ocr_evento_cerrado(evento_id, resumen, str(ruta_recorte))
 
     _actualizar_historial_monitoreo(resumen)
 
 
 def _encolar_ocr_evento_cerrado(evento_id: int, resumen: dict, ruta_recorte: str) -> None:
-    cache_key = _cache_key_ocr_evento_cerrado(evento_id, ruta_recorte)
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    if cache.get(int(evento_id), {}).get("estado") == "listo":
+        return
+    cache_key = _cache_key_ocr_evento_id(evento_id)
     with _OCR_ASYNC_LOCK:
         if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
             return
         _OCR_ASYNC_PENDIENTES.add(cache_key)
+    if int(evento_id) not in (st.session_state.get("ocr_eventos_cache") or {}):
+        st.session_state.setdefault("ocr_eventos_cache", {})[int(evento_id)] = {
+            "estado": "pendiente",
+            "ruta_recorte": str(ruta_recorte),
+            "resumen_base": dict(resumen),
+        }
     contexto = {
         "funcion": "_encolar_ocr_evento_cerrado",
         "evento_id": evento_id,
@@ -1373,7 +1725,17 @@ def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
         ruta_recorte = resumen.get("ruta_mejor_recorte_evento")
         if not ruta_recorte:
             continue
-        cache_key = _cache_key_ocr_evento_cerrado(evento_id, str(ruta_recorte))
+        cache_key = _cache_key_ocr_evento_id(evento_id)
+        cache = st.session_state.get("ocr_eventos_cache") or {}
+        cache_entry = cache.get(evento_id)
+        if cache_entry and cache_entry.get("estado") == "listo" and cache_entry.get("resumen_completo"):
+            item["estado_ocr"] = "listo"
+            item["resumen"] = dict(cache_entry["resumen_completo"])
+            placa = _obtener_placa_para_evento(item["resumen"], placa_controlada)
+            item["resumen"] = preparar_estado_notificacion_evento(item["resumen"], placa, config)
+            _actualizar_historial_monitoreo(item["resumen"])
+            hubo_cambio = True
+            continue
         with _OCR_ASYNC_LOCK:
             payload = _OCR_ASYNC_RESULTADOS.pop(cache_key, None)
         if not payload:
@@ -1403,12 +1765,49 @@ def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
             item["estado_ocr"] = "listo"
         placa = _obtener_placa_para_evento(resumen, placa_controlada)
         item["resumen"] = preparar_estado_notificacion_evento(resumen, placa, config)
+        cache = st.session_state.setdefault("ocr_eventos_cache", {})
+        cache[evento_id] = {
+            "estado": item["estado_ocr"],
+            "ruta_recorte": str(ruta_recorte),
+            "resumen_base": dict(item["resumen"]),
+            "datos": {campo: resumen.get(campo) for campo in _CAMPOS_OCR_RESUMEN if campo in resumen},
+            "resumen_completo": dict(item["resumen"]) if item["estado_ocr"] == "listo" else None,
+        }
+        st.session_state.ocr_eventos_cache = cache
         _actualizar_historial_monitoreo(item["resumen"])
         hubo_cambio = True
     if hubo_cambio:
         st.session_state.eventos_monitoreo_cola = cola
         _procesar_envio_automatico_cola(config, placa_controlada)
     return hubo_cambio
+
+
+def _procesar_cola_ocr_monitoreo(
+    config: dict,
+    placa_controlada: str,
+    resumen_live: dict | None = None,
+    *,
+    forzar: bool = False,
+    frame_actual: int | None = None,
+) -> tuple[dict, bool]:
+    """Procesa OCR de vehiculos cerrados con throttle corto; no reinicia OCR en vivo."""
+    resumen = dict(resumen_live or {})
+    ahora = time.perf_counter()
+    ultimo = float(st.session_state.get("ultimo_cola_ocr_ts") or 0.0)
+    cache = st.session_state.get("ocr_eventos_cache") or {}
+    tiene_pendiente = any(entry.get("estado") == "pendiente" for entry in cache.values())
+    intervalo = 0.12 if (tiene_pendiente or forzar) else 0.25
+    if not forzar and (ahora - ultimo) < intervalo:
+        return resumen, False
+    st.session_state.ultimo_cola_ocr_ts = ahora
+    hubo_cache = _actualizar_cache_ocr_eventos(config, placa_controlada)
+    hubo_cola = _procesar_ocr_cola_eventos(config, placa_controlada)
+    hubo = hubo_cache or hubo_cola
+    if hubo and frame_actual is not None:
+        _procesar_envio_automatico_cola(config, placa_controlada, int(frame_actual))
+    elif hubo:
+        _procesar_envio_automatico_cola(config, placa_controlada)
+    return resumen, hubo
 
 
 def _obtener_resumen_evento_seleccionado() -> tuple[dict, int | None]:
@@ -1640,10 +2039,14 @@ def _fusionar_ocr_asincrono_monitoreo(resumen: dict) -> tuple[dict, bool]:
 
 def _mostrar_panel_compacto_en_vivo(resumen: dict) -> None:
     """Panel minimo durante monitoreo activo."""
+    resumen_panel = _obtener_resumen_panel_vivo(resumen)
     cola = st.session_state.get("eventos_monitoreo_cola") or []
-    if cola:
+    otro = resumen_panel.get("capturando_otro_vehiculo")
+    if otro:
+        st.caption(f"Leyendo vehiculo anterior · capturando #{int(otro):03d} en camara")
+    elif cola:
         st.caption(f"{len(cola)} vehiculo(s) registrado(s) · evento actual #{int(resumen.get('evento_id') or 0):03d}")
-    _render_panel_deteccion_esencial(resumen)
+    _render_panel_deteccion_esencial(resumen_panel)
 
 
 def _enriquecer_resumen_monitoreo_con_ocr(resumen: dict) -> dict:
@@ -1906,6 +2309,8 @@ def _inicializar_estado_monitoreo() -> None:
         "ultimo_evento_cerrado_registrado": 0,
         "ocr_evento_vivo_id": None,
         "lecturas_evento_id": None,
+        "ocr_eventos_cache": {},
+        "ocr_eventos_encolados": set(),
         "pasos_grupo_notificados": [],
         "pasos_grupo_descartados": [],
     }
@@ -1973,24 +2378,24 @@ def pestana_monitoreo(config: dict) -> None:
 
         rotacion_ui = "Sin rotacion"
         modo_rendimiento = "Balanceado"
-        config_rendimiento = _config_modo_rendimiento(config, modo_rendimiento)
+        config_rendimiento = _config_rendimiento_monitoreo(config, modo_rendimiento, fuente_monitoreo)
         max_display_fps = int(config_rendimiento.get("max_display_fps", 0) or 0)
 
         distancia_metros = float(config["speed"].get("default_distance_meters", 10.0))
         limite_velocidad = float(config["speed"].get("campus_speed_limit_kmh", 30.0))
         posicion_linea_1 = 0.45
         posicion_linea_2 = 0.65
-        frecuencia_deteccion = 5 if fuente_monitoreo == "Video de prueba" else 3
-        frecuencia_deteccion = int((config.get("monitoring_performance") or {}).get("video" if fuente_monitoreo == "Video de prueba" else "camara", {}).get("yolo_every_n_frames", frecuencia_deteccion))
+        frecuencia_deteccion = int(config_rendimiento.get("yolo_every_n_frames", 5))
         inference_size = int(config_rendimiento["inference_size"])
         render_every_n_frames = int(config_rendimiento["render_every_n_frames"])
+        max_frame_width = int(config_rendimiento.get("max_frame_width", 960) or 0)
         st.session_state.historial_maximo_monitoreo = int(config_rendimiento["history_max"])
         conf_min = 0.45
-        persistencia_frames = 10
+        persistencia_frames = 4
         max_frames = 0
         velocidad_reproduccion = "Normal (1x)"
         placa_controlada = str(config.get("ocr", {}).get("manual_test_plate", "PBC1234"))
-        ancho_visual_max = 800
+        ancho_visual_max = int(config_rendimiento.get("preview_width", 640) or 640)
         guardar_debug_monitoreo = False
         resolucion_camara = "1280x720"
         fps_camara_objetivo = 30
@@ -2007,6 +2412,7 @@ def pestana_monitoreo(config: dict) -> None:
                 min_value=0.1,
                 value=distancia_metros,
                 step=0.5,
+                help="Distancia fisica medida en calle entre Linea 1 y Linea 2. v = distancia / delta_t (tic-toc).",
                 key="distancia_monitoreo_avanzada",
             )
             limite_velocidad = st.number_input(
@@ -2040,8 +2446,16 @@ def pestana_monitoreo(config: dict) -> None:
                 "FPS maximo visual (0 = sin limite)", 0, 30, max_display_fps, 1, key="monitoreo_max_display_fps"
             )
             ancho_visual_max = st.select_slider(
-                "Ancho maximo visual", options=[640, 800, 960, 1200], value=ancho_visual_max, key="monitoreo_ancho_visual"
+                "Ancho maximo visual", options=[480, 640, 800, 960], value=ancho_visual_max, key="monitoreo_ancho_visual"
             )
+            if fuente_monitoreo == "Video de prueba":
+                max_frame_width = st.select_slider(
+                    "Ancho maximo procesamiento video",
+                    options=[0, 720, 960, 1280],
+                    value=max_frame_width if max_frame_width in {0, 720, 960, 1280} else 960,
+                    help="Reduce la resolucion interna del video para acelerar YOLO y la visualizacion. 0 = resolucion original.",
+                    key="monitoreo_max_frame_width",
+                )
             conf_min = st.slider("Confianza minima YOLO", 0.10, 0.90, conf_min, 0.05, key="monitoreo_conf_min")
             persistencia_frames = st.slider(
                 "Persistencia de bbox",
@@ -2320,14 +2734,11 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultimo_resultado_parcial = resumen_parcial
 
         if monitoreo_activo:
-            ruta_ocr = _resolver_ruta_ocr_monitoreo(resumen_parcial)
-            if ruta_ocr:
-                _encolar_ocr_monitoreo_asincrono(resumen_parcial, ruta_ocr)
-            resumen_parcial, hubo_ocr = _fusionar_ocr_asincrono_monitoreo(resumen_parcial)
+            _, hubo_cola = _procesar_cola_ocr_monitoreo(config, placa_controlada, resumen_parcial)
             st.session_state.ultimo_resultado_parcial = resumen_parcial
             ahora = time.perf_counter()
             ultimo_panel = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
-            if hubo_ocr or (ahora - ultimo_panel) >= 2.0:
+            if hubo_cola or (ahora - ultimo_panel) >= 0.5:
                 with panel_placeholder.container():
                     _mostrar_panel_compacto_en_vivo(resumen_parcial)
                 st.session_state.ultimo_panel_vivo_ts = ahora
@@ -2346,63 +2757,78 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.ultimo_resultado = resumen_parcial
 
     def actualizar_frame(frame_rgb, numero_frame: int, estado_frame: dict | None = None) -> None:
-        frame_mostrado = _redimensionar_frame_rgb(frame_rgb, int(ancho_visual_max))
-        frame_placeholder.image(frame_mostrado, channels="RGB", use_container_width=True)
-        st.session_state.ultima_imagen_procesada = frame_mostrado
-        if estado_frame:
-            st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
+        imagen_ui = _preparar_imagen_streamlit(frame_rgb, int(ancho_visual_max))
+        if imagen_ui is not None:
+            frame_placeholder.image(imagen_ui, use_container_width=True)
+        if not estado_frame:
+            estado_placeholder.info(f"Procesando frame {numero_frame}")
+            return
+
+        ahora = time.perf_counter()
+        st.session_state.frame_actual = int(estado_frame.get("frame_actual", numero_frame) or 0)
+        ultimo_persistencia = float(st.session_state.get("ultimo_persistencia_ui_ts") or 0.0)
+        hubo_evento = bool(estado_frame.get("evento_recien_cerrado"))
+        if hubo_evento or (ahora - ultimo_persistencia) >= 0.5:
             if estado_frame.get("estado_persistencia"):
                 st.session_state.estado_persistencia = estado_frame["estado_persistencia"]
-            resumen_live = dict(st.session_state.get("ultimo_resultado_parcial") or {})
-            resumen_live.update(estado_frame)
-            resumen_live.setdefault("frames_procesados", estado_frame.get("frame_actual", numero_frame))
-            resumen_live.setdefault("fuente", fuente_monitoreo)
-            resumen_live.setdefault("placa_controlada", placa_controlada)
-            resumen_live = _reiniciar_ocr_vivo_si_cambio_evento(resumen_live)
+            st.session_state.ultimo_persistencia_ui_ts = ahora
 
-            evento_cerrado = estado_frame.get("evento_recien_cerrado")
-            if evento_cerrado:
-                _registrar_evento_cerrado_monitoreo(
-                    evento_cerrado,
-                    config,
-                    placa_controlada,
-                    fuente_monitoreo,
-                )
-                st.session_state.ultimo_recorte_ocr_procesado = None
-                st.session_state.ultimo_resultado_ocr_monitoreo = None
-                st.session_state.lecturas_evento_placa_monitoreo = []
-                st.session_state.ultima_clave_panel_monitoreo = None
-                resumen_live = _limpiar_campos_ocr_resumen(resumen_live)
+        resumen_live = dict(st.session_state.get("ultimo_resultado_parcial") or {})
+        for campo in (
+            "texto_ocr_crudo",
+            "texto_ocr_corregido",
+            "confianza_ocr",
+            "formato_ocr_valido",
+            "estado_ocr",
+            "mensaje_ocr",
+            "placa_consolidada_evento",
+            "placa_individual",
+        ):
+            resumen_live.pop(campo, None)
+        resumen_live.update(estado_frame)
+        resumen_live.setdefault("frames_procesados", estado_frame.get("frame_actual", numero_frame))
+        resumen_live.setdefault("fuente", fuente_monitoreo)
+        resumen_live.setdefault("placa_controlada", placa_controlada)
+        resumen_live = _reiniciar_ocr_vivo_si_cambio_evento(resumen_live)
+        st.session_state.ultimo_resultado_parcial = resumen_live
 
-            clave_panel = _clave_actualizacion_ocr_monitoreo(estado_frame)
-            if clave_panel != st.session_state.get("ultima_clave_panel_monitoreo") and (
-                estado_frame.get("ruta_recorte_evento_en_vivo")
-                or estado_frame.get("mejor_recorte_placa")
-                or estado_frame.get("ultimo_recorte_placa")
-            ):
-                st.session_state.ultima_clave_panel_monitoreo = clave_panel
-                resumen_live = _limpiar_campos_ocr_resumen(resumen_live)
-                st.session_state.ultimo_recorte_ocr_procesado = None
-                st.session_state.ultimo_resultado_ocr_monitoreo = None
-                ruta_ocr = _resolver_ruta_ocr_monitoreo(estado_frame)
-                if ruta_ocr:
-                    _encolar_ocr_monitoreo_asincrono(resumen_live, ruta_ocr)
+        ocr_pendiente = estado_frame.get("ocr_evento_pendiente")
+        if ocr_pendiente and ocr_pendiente.get("evento_id") and ocr_pendiente.get("ruta_recorte"):
+            base_ocr = dict(resumen_live)
+            base_ocr["evento_id"] = int(ocr_pendiente["evento_id"])
+            base_ocr["ruta_snapshot_ocr_evento"] = ocr_pendiente["ruta_recorte"]
+            _solicitar_ocr_evento_tiempo_real(
+                int(ocr_pendiente["evento_id"]),
+                str(ocr_pendiente["ruta_recorte"]),
+                base_ocr,
+            )
 
-            resumen_live, _ = _fusionar_ocr_asincrono_monitoreo(resumen_live)
-            hubo_cola = _procesar_ocr_cola_eventos(config, placa_controlada)
-            if hubo_cola:
-                _procesar_envio_automatico_cola(
-                    config,
-                    placa_controlada,
-                    int(estado_frame.get("frame_actual", numero_frame) or 0),
-                )
-            st.session_state.ultimo_resultado_parcial = resumen_live
+        evento_cerrado = estado_frame.get("evento_recien_cerrado")
+        if evento_cerrado:
+            _registrar_evento_cerrado_monitoreo(
+                evento_cerrado,
+                config,
+                placa_controlada,
+                fuente_monitoreo,
+            )
 
+        resumen_live, hubo_cola = _procesar_cola_ocr_monitoreo(
+            config,
+            placa_controlada,
+            resumen_live,
+            forzar=bool(evento_cerrado),
+            frame_actual=int(estado_frame.get("frame_actual", numero_frame) or 0),
+        )
+
+        ultimo_estado_ui = float(st.session_state.get("ultimo_estado_ui_ts") or 0.0)
+        if (ahora - ultimo_estado_ui) >= 0.4:
             confianza = estado_frame.get("ultima_confianza")
             texto_confianza = f"{confianza:.0%}" if confianza is not None else "—"
             fps_proc = estado_frame.get("fps_procesamiento", "—")
-            placa_ui = _obtener_texto_placa_ui(resumen_live)
-            if placa_ui == "Leyendo...":
+            placa_ui = _obtener_texto_placa_ui(_obtener_resumen_panel_vivo(resumen_live))
+            if placa_ui.startswith("Capturando"):
+                texto_placa = f" · {placa_ui}"
+            elif placa_ui == "Leyendo...":
                 texto_placa = " · Leyendo placa..."
             elif placa_ui != "—":
                 texto_placa = f" · {placa_ui}"
@@ -2410,21 +2836,42 @@ def pestana_monitoreo(config: dict) -> None:
                 texto_placa = ""
             cola_n = len(st.session_state.get("eventos_monitoreo_cola") or [])
             texto_cola = f" · {cola_n} vehiculo(s) registrado(s)" if cola_n else ""
+            saltados = int(estado_frame.get("frames_saltados") or 0)
+            texto_saltos = f" · {saltados} frames recuperados" if saltados else ""
             estado_placeholder.info(
-                f"{estado_frame.get('estado_placa', '—')}{texto_placa} · YOLO {texto_confianza} · {fps_proc} FPS{texto_cola}"
+                f"{estado_frame.get('estado_placa', '—')}{texto_placa} · YOLO {texto_confianza} · {fps_proc} FPS{texto_cola}{texto_saltos}"
             )
+            st.session_state.ultimo_estado_ui_ts = ahora
 
-            ahora = time.perf_counter()
-            ultimo_panel = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
-            if hubo_cola or (ahora - ultimo_panel) >= 2.0 and _obtener_ruta_recorte_ui(resumen_live):
-                with panel_placeholder.container():
-                    _mostrar_panel_compacto_en_vivo(resumen_live)
-                st.session_state.ultimo_panel_vivo_ts = ahora
-        else:
-            estado_placeholder.info(f"Procesando frame {numero_frame}")
+        hubo_evento = bool(evento_cerrado)
+        ultimo_pesado = float(st.session_state.get("ultimo_panel_vivo_ts") or 0.0)
+        cache_pendiente = any(
+            entry.get("estado") == "pendiente"
+            for entry in (st.session_state.get("ocr_eventos_cache") or {}).values()
+        )
+        intervalo_panel = 0.35 if cache_pendiente else 0.8
+        debe_pesado = (
+            hubo_evento
+            or hubo_cola
+            or bool(ocr_pendiente)
+            or (ahora - ultimo_pesado) >= intervalo_panel
+        )
+
+        if not debe_pesado:
+            return
+
+        st.session_state.ultimo_resultado_parcial = resumen_live
+
+        with panel_placeholder.container():
+            _mostrar_panel_compacto_en_vivo(resumen_live)
+        st.session_state.ultimo_panel_vivo_ts = ahora
 
     def actualizar_progreso(valor: float) -> None:
-        progreso.progress(valor)
+        ahora = time.perf_counter()
+        ultimo = float(st.session_state.get("ultimo_progreso_ui_ts") or 0.0)
+        if (ahora - ultimo) >= 0.25 or valor >= 0.999:
+            progreso.progress(valor)
+            st.session_state.ultimo_progreso_ui_ts = ahora
 
     if not ejecutar_monitoreo:
         if st.session_state.get("ultima_imagen_procesada") is not None:
@@ -2478,11 +2925,13 @@ def pestana_monitoreo(config: dict) -> None:
                 inference_size=int(inference_size),
                 render_every_n_frames=int(render_every_n_frames),
                 max_display_fps=int(max_display_fps),
+                max_frame_width=int(max_frame_width),
                 demo_fluido=modo_rendimiento == "Demo fluido",
                 guardar_debug=bool(guardar_debug_monitoreo),
                 frame_callback=actualizar_frame,
                 progreso_callback=actualizar_progreso,
                 detener_callback=lambda: not st.session_state.get("monitoreo_activo", True),
+                tiempo_real=True,
             )
         else:
             resumen = procesar_camara_monitoreo(

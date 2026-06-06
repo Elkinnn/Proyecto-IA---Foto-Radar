@@ -12,6 +12,8 @@ speed:
   default_distance_meters: 10.0
   default_time_seconds: 1.5
   campus_speed_limit_kmh: 30.0
+  # Distancia medida en calle entre las marcas fisicas de Linea 1 y Linea 2.
+  # La velocidad usa tic-toc geometrico: v = distancia_m / delta_t * 3.6
 
 ocr:
   default_mode: manual_controlado
@@ -31,27 +33,33 @@ plate_crop_selection:
 
 monitoring_performance:
   video:
-    yolo_every_n_frames: 5
+    yolo_every_n_frames: 8
+    inference_size: 416
+    render_every_n_frames: 1
+    max_display_fps: 0
+    max_frame_width: 960
+    preview_width: 640
   camara:
     yolo_every_n_frames: 3
+    max_display_fps: 24
   rapido:
     yolo_every_n_frames: 5
     inference_size: 416
     render_every_n_frames: 1
     history_max: 10
-    max_display_fps: 24
+    max_display_fps: 0
   balanceado:
     yolo_every_n_frames: 5
     inference_size: 512
     render_every_n_frames: 1
     history_max: 10
-    max_display_fps: 24
+    max_display_fps: 0
   preciso:
     yolo_every_n_frames: 3
     inference_size: 640
     render_every_n_frames: 1
     history_max: 10
-    max_display_fps: 24
+    max_display_fps: 0
 
 fuzzy:
   seguro_hasta: 20
@@ -59,6 +67,14 @@ fuzzy:
   precaucion_hasta: 35
   exceso_leve_hasta: 40
   exceso_medio_hasta: 50
+  solapamiento_kmh: 2.0
+  multa_usd:
+    seguro: 0
+    permitido: 0
+    precaucion: 0
+    exceso_leve: 15
+    exceso_medio: 35
+    exceso_alto: 60
   suspension_horas:
     seguro: 0
     permitido: 0
@@ -68,7 +84,7 @@ fuzzy:
     exceso_alto: 12
 
 notificaciones:
-  # Velocidad/limite "quemados" para el mensaje difuso del correo (demo).
+  # Solo si no hay velocidad medida en el evento (fallback de prueba).
   velocidad_demo_kmh: 47.0
   limite_demo_kmh: 30.0
   # Configuracion SMTP. Por seguridad, las credenciales se leen preferentemente
