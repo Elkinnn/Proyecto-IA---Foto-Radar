@@ -2,14 +2,41 @@ from datetime import datetime
 from pathlib import Path
 import csv
 from functools import lru_cache
+import hashlib
 import json
 import re
+import threading
 import traceback
 
 import cv2
 import numpy as np
 
 from src.utils import normalizar_placa
+
+
+def _imread_seguro(ruta, flags=cv2.IMREAD_COLOR):
+    """Lectura robusta de imagen que NO lanza excepcion si el archivo esta
+    vacio, a medio escribir o bloqueado (caso comun en el OCR en vivo con
+    varios hilos escribiendo/leyendo recortes y debug a la vez).
+
+    Ultralytics parchea cv2.imread con una version que hace
+    np.fromfile + cv2.imdecode y CRASHEA con `!buf.empty()` cuando el buffer
+    esta vacio. Esa excepcion tumbaba toda la lectura CNN -> CNN 0% / formato
+    invalido. Aqui leemos los bytes nosotros mismos y devolvemos None ante
+    cualquier problema, en lugar de propagar el error.
+    """
+    try:
+        datos = np.fromfile(str(ruta), dtype=np.uint8)
+    except (OSError, ValueError):
+        return None
+    if datos is None or datos.size == 0:
+        return None
+    try:
+        return cv2.imdecode(datos, flags)
+    except cv2.error:
+        return None
+    except Exception:
+        return None
 
 
 RECONOCIMIENTO_CARACTERES_DIR = Path("reports") / "evidencias" / "reconocimiento_caracteres"
@@ -31,6 +58,9 @@ MODELO_CARACTERES_PATH = Path("models") / "character_reader" / "character_cnn.ke
 MODELO_CARACTERES_ROBUSTO_PATH = Path("models") / "character_reader" / "character_cnn_robusto.keras"
 MODELO_CARACTERES_FINETUNED_PATH = Path("models") / "character_reader" / "character_cnn_finetuned.keras"
 CLASS_NAMES_PATH = Path("models") / "character_reader" / "class_names.json"
+_MODELO_CARACTERES_LOCK = threading.RLock()
+_MODELO_CARACTERES_CACHE = None
+_MODELO_CARACTERES_CACHE_KEY = None
 
 Y_INICIO_BANDA = 0.34
 Y_FIN_BANDA = 0.95
@@ -157,38 +187,52 @@ def _resolver_ruta_modelo_caracteres() -> Path | None:
 
 
 def cargar_modelo_caracteres():
+    global _MODELO_CARACTERES_CACHE, _MODELO_CARACTERES_CACHE_KEY
+
     MODELO_CARACTERES_PATH.parent.mkdir(parents=True, exist_ok=True)
     ruta_modelo = _resolver_ruta_modelo_caracteres()
     if ruta_modelo is None:
         return None, "No existe un modelo propio de caracteres. Entrene primero el clasificador de caracteres."
     if not CLASS_NAMES_PATH.exists():
         return None, "No existe class_names.json para interpretar las salidas del modelo de caracteres."
-    try:
-        import tensorflow as tf
 
-        modelo = tf.keras.models.load_model(ruta_modelo)
-    except ImportError:
+    cache_key = (
+        str(ruta_modelo.resolve()),
+        int(ruta_modelo.stat().st_mtime_ns),
+        int(CLASS_NAMES_PATH.stat().st_mtime_ns),
+    )
+    with _MODELO_CARACTERES_LOCK:
+        if _MODELO_CARACTERES_CACHE is not None and _MODELO_CARACTERES_CACHE_KEY == cache_key:
+            return _MODELO_CARACTERES_CACHE, f"Modelo de caracteres reutilizado: {ruta_modelo.name}."
         try:
-            import keras
+            import tensorflow as tf
 
-            modelo = keras.models.load_model(ruta_modelo)
+            modelo = tf.keras.models.load_model(ruta_modelo)
         except ImportError:
-            return None, "No esta instalado TensorFlow ni Keras en este entorno. No se puede cargar la CNN de caracteres."
-        except Exception as exc:
-            return None, f"No se pudo cargar el modelo propio de caracteres con Keras: {exc}"
-    except Exception as exc:
-        return None, f"No se pudo cargar el modelo propio de caracteres con TensorFlow: {exc}"
+            try:
+                import keras
 
-    try:
-        class_names = json.loads(CLASS_NAMES_PATH.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return None, f"No se pudo cargar class_names.json: {exc}"
-    return (modelo, class_names), f"Modelo de caracteres cargado: {ruta_modelo.name}."
+                modelo = keras.models.load_model(ruta_modelo)
+            except ImportError:
+                return None, "No esta instalado TensorFlow ni Keras en este entorno. No se puede cargar la CNN de caracteres."
+            except Exception as exc:
+                return None, f"No se pudo cargar el modelo propio de caracteres con Keras: {exc}"
+        except Exception as exc:
+            return None, f"No se pudo cargar el modelo propio de caracteres con TensorFlow: {exc}"
+
+        try:
+            class_names = json.loads(CLASS_NAMES_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return None, f"No se pudo cargar class_names.json: {exc}"
+
+        _MODELO_CARACTERES_CACHE = (modelo, class_names)
+        _MODELO_CARACTERES_CACHE_KEY = cache_key
+        return _MODELO_CARACTERES_CACHE, f"Modelo de caracteres cargado: {ruta_modelo.name}."
 
 
 def normalizar_caracter_para_cnn(ruta_caracter: str) -> dict:
     DEBUG_CNN_INPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    imagen = cv2.imread(str(ruta_caracter), cv2.IMREAD_GRAYSCALE)
+    imagen = _imread_seguro(str(ruta_caracter), cv2.IMREAD_GRAYSCALE)
     if imagen is None:
         return {
             "array": None,
@@ -980,6 +1024,25 @@ def _nombre_seguro(ruta_imagen: str, nombre_base: str) -> str:
     return texto[:80]
 
 
+def _huella_archivo_imagen(ruta_imagen: str, longitud: int = 12) -> str:
+    """Identifica el contenido, no solo el nombre reutilizable del evento."""
+    digest = hashlib.sha256()
+    try:
+        with open(ruta_imagen, "rb") as archivo:
+            for bloque in iter(lambda: archivo.read(1024 * 1024), b""):
+                digest.update(bloque)
+        return digest.hexdigest()[:longitud]
+    except OSError:
+        respaldo = f"{ruta_imagen}|{datetime.now().isoformat(timespec='microseconds')}"
+        return hashlib.sha256(respaldo.encode("utf-8")).hexdigest()[:longitud]
+
+
+def _nombre_lectura_unica(ruta_imagen: str, nombre_base: str = "placa") -> str:
+    nombre = _nombre_seguro(ruta_imagen, nombre_base)
+    huella = _huella_archivo_imagen(ruta_imagen)
+    return f"{nombre[:67]}_{huella}"
+
+
 def _ordenar_puntos_cuadrilatero(puntos: np.ndarray) -> np.ndarray:
     puntos = puntos.reshape(4, 2).astype("float32")
     suma = puntos.sum(axis=1)
@@ -1372,7 +1435,7 @@ def rectificar_placa_para_lector_cnn(crop_placa, nombre_base: str = "placa") -> 
 
 def preprocesar_placa(ruta_imagen: str, nombre_base: str = "placa") -> dict:
     PREPROCESADAS_DIR.mkdir(parents=True, exist_ok=True)
-    imagen = cv2.imread(str(ruta_imagen))
+    imagen = _imread_seguro(str(ruta_imagen))
     if imagen is None:
         return {
             "ruta_imagen_procesada": None,
@@ -1380,7 +1443,15 @@ def preprocesar_placa(ruta_imagen: str, nombre_base: str = "placa") -> dict:
             "mensaje": "No se pudo cargar el recorte de placa.",
         }
 
-    nombre = _nombre_seguro(ruta_imagen, nombre_base)
+    # nombre_base ya incorpora la huella del recorte cuando proviene del lector
+    # completo. Preservarlo evita que otro evento sobrescriba estas evidencias.
+    # Las llamadas independientes que dejan el valor por defecto conservan el
+    # nombre derivado de su archivo de entrada.
+    nombre = (
+        _nombre_seguro(ruta_imagen, nombre_base)
+        if nombre_base == "placa"
+        else _nombre_seguro(nombre_base, "placa")
+    )
     rectificacion = rectificar_placa_para_lector_cnn(imagen, nombre)
     preprocesamiento = preprocesar_recorte_placa_para_ocr(rectificacion["placa_rectificada"], nombre)
     preprocesamiento["rectificacion"] = {
@@ -1513,7 +1584,7 @@ def preprocesar_recorte_placa_para_ocr(crop, nombre_base: str = "placa") -> dict
 
 def segmentar_caracteres(ruta_imagen_procesada: str, nombre_base: str = "placa") -> list[dict]:
     CARACTERES_DIR.mkdir(parents=True, exist_ok=True)
-    imagen = cv2.imread(str(ruta_imagen_procesada), cv2.IMREAD_GRAYSCALE)
+    imagen = _imread_seguro(str(ruta_imagen_procesada), cv2.IMREAD_GRAYSCALE)
     if imagen is None:
         return []
 
@@ -1567,7 +1638,7 @@ def segmentar_caracteres(ruta_imagen_procesada: str, nombre_base: str = "placa")
 def extraer_banda_caracteres(imagen_preprocesada, nombre_base: str = "placa") -> dict:
     BANDAS_DIR.mkdir(parents=True, exist_ok=True)
     if isinstance(imagen_preprocesada, (str, Path)):
-        imagen = cv2.imread(str(imagen_preprocesada), cv2.IMREAD_GRAYSCALE)
+        imagen = _imread_seguro(str(imagen_preprocesada), cv2.IMREAD_GRAYSCALE)
     else:
         imagen = imagen_preprocesada
 
@@ -1676,7 +1747,7 @@ def extraer_banda_caracteres(imagen_preprocesada, nombre_base: str = "placa") ->
 def segmentar_caracteres_v2(ruta_imagen_procesada: str, nombre_base: str = "placa") -> dict:
     CARACTERES_DIR.mkdir(parents=True, exist_ok=True)
     DEBUG_SEGMENTACION_DIR.mkdir(parents=True, exist_ok=True)
-    imagen = cv2.imread(str(ruta_imagen_procesada), cv2.IMREAD_GRAYSCALE)
+    imagen = _imread_seguro(str(ruta_imagen_procesada), cv2.IMREAD_GRAYSCALE)
     if imagen is None:
         return {
             "caracteres": [],
@@ -1813,7 +1884,7 @@ def segmentar_caracteres_v3_estrategias(ruta_imagen_procesada: str, nombre_base:
     DEBUG_SEGMENTACION_DIR.mkdir(parents=True, exist_ok=True)
     BANDAS_DIR.mkdir(parents=True, exist_ok=True)
     COMPARACION_DIR.mkdir(parents=True, exist_ok=True)
-    imagen = cv2.imread(str(ruta_imagen_procesada), cv2.IMREAD_GRAYSCALE)
+    imagen = _imread_seguro(str(ruta_imagen_procesada), cv2.IMREAD_GRAYSCALE)
     if imagen is None:
         return {
             "caracteres": [],
@@ -2684,7 +2755,7 @@ def _guardar_debug_slots_ecuador(nombre: str, etiqueta: str, datos: dict, carpet
             normalizado = normalizar_imagen_caracter_para_cnn(caracter, f"{nombre}_{etiqueta}_slot_{idx:02d}_debug")
             ruta_norm = normalizado.get("ruta_debug_normalizada")
             if ruta_norm and Path(ruta_norm).exists():
-                img_norm = cv2.imread(str(ruta_norm), cv2.IMREAD_GRAYSCALE)
+                img_norm = _imread_seguro(str(ruta_norm), cv2.IMREAD_GRAYSCALE)
                 if img_norm is not None:
                     cv2.imwrite(str(carpeta / f"slot_{idx:02d}_normalizado_32x32.png"), img_norm)
 
@@ -3108,7 +3179,7 @@ def segmentar_caracteres_camino_limpio(ruta_procesada: str, ruta_gris: str | Non
     """
     CARACTERES_DIR.mkdir(parents=True, exist_ok=True)
     BANDAS_DIR.mkdir(parents=True, exist_ok=True)
-    proc = cv2.imread(str(ruta_procesada), cv2.IMREAD_GRAYSCALE)
+    proc = _imread_seguro(str(ruta_procesada), cv2.IMREAD_GRAYSCALE)
     if proc is None:
         return {
             "caracteres": [],
@@ -3118,7 +3189,7 @@ def segmentar_caracteres_camino_limpio(ruta_procesada: str, ruta_gris: str | Non
             "puntaje_segmentacion": -999.0,
             "metodo": "camino_limpio",
         }
-    gris = cv2.imread(str(ruta_gris), cv2.IMREAD_GRAYSCALE) if ruta_gris else None
+    gris = _imread_seguro(str(ruta_gris), cv2.IMREAD_GRAYSCALE) if ruta_gris else None
     nombre = _nombre_seguro(ruta_procesada, nombre_base)
     alto, ancho = proc.shape[:2]
     margen_x = max(int(ancho * 0.04), 6)
@@ -3812,7 +3883,7 @@ def _leer_placa_desde_recorte_core(
     placa_esperada: str = "",
     metodo_segmentacion: str = "v3_estrategias",
 ) -> dict:
-    nombre_base = _nombre_seguro(ruta_imagen, "placa")
+    nombre_base = _nombre_lectura_unica(ruta_imagen, "placa")
     preprocesamiento = preprocesar_placa(ruta_imagen, nombre_base)
     caracteres = []
     segmentacion = {
@@ -3940,6 +4011,8 @@ def _leer_placa_desde_recorte_core(
 
     return {
         "ruta_imagen": str(ruta_imagen),
+        "id_lectura": nombre_base,
+        "huella_recorte": nombre_base.rsplit("_", 1)[-1],
         "preprocesamiento": preprocesamiento,
         "rectificacion": preprocesamiento.get("rectificacion", {}),
         "metodo_rectificacion": (preprocesamiento.get("rectificacion") or {}).get("metodo_rectificacion"),
@@ -3996,7 +4069,7 @@ def leer_placa_cnn_seguro_desde_monitoreo(crop_o_ruta, contexto: dict | None = N
     try:
         if isinstance(crop_o_ruta, (str, Path)):
             ruta_recorte = Path(str(crop_o_ruta))
-            imagen = cv2.imread(str(ruta_recorte), cv2.IMREAD_UNCHANGED)
+            imagen = _imread_seguro(str(ruta_recorte), cv2.IMREAD_UNCHANGED)
         else:
             try:
                 imagen = np.asarray(crop_o_ruta)
@@ -4105,15 +4178,23 @@ def _normalizar_salida_lector_cnn(resultado: dict) -> dict:
     texto_formato = resultado.get("texto_postprocesado") or resultado.get("texto_corregido_formato") or ""
     confianza = resultado.get("confianza_promedio")
     cantidad = int(resultado.get("cantidad_caracteres_segmentados", 0) or 0)
+    error_lector = resultado.get("error")
+    if resultado.get("estado") == "requiere_modelo_caracteres":
+        error_lector = resultado.get("mensaje_modelo") or resultado.get("mensaje") or "No se pudo cargar la CNN de caracteres."
+    elif cantidad > 0 and not texto_crudo and not texto_formato and not resultado.get("predicciones_caracteres"):
+        error_lector = (
+            resultado.get("mensaje_modelo")
+            or "La segmentacion produjo caracteres, pero la CNN no devolvio predicciones."
+        )
     estado_lectura, motivo = _determinar_estado_lectura(
         texto_crudo=texto_crudo,
         texto_corregido=texto_formato,
         cantidad_caracteres=cantidad,
         formato_valido=bool(formato.get("valido")),
-        error=resultado.get("error"),
+        error=error_lector,
         causa_probable=resultado.get("causa_probable"),
     )
-    ok = bool(resultado.get("ok", True)) and not bool(resultado.get("error")) and resultado.get("estado") != "error"
+    ok = bool(resultado.get("ok", True)) and not bool(error_lector) and resultado.get("estado") != "error"
     resultado.update(
         {
             "ok": ok,
@@ -4124,7 +4205,7 @@ def _normalizar_salida_lector_cnn(resultado: dict) -> dict:
             "texto_corregido_formato": texto_formato,
             "confianza_cnn_caracteres": confianza,
             "formato_valido": bool(formato.get("valido")),
-            "error": resultado.get("error"),
+            "error": error_lector,
             "etapa_error": resultado.get("etapa_error"),
             "debug_images": {
                 "preprocesada": (resultado.get("preprocesamiento") or {}).get("ruta_imagen_procesada"),
@@ -4189,7 +4270,7 @@ def _guardar_debug_sin_lectura(resultado: dict) -> str:
             continue
         origen = Path(str(ruta))
         if origen.exists():
-            imagen = cv2.imread(str(origen), cv2.IMREAD_UNCHANGED)
+            imagen = _imread_seguro(str(origen), cv2.IMREAD_UNCHANGED)
             if imagen is not None:
                 cv2.imwrite(str(salida / f"{etiqueta}{origen.suffix or '.jpg'}"), imagen)
 
@@ -4197,13 +4278,13 @@ def _guardar_debug_sin_lectura(resultado: dict) -> str:
     for idx, caracter in enumerate(caracteres, start=1):
         ruta_char = caracter.get("ruta_caracter")
         if ruta_char and Path(ruta_char).exists():
-            imagen_char = cv2.imread(str(ruta_char), cv2.IMREAD_UNCHANGED)
+            imagen_char = _imread_seguro(str(ruta_char), cv2.IMREAD_UNCHANGED)
             if imagen_char is not None:
                 cv2.imwrite(str(salida / f"caracter_{idx:02d}.png"), imagen_char)
 
     shape_recorte = None
     if resultado.get("ruta_imagen"):
-        imagen = cv2.imread(str(resultado["ruta_imagen"]))
+        imagen = _imread_seguro(str(resultado["ruta_imagen"]))
         if imagen is not None:
             shape_recorte = list(imagen.shape)
 
@@ -4274,7 +4355,7 @@ def _registrar_error_lector_cnn(ruta_imagen: str, etapa: str, exc: Exception, co
         "traceback": traceback.format_exc(),
     }
     try:
-        imagen = cv2.imread(str(ruta_imagen))
+        imagen = _imread_seguro(str(ruta_imagen))
         if imagen is not None:
             info["shape_recorte_original"] = list(imagen.shape)
             info["dtype_recorte_original"] = str(imagen.dtype)

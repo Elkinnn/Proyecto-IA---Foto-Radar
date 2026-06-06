@@ -12,6 +12,7 @@ from src.fuzzy_system import clasificar_velocidad
 from src.plate_detector import PlateDetector, dibujar_deteccion
 from src.plate_reader import (
     PlateReader,
+    _imread_seguro,
     asegurar_grayscale,
     asegurar_rgb,
     consolidar_lecturas_evento_placa,
@@ -2200,7 +2201,7 @@ def _cerrar_evento_placa(estado: dict, frame_fin: int) -> None:
     if estado["mejor_frame_evento"] is None:
         ruta_frame_vivo = estado.get("ruta_frame_evento_en_vivo")
         if ruta_frame_vivo and Path(str(ruta_frame_vivo)).exists():
-            estado["mejor_frame_evento"] = cv2.imread(str(ruta_frame_vivo))
+            estado["mejor_frame_evento"] = _imread_seguro(str(ruta_frame_vivo))
     if estado["mejor_frame_evento"] is None:
         estado["evento_activo"] = False
         _limpiar_seguimiento_bbox(estado)

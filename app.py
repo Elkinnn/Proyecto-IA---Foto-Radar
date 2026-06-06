@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 import csv
+import hashlib
 import json
 import threading
 import time
@@ -64,6 +65,54 @@ PERFORMANCE_MODE_LABELS = {
 _OCR_ASYNC_LOCK = threading.Lock()
 _OCR_ASYNC_PENDIENTES: set[str] = set()
 _OCR_ASYNC_RESULTADOS: dict[str, dict] = {}
+# Serializa la ejecucion real del OCR (CNN + escritura/lectura de imagenes de
+# debug). Sin esto, varios hilos OCR escriben y leen las mismas carpetas a la
+# vez y se producen archivos a medio escribir -> cv2.imdecode con buffer vacio
+# -> error_cnn -> CNN 0% / formato invalido. Tambien evita llamadas
+# concurrentes a TensorFlow, que no es thread-safe.
+_OCR_EJECUCION_LOCK = threading.Lock()
+_OCR_ENTRADAS_INMUTABLES_DIR = (
+    Path("reports") / "evidencias" / "reconocimiento_caracteres" / "entradas_monitoreo"
+)
+
+
+def _nuevo_id_ejecucion_monitoreo() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _id_ejecucion_monitoreo_actual() -> str:
+    return str(st.session_state.get("monitoreo_run_id") or "sin_ejecucion")
+
+
+def _crear_snapshot_ocr_inmutable(
+    ruta_recorte: str,
+    *,
+    evento_id: int | None = None,
+    frame_actual: int | None = None,
+) -> str:
+    """Copia el recorte antes del hilo CNN para que nunca cambie bajo sus pies."""
+    origen = Path(str(ruta_recorte))
+    try:
+        datos = origen.read_bytes()
+    except OSError:
+        return str(origen)
+    if not datos:
+        return str(origen)
+
+    huella = hashlib.sha256(datos).hexdigest()[:16]
+    run_id = "".join(c for c in _id_ejecucion_monitoreo_actual() if c.isalnum() or c in "_-")
+    evento = max(int(evento_id or 0), 0)
+    frame = max(int(frame_actual or 0), 0)
+    sufijo = origen.suffix.lower() if origen.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"} else ".jpg"
+    carpeta = _OCR_ENTRADAS_INMUTABLES_DIR / run_id
+    carpeta.mkdir(parents=True, exist_ok=True)
+    destino = carpeta / f"evento_{evento:04d}_frame_{frame:06d}_{huella}{sufijo}"
+    if not destino.exists():
+        # El nombre ya es inmutable por contenido. Escribir directamente evita
+        # fallos de os.replace en Windows/OneDrive cuando el antivirus inspecciona
+        # el archivo temporal justo al crearlo.
+        destino.write_bytes(datos)
+    return str(destino)
 
 
 def _config_modo_rendimiento(config: dict, modo: str) -> dict:
@@ -797,6 +846,27 @@ def enviar_notificacion_evento_monitoreo(
     return resumen
 
 
+_ERRORES_LECTURA_OCR_UI = frozenset(
+    {
+        "PENDIENTE",
+        "ANALIZANDOPLACA...",
+        "SINLECTURA",
+        "SINPLACA",
+        "FORMATO_INVALIDO",
+        "SEGMENTACION_INCOMPLETA",
+        "SIN_CARACTERES",
+        "ERROR_CNN",
+        "NO_RECONOCIDO",
+        "FORMATODUDOSO",
+    }
+)
+
+
+def _es_codigo_error_lectura(texto: str) -> bool:
+    normalizado = str(texto or "").strip().upper().replace("-", "").replace(" ", "").replace("_", "")
+    return normalizado in _ERRORES_LECTURA_OCR_UI or normalizado.startswith("SINLECTURA")
+
+
 def _extraer_placa_desde_resumen(resumen: dict) -> str:
     """Mejor lectura OCR disponible (consolidada o individual)."""
     candidatos = (
@@ -812,8 +882,10 @@ def _extraer_placa_desde_resumen(resumen: dict) -> str:
         for prefijo in ("Lectura parcial: ", "Formato dudoso: ", "Sin lectura: "):
             if texto.startswith(prefijo):
                 texto = texto[len(prefijo) :].strip()
+        if _es_codigo_error_lectura(texto):
+            continue
         normalizado = texto.upper().replace("-", "").replace(" ", "")
-        if normalizado and normalizado not in {"PENDIENTE", "ANALIZANDOPLACA...", "SINLECTURA", "SINPLACA"}:
+        if normalizado and normalizado not in _ERRORES_LECTURA_OCR_UI:
             return normalizado
     return ""
 
@@ -837,7 +909,7 @@ def _placa_consolidada_en_cache(evento_id: int | None) -> str:
 def _ocr_en_vuelo_evento(evento_id: int | None) -> bool:
     if evento_id is None:
         return False
-    cache_key = f"evento_{int(evento_id)}"
+    cache_key = _cache_key_ocr_evento_id(int(evento_id))
     with _OCR_ASYNC_LOCK:
         if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
             return True
@@ -861,6 +933,23 @@ def _obtener_texto_placa_ui(resumen: dict) -> str:
     placa = _extraer_placa_desde_resumen(resumen)
     if placa:
         return placa
+    causa = (
+        resumen.get("causa_probable_ocr")
+        or resumen.get("motivo_lector_cnn")
+        or resumen.get("estado_consolidado_evento")
+        or ""
+    )
+    if causa and str(causa).lower() in {
+        "formato_invalido",
+        "segmentacion_incompleta",
+        "sin_caracteres",
+        "error_cnn",
+        "recorte_borroso",
+        "baja_confianza_cnn_caracteres",
+        "formato_dudoso",
+        "lectura_parcial",
+    }:
+        return "Sin lectura"
     eid = int(evento_id or 0)
     if resumen.get("evento_activo") or resumen.get("estado_placa") in ("Detectada", "Mantenida"):
         if eid and _ocr_en_vuelo_evento(eid):
@@ -1366,6 +1455,116 @@ def _mostrar_formula_velocidad(velocidad: dict) -> None:
         st.warning(velocidad["motivo_invalido"])
 
 
+def _mostrar_imagen_debug_ui(ruta: str | None, caption: str) -> bool:
+    if not ruta or not Path(str(ruta)).exists():
+        return False
+    imagen = _cargar_recorte_ui_rgb(str(ruta))
+    if imagen is not None:
+        st.image(imagen, caption=caption, channels="RGB", use_container_width=True)
+    else:
+        st.image(str(ruta), caption=caption, use_container_width=True)
+    return True
+
+
+def _render_pipeline_preprocesamiento_ocr(resumen: dict) -> None:
+    """Muestra el recorrido visual del recorte hasta la segmentacion y prediccion CNN."""
+    rutas_debug = resumen.get("rutas_debug_preprocesamiento_ocr") or {}
+    predicciones = resumen.get("predicciones_caracteres_ocr") or []
+    caracteres = resumen.get("caracteres_segmentados_ocr") or []
+    tiene_pipeline = bool(
+        rutas_debug
+        or resumen.get("ruta_placa_preprocesada_ocr")
+        or resumen.get("ruta_banda_ocr")
+        or resumen.get("ruta_debug_segmentacion_ocr")
+        or predicciones
+        or caracteres
+    )
+    if not tiene_pipeline:
+        return
+
+    estrategia = resumen.get("estrategia_segmentacion") or "—"
+    puntaje_seg = resumen.get("puntaje_segmentacion")
+    titulo_puntaje = f" · {estrategia}"
+    if puntaje_seg is not None:
+        titulo_puntaje += f" ({float(puntaje_seg):.0f} pts)"
+    with st.expander(f"Pipeline OCR — preprocesamiento y segmentacion{titulo_puntaje}", expanded=False):
+        if resumen.get("causa_probable_ocr") or resumen.get("motivo_lector_cnn"):
+            st.caption(
+                f"Diagnostico: {resumen.get('causa_probable_ocr') or resumen.get('motivo_lector_cnn') or '—'}"
+            )
+
+        pasos_etiquetas = (
+            ("Recorte YOLO", resumen.get("ruta_recorte_ocr") or _obtener_ruta_recorte_ui(resumen)),
+            ("Rectificacion", resumen.get("ruta_rectificacion_ocr")),
+            ("Gris", rutas_debug.get("gris")),
+            ("Contraste", rutas_debug.get("contraste")),
+            ("Denoise", rutas_debug.get("denoise")),
+            ("Binarizacion", rutas_debug.get("final") or resumen.get("ruta_placa_preprocesada_ocr")),
+            ("Banda chars", resumen.get("ruta_banda_ocr")),
+            ("Segmentacion", resumen.get("ruta_debug_segmentacion_ocr")),
+        )
+        pasos_visibles = [(etiq, ruta) for etiq, ruta in pasos_etiquetas if ruta and Path(str(ruta)).exists()]
+        if pasos_visibles:
+            st.markdown("**Etapas de transformacion**")
+            cols = st.columns(min(len(pasos_visibles), 4))
+            for idx, (etiq, ruta) in enumerate(pasos_visibles):
+                with cols[idx % len(cols)]:
+                    _mostrar_imagen_debug_ui(str(ruta), etiq)
+            if resumen.get("ruta_debug_segmentacion_ocr"):
+                st.caption("Segmentacion: verde = aceptado, rojo = rechazado.")
+
+        if resumen.get("metodo_rectificacion"):
+            st.caption(
+                f"Rectificacion: {resumen.get('metodo_rectificacion')} "
+                f"(puntaje {resumen.get('puntaje_rectificacion', '—')})"
+            )
+
+        motivos = resumen.get("motivos_rechazo_ocr") or {}
+        if motivos:
+            with st.expander("Motivos de rechazo en segmentacion", expanded=False):
+                st.json(motivos)
+
+        chars_mostrar = caracteres or [
+            {"ruta_caracter": p.get("ruta_caracter")}
+            for p in predicciones
+            if p.get("ruta_caracter")
+        ]
+        if chars_mostrar:
+            st.markdown("**Caracteres segmentados**")
+            cols_chars = st.columns(min(len(chars_mostrar), 8))
+            for idx, char in enumerate(chars_mostrar[:8]):
+                ruta_char = char.get("ruta_caracter")
+                if ruta_char and Path(str(ruta_char)).exists():
+                    with cols_chars[idx % len(cols_chars)]:
+                        st.image(str(ruta_char), caption=f"#{idx + 1}", use_container_width=True)
+
+        if predicciones:
+            st.markdown("**Prediccion CNN por caracter**")
+            for pred in predicciones[:8]:
+                indice = int(pred.get("indice") or 0)
+                predicho = pred.get("caracter_predicho") or "?"
+                conf = float(pred.get("confianza") or 0.0)
+                top3 = ", ".join(
+                    f"{item.get('caracter', '?')} ({float(item.get('confianza', 0)):.0%})"
+                    for item in (pred.get("top3_predicciones") or [])[:3]
+                )
+                c_img, c_norm, c_txt = st.columns([0.12, 0.12, 0.76])
+                if pred.get("ruta_caracter") and Path(str(pred["ruta_caracter"])).exists():
+                    c_img.image(str(pred["ruta_caracter"]), caption=f"#{indice}", use_container_width=True)
+                if pred.get("ruta_debug_normalizada") and Path(str(pred["ruta_debug_normalizada"])).exists():
+                    c_norm.image(str(pred["ruta_debug_normalizada"]), caption="32x32", use_container_width=True)
+                c_txt.write(f"**{predicho}** · confianza {conf:.0%}")
+                if top3:
+                    c_txt.caption(f"Top 3: {top3}")
+
+        cantidad = int(resumen.get("cantidad_caracteres_segmentados_ocr") or len(caracteres) or 0)
+        if cantidad and cantidad < 6:
+            st.warning(
+                f"Solo se segmentaron {cantidad} caracteres (minimo esperado: 6). "
+                "Recorte borroso o binarizacion deficiente suelen causar T→I, C→Q, 2→9."
+            )
+
+
 def _render_panel_deteccion_esencial(
     resumen: dict,
     config: dict | None = None,
@@ -1409,8 +1608,11 @@ def _render_panel_deteccion_esencial(
             st.info("Esperando placa...")
     with col_main:
         placa_estado = resumen.get("placa_estado_ui")
-        if placa_estado == "confirmada":
+        if placa_estado == "confirmada" and placa != "Sin lectura":
             st.caption("Placa confirmada")
+        elif placa == "Sin lectura":
+            causa = resumen.get("causa_probable_ocr") or resumen.get("motivo_lector_cnn") or "ocr_fallido"
+            st.caption(f"Sin lectura OCR · causa: {str(causa).replace('_', ' ')}")
         elif placa_estado == "provisional" and placa not in ("—", "Leyendo...", "Capturando...", "Capturando") and not str(placa).startswith("Capturando #"):
             st.caption("Lectura provisional · se consolida con mas frames")
         elif placa_estado == "leyendo" and placa == "Leyendo...":
@@ -1449,6 +1651,8 @@ def _render_panel_deteccion_esencial(
         ultima_norm = _extraer_placa_desde_resumen({"texto_ocr_corregido": ultima_frame}) if ultima_frame else ""
         if ultima_norm and placa_mostrada and ultima_norm != placa_mostrada:
             st.caption(f"Ultimo frame descartado: {ultima_norm}")
+
+    _render_pipeline_preprocesamiento_ocr(resumen)
 
     if config is not None:
         resumen = preparar_estado_notificacion_evento(
@@ -1621,7 +1825,7 @@ def _render_sidebar_envio_correo(config: dict, placa_controlada: str) -> None:
 def _cache_key_ocr_monitoreo(resumen: dict, ruta_recorte: str) -> str:
     evento_id = resumen.get("evento_id") or resumen.get("eventos_placa") or 0
     frame_ref = resumen.get("frame_mejor_evento") or resumen.get("frame_actual") or resumen.get("frames_procesados")
-    return f"evt{int(evento_id)}|{ruta_recorte}|{frame_ref}"
+    return f"{_id_ejecucion_monitoreo_actual()}|evt{int(evento_id)}|{ruta_recorte}|{frame_ref}"
 
 
 _CAMPOS_OCR_RESUMEN = (
@@ -1651,6 +1855,20 @@ _CAMPOS_OCR_RESUMEN = (
     "tiempo_lector_cnn_ms",
     "placa_individual_ultimo_frame",
     "mejor_puntaje_consolidado_evento",
+    "ruta_recorte_ocr",
+    "ruta_rectificacion_ocr",
+    "metodo_rectificacion",
+    "puntaje_rectificacion",
+    "rutas_debug_preprocesamiento_ocr",
+    "ruta_placa_preprocesada_ocr",
+    "ruta_banda_ocr",
+    "ruta_debug_segmentacion_ocr",
+    "estrategia_segmentacion",
+    "puntaje_segmentacion",
+    "predicciones_caracteres_ocr",
+    "caracteres_segmentados_ocr",
+    "cantidad_caracteres_segmentados_ocr",
+    "motivos_rechazo_ocr",
 )
 
 
@@ -1659,9 +1877,27 @@ def _obtener_entrada_cache_ocr(evento_id: int) -> dict:
     entry = cache.get(int(evento_id)) or {}
     entry.setdefault("lecturas", [])
     entry.setdefault("estado", "pendiente")
+    entry.setdefault("ocr_intentos", 0)
     cache[int(evento_id)] = entry
     st.session_state.ocr_eventos_cache = cache
     return entry
+
+
+def _entrada_ocr_tiene_texto_util(entry: dict) -> bool:
+    return bool(_extraer_placa_desde_resumen(entry.get("datos") or {}))
+
+
+def _resultado_ocr_necesita_reintento(resultado: dict) -> bool:
+    texto = (
+        resultado.get("texto_postprocesado")
+        or resultado.get("texto_corregido_formato")
+        or resultado.get("texto_detectado_crudo")
+        or resultado.get("texto_crudo")
+        or ""
+    )
+    cantidad = int(resultado.get("cantidad_caracteres_segmentados", 0) or 0)
+    predicciones = resultado.get("predicciones_caracteres") or []
+    return not str(texto).strip() and cantidad >= 6 and not predicciones
 
 
 def _puntaje_consolidado_evento(consolidado: dict | None) -> float:
@@ -1752,7 +1988,7 @@ def _reiniciar_ocr_vivo_si_cambio_evento(resumen: dict) -> dict:
 
 
 def _cache_key_ocr_evento_id(evento_id: int) -> str:
-    return f"evento_{int(evento_id)}"
+    return f"{_id_ejecucion_monitoreo_actual()}|evento_{int(evento_id)}"
 
 
 def _cache_key_ocr_evento_cerrado(evento_id: int, ruta_recorte: str = "") -> str:
@@ -1927,35 +2163,36 @@ def _encolar_ocr_evento_vivo_asincrono(
 ) -> None:
     eid = int(evento_id)
     cache = st.session_state.setdefault("ocr_eventos_cache", {})
-    entry = cache.get(eid) or {}
+    entry = _obtener_entrada_cache_ocr(eid)
     if entry.get("evento_cerrado") and entry.get("estado") == "listo":
         return
-    lecturas = entry.get("lecturas") or []
-    if not entry.get("evento_cerrado") and len(lecturas) >= 3:
+    if _entrada_ocr_tiene_texto_util(entry):
         return
     cache_key = _cache_key_ocr_evento_id(eid)
-    ruta_nueva = str(ruta_recorte)
-    if _lectura_existe_para_ruta(lecturas, ruta_nueva):
-        return
+    ruta_nueva = _crear_snapshot_ocr_inmutable(
+        str(ruta_recorte),
+        evento_id=eid,
+        frame_actual=resumen_base.get("frame_actual") or resumen_base.get("frame_mejor_evento"),
+    )
     with _OCR_ASYNC_LOCK:
-        en_vuelo = cache_key in _OCR_ASYNC_PENDIENTES
+        en_vuelo = cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS
     if en_vuelo:
-        entry = cache.get(eid) or {}
-        entry["ruta_recorte"] = ruta_nueva
-        entry["resumen_base"] = dict(resumen_base)
-        entry["_ocr_snapshot_mas_reciente"] = ruta_nueva
-        entry.setdefault("estado", "pendiente")
+        if int(entry.get("ocr_intentos") or 0) < 2:
+            entry["_ocr_snapshot_reintento"] = ruta_nueva
+            entry["_ocr_resumen_reintento"] = dict(resumen_base)
         cache[eid] = entry
         st.session_state.ocr_eventos_cache = cache
         return
+    if int(entry.get("ocr_intentos") or 0) >= 2:
+        return
     with _OCR_ASYNC_LOCK:
-        if cache_key in _OCR_ASYNC_PENDIENTES:
+        if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
             return
-    cache[eid] = {
-        "estado": "pendiente",
-        "ruta_recorte": ruta_nueva,
-        "resumen_base": dict(resumen_base),
-    }
+    entry["estado"] = "pendiente"
+    entry["ruta_recorte"] = ruta_nueva
+    entry["resumen_base"] = dict(resumen_base)
+    entry["ocr_intentos"] = int(entry.get("ocr_intentos") or 0) + 1
+    cache[eid] = entry
     st.session_state.ocr_eventos_cache = cache
     with _OCR_ASYNC_LOCK:
         if cache_key in _OCR_ASYNC_PENDIENTES:
@@ -1966,6 +2203,9 @@ def _encolar_ocr_evento_vivo_asincrono(
         "evento_id": eid,
         "frame_actual": resumen_base.get("frame_actual"),
         "fuente": resumen_base.get("fuente"),
+        "monitoreo_run_id": _id_ejecucion_monitoreo_actual(),
+        "ruta_recorte_origen": str(ruta_recorte),
+        "ruta_recorte_inmutable": ruta_nueva,
     }
     threading.Thread(
         target=_tarea_ocr_monitoreo_asincrona,
@@ -2040,26 +2280,6 @@ def _actualizar_cache_ocr_eventos(config: dict, placa_controlada: str) -> bool:
             }
         else:
             ruta_procesada = ruta_recorte
-            snapshot_mas_reciente = entry.pop("_ocr_snapshot_mas_reciente", None)
-            if (
-                snapshot_mas_reciente
-                and str(snapshot_mas_reciente) != str(ruta_procesada)
-                and Path(str(snapshot_mas_reciente)).exists()
-            ):
-                entry["estado"] = "pendiente"
-                entry["ruta_recorte"] = str(snapshot_mas_reciente)
-                base_reocr = dict(entry.get("resumen_base") or resumen)
-                base_reocr["evento_id"] = int(eid)
-                cache[int(eid)] = entry
-                st.session_state.ocr_eventos_cache = cache
-                _encolar_ocr_evento_vivo_asincrono(
-                    int(eid),
-                    str(snapshot_mas_reciente),
-                    base_reocr,
-                    config,
-                    placa_controlada,
-                )
-                continue
             resumen = _aplicar_resultado_ocr_monitoreo(
                 resumen,
                 payload["resultado_ocr"],
@@ -2071,11 +2291,36 @@ def _actualizar_cache_ocr_eventos(config: dict, placa_controlada: str) -> bool:
             entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(eid)) or entry
             entry["ruta_recorte"] = ruta_recorte
             entry.setdefault("resumen_base", dict(entry.get("resumen_base") or resumen))
+            necesita_reintento = _resultado_ocr_necesita_reintento(payload["resultado_ocr"])
+            ruta_reintento = entry.pop("_ocr_snapshot_reintento", None)
+            resumen_reintento = entry.pop("_ocr_resumen_reintento", None)
+            if necesita_reintento and entry.get("evento_cerrado"):
+                ruta_reintento = entry.get("ruta_mejor_recorte_final") or ruta_reintento
+                resumen_reintento = dict(entry.get("resumen_base") or resumen_reintento or resumen)
+            if (
+                necesita_reintento
+                and int(entry.get("ocr_intentos") or 0) < 2
+                and ruta_reintento
+                and Path(str(ruta_reintento)).exists()
+            ):
+                entry["estado"] = "pendiente"
+                cache[int(eid)] = entry
+                st.session_state.ocr_eventos_cache = cache
+                base_reocr = dict(resumen_reintento or entry.get("resumen_base") or resumen)
+                base_reocr["evento_id"] = int(eid)
+                _encolar_ocr_evento_vivo_asincrono(
+                    int(eid),
+                    str(ruta_reintento),
+                    base_reocr,
+                    config,
+                    placa_controlada,
+                )
+                continue
             if entry.get("evento_cerrado"):
                 _finalizar_ocr_evento_en_cache(int(eid), config, placa_controlada)
                 entry = (st.session_state.get("ocr_eventos_cache") or {}).get(int(eid)) or entry
             else:
-                entry["estado"] = "pendiente"
+                entry["estado"] = "lectura_disponible" if _entrada_ocr_tiene_texto_util(entry) else "pendiente"
                 cache[int(eid)] = entry
                 st.session_state.ocr_eventos_cache = cache
                 _sync_cola_item_desde_cache(int(eid), entry, config, placa_controlada)
@@ -2181,32 +2426,15 @@ def _encolar_ocr_evento_cerrado(evento_id: int, resumen: dict, ruta_recorte: str
     entry["ruta_mejor_recorte_final"] = str(ruta_recorte)
     entry["resumen_base"] = dict(resumen)
     st.session_state.ocr_eventos_cache[int(evento_id)] = entry
-    if _lectura_existe_para_ruta(entry.get("lecturas"), str(ruta_recorte)):
-        entry["estado"] = "pendiente"
-        st.session_state.ocr_eventos_cache[int(evento_id)] = entry
+    if _entrada_ocr_tiene_texto_util(entry):
         return
-    cache_key = _cache_key_ocr_evento_id(evento_id)
-    with _OCR_ASYNC_LOCK:
-        if cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS:
-            return
-        _OCR_ASYNC_PENDIENTES.add(cache_key)
-    if int(evento_id) not in (st.session_state.get("ocr_eventos_cache") or {}):
-        st.session_state.setdefault("ocr_eventos_cache", {})[int(evento_id)] = {
-            "estado": "pendiente",
-            "ruta_recorte": str(ruta_recorte),
-            "resumen_base": dict(resumen),
-        }
-    contexto = {
-        "funcion": "_encolar_ocr_evento_cerrado",
-        "evento_id": evento_id,
-        "frame_actual": resumen.get("frame_actual"),
-        "fuente": resumen.get("fuente"),
-    }
-    threading.Thread(
-        target=_tarea_ocr_monitoreo_asincrona,
-        args=(cache_key, ruta_recorte, contexto, dict(resumen)),
-        daemon=True,
-    ).start()
+    _encolar_ocr_evento_vivo_asincrono(
+        int(evento_id),
+        str(ruta_recorte),
+        dict(resumen),
+        st.session_state.get("_config_monitoreo_activo") or {},
+        st.session_state.get("placa_controlada_monitoreo") or "",
+    )
 
 
 def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
@@ -2232,6 +2460,18 @@ def _procesar_ocr_cola_eventos(config: dict, placa_controlada: str) -> bool:
             placa = _obtener_placa_para_evento(item["resumen"], placa_controlada)
             item["resumen"] = preparar_estado_notificacion_evento(item["resumen"], placa, config)
             _actualizar_historial_monitoreo(item["resumen"])
+            hubo_cambio = True
+            continue
+        cache_entry = _obtener_entrada_cache_ocr(evento_id)
+        cache_key = _cache_key_ocr_evento_id(evento_id)
+        with _OCR_ASYNC_LOCK:
+            lectura_en_vuelo = cache_key in _OCR_ASYNC_PENDIENTES or cache_key in _OCR_ASYNC_RESULTADOS
+        if (
+            not lectura_en_vuelo
+            and not _entrada_ocr_tiene_texto_util(cache_entry)
+            and int(cache_entry.get("ocr_intentos") or 0) < 2
+        ):
+            _encolar_ocr_evento_cerrado(evento_id, resumen, str(ruta_recorte))
             hubo_cambio = True
             continue
         with _OCR_ASYNC_LOCK:
@@ -2331,6 +2571,23 @@ def _limpiar_ocr_asincrono_monitoreo() -> None:
         _OCR_ASYNC_RESULTADOS.clear()
 
 
+def _iniciar_contexto_lectura_monitoreo() -> None:
+    """Aisla cache, cola y resultados cuando comienza una fuente nueva."""
+    st.session_state.monitoreo_run_id = _nuevo_id_ejecucion_monitoreo()
+    st.session_state.ocr_eventos_cache = {}
+    st.session_state.ocr_eventos_encolados = set()
+    st.session_state._ocr_eventos_listos = []
+    st.session_state.ocr_evento_vivo_id = None
+    st.session_state.lecturas_evento_id = None
+    st.session_state.lecturas_evento_placa_monitoreo = []
+    st.session_state.ultimo_recorte_ocr_procesado = None
+    st.session_state.ultimo_resultado_ocr_monitoreo = None
+    st.session_state.ultimo_resultado_parcial = None
+    st.session_state.eventos_monitoreo_cola = []
+    st.session_state.ultimo_evento_cerrado_registrado = 0
+    _limpiar_ocr_asincrono_monitoreo()
+
+
 def _aplicar_resultado_ocr_monitoreo(
     resumen: dict,
     resultado_ocr: dict,
@@ -2365,6 +2622,8 @@ def _aplicar_resultado_ocr_monitoreo(
         "causa_probable_ocr": resultado_ocr.get("causa_probable"),
         "motivo_lector_cnn": motivo_lectura,
         "ruta_placa_preprocesada_ocr": (resultado_ocr.get("preprocesamiento") or {}).get("ruta_imagen_procesada"),
+        "rutas_debug_preprocesamiento_ocr": (resultado_ocr.get("preprocesamiento") or {}).get("rutas_debug"),
+        "ruta_recorte_ocr": str(ruta_recorte),
         "metodo_rectificacion": resultado_ocr.get("metodo_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("metodo_rectificacion"),
         "puntaje_rectificacion": resultado_ocr.get("puntaje_rectificacion") or (resultado_ocr.get("rectificacion") or {}).get("confianza_rectificacion"),
         "ruta_rectificacion_ocr": (resultado_ocr.get("rectificacion") or {}).get("ruta_seleccionada"),
@@ -2374,7 +2633,9 @@ def _aplicar_resultado_ocr_monitoreo(
         "estrategia_segmentacion": resultado_ocr.get("estrategia_segmentacion") or (resultado_ocr.get("segmentacion") or {}).get("estrategia_segmentacion"),
         "puntaje_segmentacion": resultado_ocr.get("puntaje_segmentacion") if resultado_ocr.get("puntaje_segmentacion") is not None else (resultado_ocr.get("segmentacion") or {}).get("puntaje_segmentacion"),
         "caracteres_segmentados_ocr": resultado_ocr.get("caracteres_segmentados") or resultado_ocr.get("caracteres", []),
+        "predicciones_caracteres_ocr": resultado_ocr.get("predicciones_caracteres", []),
         "cantidad_caracteres_segmentados_ocr": resultado_ocr.get("cantidad_caracteres_segmentados", 0),
+        "motivos_rechazo_ocr": resultado_ocr.get("motivos_rechazo") or (resultado_ocr.get("segmentacion") or {}).get("motivos_rechazo") or {},
         "tiempo_lector_cnn_ms": round(tiempo_lector_ms, 3),
         "lector_cnn_ok": lector_ok,
         "etapa_error_lector_cnn": resultado_ocr.get("etapa_error"),
@@ -2409,7 +2670,14 @@ def _aplicar_resultado_ocr_monitoreo(
         st.session_state.lecturas_evento_id = int(evento_id or 0)
         st.session_state.lecturas_evento_placa_monitoreo = []
         lecturas = []
-    if evento_id is not None and not _lectura_existe_para_ruta(lecturas, lectura_evento["ruta_recorte"]):
+    if evento_id is not None:
+        # Un reintento puede usar el mismo recorte. Sustituir el resultado previo
+        # evita que una lectura fallida o vacia oculte la nueva prediccion valida.
+        lecturas = [
+            item
+            for item in lecturas
+            if str(item.get("ruta_recorte") or "") != lectura_evento["ruta_recorte"]
+        ]
         lecturas.insert(0, lectura_evento)
     lecturas = lecturas[:5]
     if evento_id is not None:
@@ -2481,6 +2749,25 @@ def _aplicar_resultado_ocr_monitoreo(
             prev_datos["placa_individual_ultimo_frame"] = texto_individual
             prev_datos["recortes_usados_evento"] = len(lecturas)
             prev_datos["lecturas_usadas_evento"] = datos_ocr.get("lecturas_usadas_evento")
+            for campo in (
+                "ruta_recorte_ocr",
+                "ruta_rectificacion_ocr",
+                "metodo_rectificacion",
+                "puntaje_rectificacion",
+                "rutas_debug_preprocesamiento_ocr",
+                "ruta_placa_preprocesada_ocr",
+                "ruta_banda_ocr",
+                "ruta_debug_segmentacion_ocr",
+                "estrategia_segmentacion",
+                "puntaje_segmentacion",
+                "predicciones_caracteres_ocr",
+                "caracteres_segmentados_ocr",
+                "cantidad_caracteres_segmentados_ocr",
+                "motivos_rechazo_ocr",
+                "causa_probable_ocr",
+            ):
+                if campo in datos_ocr:
+                    prev_datos[campo] = datos_ocr[campo]
             entry_cache["datos"] = prev_datos
         st.session_state.ocr_eventos_cache[int(evento_id)] = entry_cache
         resumen.update(entry_cache["datos"])
@@ -2504,7 +2791,8 @@ def _aplicar_resultado_ocr_monitoreo(
 def _tarea_ocr_monitoreo_asincrona(cache_key: str, ruta_recorte: str, contexto: dict, resumen_base: dict) -> None:
     try:
         inicio = time.perf_counter()
-        resultado_ocr = leer_placa_cnn_seguro_desde_monitoreo(str(ruta_recorte), contexto=contexto)
+        with _OCR_EJECUCION_LOCK:
+            resultado_ocr = leer_placa_cnn_seguro_desde_monitoreo(str(ruta_recorte), contexto=contexto)
         tiempo_ms = (time.perf_counter() - inicio) * 1000
         payload = {
             "resultado_ocr": resultado_ocr,
@@ -2519,11 +2807,20 @@ def _tarea_ocr_monitoreo_asincrona(cache_key: str, ruta_recorte: str, contexto: 
             "resumen_base": dict(resumen_base),
         }
     with _OCR_ASYNC_LOCK:
-        _OCR_ASYNC_RESULTADOS[cache_key] = payload
-        _OCR_ASYNC_PENDIENTES.discard(cache_key)
+        # Si se reinicio Monitoreo, la clave anterior ya fue retirada de
+        # pendientes. Descartamos ese resultado viejo para que no contamine
+        # la nueva ejecucion aunque reutilice el mismo numero de evento.
+        if cache_key in _OCR_ASYNC_PENDIENTES:
+            _OCR_ASYNC_RESULTADOS[cache_key] = payload
+            _OCR_ASYNC_PENDIENTES.discard(cache_key)
 
 
 def _encolar_ocr_monitoreo_asincrono(resumen: dict, ruta_recorte: str) -> None:
+    ruta_recorte = _crear_snapshot_ocr_inmutable(
+        ruta_recorte,
+        evento_id=resumen.get("evento_id"),
+        frame_actual=resumen.get("frame_actual") or resumen.get("frame_mejor_evento"),
+    )
     cache_key = _cache_key_ocr_monitoreo(resumen, ruta_recorte)
     if st.session_state.get("ultimo_recorte_ocr_procesado") == cache_key:
         return
@@ -2536,6 +2833,8 @@ def _encolar_ocr_monitoreo_asincrono(resumen: dict, ruta_recorte: str) -> None:
         "frame_actual": resumen.get("frame_actual"),
         "evento_id": resumen.get("evento_id"),
         "fuente": resumen.get("fuente"),
+        "monitoreo_run_id": _id_ejecucion_monitoreo_actual(),
+        "ruta_recorte_inmutable": ruta_recorte,
     }
     threading.Thread(
         target=_tarea_ocr_monitoreo_asincrona,
@@ -2841,6 +3140,7 @@ def mostrar_panel_monitoreo_limpio(
 
 def _inicializar_estado_monitoreo() -> None:
     valores_iniciales = {
+        "monitoreo_run_id": _nuevo_id_ejecucion_monitoreo(),
         "monitoreo_activo": False,
         "monitoreo_pausado": False,
         "frame_actual": 0,
@@ -3195,6 +3495,7 @@ def pestana_monitoreo(config: dict) -> None:
             st.session_state.video_monitoreo_nombre = video.name
             st.session_state.ultimo_resultado = None
             st.session_state.video_anotado_resultado = None
+            _iniciar_contexto_lectura_monitoreo()
         with frame_placeholder.container():
             if st.session_state.get("ultima_imagen_procesada") is not None:
                 st.image(st.session_state.ultima_imagen_procesada, channels="RGB", use_container_width=True)
@@ -3231,7 +3532,7 @@ def pestana_monitoreo(config: dict) -> None:
         st.session_state.lecturas_evento_id = None
         st.session_state.pasos_grupo_notificados = []
         st.session_state.pasos_grupo_descartados = []
-        _limpiar_ocr_asincrono_monitoreo()
+        _iniciar_contexto_lectura_monitoreo()
 
     def _refrescar_sidebar_correo() -> None:
         with sidebar_correo_placeholder.container():
@@ -3295,7 +3596,7 @@ def pestana_monitoreo(config: dict) -> None:
             st.session_state.lecturas_evento_id = None
             st.session_state.pasos_grupo_notificados = []
             st.session_state.pasos_grupo_descartados = []
-            _limpiar_ocr_asincrono_monitoreo()
+            _iniciar_contexto_lectura_monitoreo()
         if fuente_monitoreo == "Video de prueba":
             if not reanudar_video:
                 st.session_state.ruta_video_monitoreo = guardar_archivo_subido(video, config["paths"]["input_dir"])
@@ -4525,4 +4826,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

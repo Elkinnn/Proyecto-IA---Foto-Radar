@@ -3,6 +3,8 @@ import time
 
 import cv2
 
+from src.plate_reader import _imread_seguro
+
 
 DEFAULT_MODEL_PATH = "models/plate_detector/placas_ecuador.pt"
 MARGEN_BORDE_MIN_PX = 5
@@ -129,7 +131,7 @@ class PlateDetector:
                 "mensaje": "La deteccion por archivo solo soporta imagenes.",
             }
 
-        imagen = cv2.imread(str(ruta))
+        imagen = _imread_seguro(str(ruta))
         if imagen is None:
             return {
                 "detectada": False,
@@ -161,7 +163,7 @@ def dibujar_deteccion(ruta_archivo: str, deteccion: dict, output_dir: str) -> st
     if ruta.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
         return None
 
-    imagen = cv2.imread(str(ruta))
+    imagen = _imread_seguro(str(ruta))
     if imagen is None:
         return None
 
