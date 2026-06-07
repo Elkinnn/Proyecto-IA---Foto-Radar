@@ -19,7 +19,6 @@ from src.pipeline import (
     procesar_video_monitoreo,
 )
 from src.camera_utils import (
-    frame_tiene_senal,
     indices_a_escanear,
     probar_indices_camara,
     resumen_camaras_sistema,

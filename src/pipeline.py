@@ -8,7 +8,17 @@ import time
 import cv2
 import numpy as np
 
-from src.camera_utils import abrir_captura_camara, frame_tiene_senal, probar_indices_camara, resolucion_real_captura, _configurar_captura, mensaje_error_apertura_camara, liberar_captura_camara_activa
+from src.camera_utils import (
+    abrir_captura_camara,
+    esperar_frame_util_camara,
+    frame_es_util_camara,
+    leer_frame_reciente_camara,
+    probar_indices_camara,
+    resolucion_real_captura,
+    _configurar_captura,
+    mensaje_error_apertura_camara,
+    liberar_captura_camara_activa,
+)
 from src.fuzzy_system import clasificar_velocidad
 from src.plate_detector import PlateDetector, dibujar_deteccion
 from src.plate_reader import (
@@ -457,6 +467,46 @@ def _procesar_fuente_monitoreo(
                 fps = fps_real
     if isinstance(fuente, int) and fps <= 0 and camera_fps:
         fps = float(camera_fps)
+    frame_inicial_camara = None
+    if isinstance(fuente, int) and tiempo_real:
+        diagnostico_camara = esperar_frame_util_camara(captura, timeout_s=3.0, pausa_s=0.05, max_grabs=2)
+        if not diagnostico_camara.get("ok"):
+            liberar_captura_camara_activa(captura)
+            return {
+                "estado": "error",
+                "mensaje_estado": (
+                    f"{diagnostico_camara.get('mensaje') or mensaje_error_apertura_camara(int(fuente))} "
+                    f"Puntaje de senal: {diagnostico_camara.get('puntaje', 0)}."
+                ),
+                "frames_procesados": 0,
+                "fps": fps,
+                "ancho": ancho,
+                "alto": alto,
+                "total_frames": 0,
+                "duracion_segundos": 0.0,
+                "segundos_procesados": 0.0,
+                "modo_procesamiento": _obtener_modo_procesamiento(max_frames),
+                "fuente": nombre_fuente,
+                "rotacion": rotacion,
+                "distancia_lineas_m": distancia_lineas_m,
+                "limite_velocidad_kmh": limite_velocidad_kmh,
+                "primer_frame_evidencia": None,
+                "ultimo_frame_evidencia": None,
+                "modelo_detector_disponible": detector.model is not None,
+                "mensaje_detector": detector.estado,
+                "placas_detectadas": 0,
+                "detecciones_frame": 0,
+                "eventos_placa": 0,
+                "estado_placa": "Sin senal de camara",
+                "frames_desde_ultima_deteccion": 0,
+                "ultima_deteccion": None,
+                "ultimo_recorte_placa": None,
+                "ultimo_frame_deteccion": None,
+                "velocidad": _resumen_velocidad_vacio(distancia_lineas_m, fps),
+            }
+        frame_inicial_camara = diagnostico_camara.get("frame")
+        if frame_inicial_camara is not None:
+            alto, ancho = frame_inicial_camara.shape[:2]
     start_frame = max(int(start_frame or 0), 0)
     if start_frame > 0 and total_frames > 0:
         start_frame = min(start_frame, max(total_frames - 1, 0))
@@ -534,7 +584,10 @@ def _procesar_fuente_monitoreo(
 
         t_lectura = time.perf_counter()
         es_camara_vivo = isinstance(fuente, int) and tiempo_real
-        if es_camara_vivo:
+        if es_camara_vivo and frame_inicial_camara is not None:
+            ok, frame = True, frame_inicial_camara
+            frame_inicial_camara = None
+        elif es_camara_vivo:
             ok, frame = _leer_frame_camara_vivo(captura, max_grabs=2)
         else:
             ok, frame = captura.read()
@@ -542,6 +595,14 @@ def _procesar_fuente_monitoreo(
         tiempos_etapa["lectura_frame_ms"] = round((time.perf_counter() - t_lectura) * 1000, 3)
         if not ok:
             break
+        if es_camara_vivo and not frame_es_util_camara(frame):
+            estado_persistencia["_frames_camara_sin_senal"] = int(
+                estado_persistencia.get("_frames_camara_sin_senal", 0)
+            ) + 1
+            time.sleep(0.04)
+            continue
+        if es_camara_vivo:
+            estado_persistencia["_frames_camara_sin_senal"] = 0
         t_rotacion = time.perf_counter()
         frame = aplicar_rotacion(frame, rotacion)
         if max_frame_width > 0 and es_archivo_video:
@@ -1688,18 +1749,7 @@ def _puede_saltar_frames_video(estado_persistencia: dict) -> bool:
 
 def _leer_frame_camara_vivo(captura, *, max_grabs: int = 1) -> tuple[bool, object | None]:
     """Descarta frames viejos con grab (barato) y decodifica solo el ultimo."""
-    try:
-        for _ in range(max(0, int(max_grabs))):
-            if not captura.grab():
-                break
-        ok, frame = captura.retrieve()
-        if not ok or frame is None:
-            ok, frame = captura.read()
-        if not ok or frame is None:
-            return False, None
-        return True, frame
-    except cv2.error:
-        return False, None
+    return leer_frame_reciente_camara(captura, max_grabs=max_grabs)
 
 
 def _esperar_reproduccion_frame(

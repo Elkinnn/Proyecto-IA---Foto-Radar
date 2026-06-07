@@ -12,6 +12,8 @@ import numpy as np
 
 _CAPTURA_ACTIVA_LOCK = threading.Lock()
 _CAPTURA_CAMARA_ACTIVA = None
+CAMARA_WARMUP_TIMEOUT_S = 2.5
+CAMARA_WARMUP_PAUSA_S = 0.05
 
 
 def liberar_captura_camara_activa(captura=None) -> None:
@@ -50,8 +52,14 @@ def listar_nombres_camara_dshow() -> list[str] | None:
 def _gris_frame(frame):
     if frame is None or getattr(frame, "size", 0) == 0:
         return None
-    if len(frame.shape) == 3:
+    if len(frame.shape) == 2:
+        return frame
+    if len(frame.shape) == 3 and frame.shape[2] == 1:
+        return frame[:, :, 0]
+    if len(frame.shape) == 3 and frame.shape[2] == 3:
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if len(frame.shape) == 3 and frame.shape[2] == 4:
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
     return frame
 
 
@@ -95,6 +103,81 @@ def frame_tiene_senal(frame, *, umbral: float = 35.0) -> bool:
     return puntaje_senal_frame(frame) >= umbral
 
 
+def frame_es_util_camara(frame, *, umbral: float = 18.0) -> bool:
+    """Valida que la camara entregue video real, no negro/splash inicial.
+
+    El umbral es deliberadamente mas bajo que el del escaner visual para no
+    rechazar escenas reales con poca luz. Solo bloquea frames vacios, negros o
+    placeholders tipicos de camaras virtuales mientras conectan.
+    """
+    gris = _gris_frame(frame)
+    if gris is None:
+        return False
+    if es_frame_placeholder(frame):
+        return False
+    media = float(gris.mean())
+    std = float(gris.std())
+    if media < 4.0 and std < 3.0:
+        return False
+    return puntaje_senal_frame(frame) >= umbral or std >= 8.0
+
+
+def leer_frame_reciente_camara(captura, *, max_grabs: int = 2):
+    """Descarta frames viejos y recupera el mas reciente disponible."""
+    try:
+        for _ in range(max(0, int(max_grabs))):
+            if not captura.grab():
+                break
+        ok, frame = captura.retrieve()
+        if not ok or frame is None:
+            ok, frame = captura.read()
+        if not ok or frame is None:
+            return False, None
+        return True, frame
+    except cv2.error:
+        return False, None
+
+
+def esperar_frame_util_camara(
+    captura,
+    *,
+    timeout_s: float = CAMARA_WARMUP_TIMEOUT_S,
+    pausa_s: float = CAMARA_WARMUP_PAUSA_S,
+    max_grabs: int = 2,
+) -> dict:
+    """Espera hasta que la camara virtual entregue un frame con senal util."""
+    inicio = time.perf_counter()
+    intentos = 0
+    ultimo_frame = None
+    ultimo_puntaje = 0.0
+    while time.perf_counter() - inicio <= max(float(timeout_s), 0.0):
+        intentos += 1
+        ok, frame = leer_frame_reciente_camara(captura, max_grabs=max_grabs)
+        if ok and frame is not None:
+            ultimo_frame = frame
+            ultimo_puntaje = puntaje_senal_frame(frame)
+            if frame_es_util_camara(frame):
+                return {
+                    "ok": True,
+                    "frame": frame,
+                    "puntaje": round(float(ultimo_puntaje), 2),
+                    "intentos": intentos,
+                    "mensaje": "Camara lista.",
+                }
+        if pausa_s > 0:
+            time.sleep(float(pausa_s))
+    return {
+        "ok": False,
+        "frame": ultimo_frame,
+        "puntaje": round(float(ultimo_puntaje), 2),
+        "intentos": intentos,
+        "mensaje": (
+            "La camara se abrio, pero aun no entrega video util. "
+            "Verifique que Camo Studio muestre imagen y que ninguna otra app use la camara virtual."
+        ),
+    }
+
+
 def _set_prop_seguro(captura, prop: int, value) -> bool:
     """Algunas camaras virtuales (Camo, Iriun) lanzan cv2.error al fijar FPS/resolucion."""
     try:
@@ -135,7 +218,7 @@ def resolucion_real_captura(captura) -> tuple[int, int, float]:
 def _leer_frame_muestra(captura, intentos: int = 12, pausa_s: float = 0.08):
     for _ in range(max(1, int(intentos))):
         try:
-            ok, frame = captura.read()
+            ok, frame = leer_frame_reciente_camara(captura, max_grabs=1)
             if ok and frame is not None and getattr(frame, "size", 0) > 0:
                 return frame
         except cv2.error:
@@ -152,7 +235,8 @@ def _probar_backend(indice: int, backend: int, camera_width, camera_height, came
         if not captura.isOpened():
             return None, None, -1.0
         _configurar_captura(captura, camera_width, camera_height, camera_fps, nombre_dispositivo)
-        frame = _leer_frame_muestra(captura)
+        listo = esperar_frame_util_camara(captura, timeout_s=1.2, pausa_s=0.06, max_grabs=1)
+        frame = listo.get("frame")
         puntaje = puntaje_senal_frame(frame)
         if frame is None:
             # Algunas camaras virtuales (Camo) abren bien pero tardan en entregar el
