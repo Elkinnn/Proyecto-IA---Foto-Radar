@@ -920,6 +920,7 @@ def _crear_estado_persistencia() -> dict:
         "ultimo_frame_recorte": -GUARDAR_RECORTE_CADA_N_FRAMES,
         "evento_activo": False,
         "evento_id": 0,
+        "fecha_hora_evento": None,
         "mejor_confianza_evento": None,
         "mejor_bbox_evento": None,
         "mejor_frame_evento": None,
@@ -1985,6 +1986,7 @@ def _serializar_evento_cerrado(estado: dict, frame_fin: int) -> dict:
     velocidad = tracker.resumen() if tracker is not None else {}
     return {
         "evento_id": int(estado["evento_id"]),
+        "fecha_hora_evento": estado.get("fecha_hora_evento"),
         "frame_inicio": estado.get("frame_inicio_evento"),
         "frame_mejor": estado.get("frame_mejor_evento"),
         "frame_fin": frame_fin,
@@ -2141,6 +2143,7 @@ def _sincronizar_estado_raiz_desde_tracks(estado: dict, track_principal: dict | 
         "mejor_confianza_evento",
         "mejor_bbox_evento",
         "frame_inicio_evento",
+        "fecha_hora_evento",
         "frame_mejor_evento",
         "frame_ultimo_evento",
         "frames_sin_deteccion",
@@ -2318,6 +2321,7 @@ def _intentar_disparar_ocr_snapshot_evento(
 def _iniciar_evento_placa(estado: dict, evento_id: int, numero_frame: int) -> None:
     estado["evento_activo"] = True
     estado["evento_id"] = evento_id
+    estado["fecha_hora_evento"] = datetime.now().isoformat(timespec="seconds")
     estado["mejor_confianza_evento"] = None
     estado["mejor_bbox_evento"] = None
     estado["mejor_frame_evento"] = None

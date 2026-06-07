@@ -87,9 +87,6 @@ fuzzy:
     exceso_alto: 12
 
 notificaciones:
-  # Solo si no hay velocidad medida en el evento (fallback de prueba).
-  velocidad_demo_kmh: 47.0
-  limite_demo_kmh: 30.0
   # Configuracion SMTP. Por seguridad, las credenciales se leen preferentemente
   # de variables de entorno (ver .env.example):
   #   FOTORRADAR_SMTP_HOST, FOTORRADAR_SMTP_PORT, FOTORRADAR_SMTP_USER,

@@ -692,7 +692,7 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
         col_evt_res1, col_evt_res2, col_evt_res3 = st.columns(3)
         col_evt_res1.metric("Placa reconocida", resumen.get("placa_controlada", "Pendiente"))
         col_evt_res2.metric("Apta para envio", "Si" if evaluacion.get("apto") else "No")
-        col_evt_res3.metric("Velocidad (demo)", f"{difuso_evento.get('velocidad_kmh', 0):.1f} km/h" if difuso_evento else "Pendiente")
+        col_evt_res3.metric("Velocidad medida", f"{difuso_evento.get('velocidad_kmh', 0):.1f} km/h" if difuso_evento else "Pendiente")
 
         col_evt_res4, col_evt_res5, col_evt_res6 = st.columns(3)
         col_evt_res4.metric("Estado difuso", difuso_evento.get("estado", "Pendiente"))
@@ -756,8 +756,8 @@ def _metricas_calidad_desde_resumen(resumen: dict, placa: str) -> dict:
 
 def _adjuntos_evento_desde_resumen(resumen: dict) -> list[str]:
     candidatos_frame = [
-        resumen.get("ruta_snapshot_frame_evento"),
         resumen.get("ruta_mejor_frame_evento"),
+        resumen.get("ruta_snapshot_frame_evento"),
         resumen.get("mejor_frame_bbox_placa"),
         resumen.get("ruta_frame_evento_en_vivo"),
         resumen.get("mejor_frame_recorte_placa"),
@@ -790,6 +790,42 @@ def _adjuntos_evento_desde_resumen(resumen: dict) -> list[str]:
     return adjuntos
 
 
+def _mejor_frame_evento_desde_resumen(resumen: dict) -> str | None:
+    """Devuelve la evidencia completa seleccionada para el evento."""
+    for clave in (
+        "ruta_mejor_frame_evento",
+        "ruta_snapshot_frame_evento",
+        "mejor_frame_bbox_placa",
+        "ruta_frame_evento_en_vivo",
+    ):
+        ruta = resumen.get(clave)
+        if ruta and Path(str(ruta)).exists():
+            return str(ruta)
+    return None
+
+
+def _contexto_notificacion_desde_resumen(resumen: dict, adjuntos: list[str], config: dict | None = None) -> dict:
+    """Extrae solo datos medidos y evidencias pertenecientes al mismo evento."""
+    velocidad = resumen.get("velocidad") or {}
+    ultima_deteccion = resumen.get("ultima_deteccion") or {}
+    mejor_frame = _mejor_frame_evento_desde_resumen(resumen)
+    return {
+        "evento_id": resumen.get("evento_id") or resumen.get("eventos_placa"),
+        "fecha_hora": resumen.get("fecha_hora_evento") or resumen.get("fecha_hora"),
+        "fuente": resumen.get("fuente"),
+        "velocidad_kmh": _obtener_velocidad_kmh_desde_resumen(resumen),
+        "limite_kmh": _obtener_limite_kmh_resumen(resumen, config),
+        "distancia_metros": velocidad.get("distancia_metros") or resumen.get("distancia_lineas_m"),
+        "tiempo_entre_lineas": velocidad.get("tiempo_entre_lineas"),
+        "frame_linea_1": velocidad.get("frame_cruce_linea_1"),
+        "frame_linea_2": velocidad.get("frame_cruce_linea_2"),
+        "metodo_medicion": velocidad.get("metodo_medicion"),
+        "confianza_ocr": resumen.get("confianza_final_evento") or resumen.get("confianza_ocr"),
+        "confianza_yolo": resumen.get("mejor_confianza_evento") or ultima_deteccion.get("confianza"),
+        "evidencia_principal": mejor_frame,
+    }
+
+
 def _tiene_recorte_placa_valido(resumen: dict) -> bool:
     ruta = (
         resumen.get("mejor_recorte_placa")
@@ -807,7 +843,9 @@ def preparar_estado_notificacion_evento(resumen: dict, placa_evento: str, config
     resumen["evaluacion_calidad_evento"] = evaluacion
     resumen["placa_controlada"] = placa
     resumen["puede_enviar_notificacion"] = bool(
-        evaluacion.get("apto") and _tiene_recorte_placa_valido(resumen)
+        evaluacion.get("apto")
+        and _tiene_recorte_placa_valido(resumen)
+        and _mejor_frame_evento_desde_resumen(resumen)
     )
     return resumen
 
@@ -820,6 +858,23 @@ def enviar_notificacion_evento_monitoreo(
 ) -> dict:
     """Envia correo para un evento (usado por el envio automatico)."""
     placa = (placa_evento or "").strip().upper()
+    if not _extraer_placa_desde_resumen(resumen):
+        resumen["notificacion_correo"] = {
+            "enviado": False,
+            "modo": "bloqueado",
+            "estado": "placa_no_reconocida",
+            "mensaje_estado": "No se envia correo: el evento no tiene una placa reconocida por el lector CNN.",
+        }
+        return resumen
+    velocidad_kmh = _obtener_velocidad_kmh_desde_resumen(resumen)
+    if velocidad_kmh is None:
+        resumen["notificacion_correo"] = {
+            "enviado": False,
+            "modo": "bloqueado",
+            "estado": "velocidad_no_medida",
+            "mensaje_estado": "No se envia correo: el vehiculo no completo la medicion real entre Linea 1 y Linea 2.",
+        }
+        return resumen
     resumen = preparar_estado_notificacion_evento(resumen, placa, config)
     resumen = _aplicar_multa_difusa_resumen(resumen, config)
     evaluacion = resumen.get("evaluacion_calidad_evento") or {}
@@ -846,7 +901,15 @@ def enviar_notificacion_evento_monitoreo(
 
     metricas = _metricas_calidad_desde_resumen(resumen, placa)
     adjuntos = _adjuntos_evento_desde_resumen(resumen)
-    velocidad_kmh = _obtener_velocidad_kmh_desde_resumen(resumen)
+    mejor_frame = _mejor_frame_evento_desde_resumen(resumen)
+    if not adjuntos or not mejor_frame:
+        resumen["notificacion_correo"] = {
+            "enviado": False,
+            "modo": "bloqueado",
+            "estado": "evidencia_no_disponible",
+            "mensaje_estado": "No se envia correo: no existe el mejor frame completo del evento.",
+        }
+        return resumen
     limite_kmh = _obtener_limite_kmh_resumen(resumen, config)
     notificacion = notificar_evento_placa(
         destinatario=correo_destino,
@@ -855,11 +918,7 @@ def enviar_notificacion_evento_monitoreo(
         adjuntos=adjuntos,
         config=config,
         evento_id=resumen.get("evento_id") or resumen.get("eventos_placa") or "monitoreo",
-        contexto={
-            "fecha_hora": datetime.now().isoformat(timespec="seconds"),
-            "velocidad_kmh": velocidad_kmh,
-            "limite_kmh": limite_kmh,
-        },
+        contexto=_contexto_notificacion_desde_resumen(resumen, adjuntos, config),
         velocidad_kmh=velocidad_kmh,
         limite_kmh=limite_kmh,
     )
@@ -934,6 +993,12 @@ def _resumen_notificacion_desde_cache(evento_id: int, entry: dict) -> dict:
 
 
 def _evento_confirmado_para_email(resumen: dict, placa: str, config: dict, *, evento_cerrado: bool) -> bool:
+    if not evento_cerrado:
+        return False
+    if not _extraer_placa_desde_resumen(resumen):
+        return False
+    if _obtener_velocidad_kmh_desde_resumen(resumen) is None:
+        return False
     resumen = preparar_estado_notificacion_evento(resumen, placa, config)
     if not resumen.get("puede_enviar_notificacion"):
         return False
@@ -972,6 +1037,13 @@ def _encolar_email_evento_asincrono(
     metricas = _metricas_calidad_desde_resumen(resumen, placa)
     adjuntos = _adjuntos_evento_desde_resumen(resumen)
     velocidad_kmh = _obtener_velocidad_kmh_desde_resumen(resumen)
+    if (
+        velocidad_kmh is None
+        or not adjuntos
+        or not _mejor_frame_evento_desde_resumen(resumen)
+        or not _extraer_placa_desde_resumen(resumen)
+    ):
+        return False
     limite_kmh = _obtener_limite_kmh_resumen(resumen, config)
     payload = {
         "evento_id": int(evento_id),
@@ -982,11 +1054,7 @@ def _encolar_email_evento_asincrono(
         "config": config,
         "velocidad_kmh": velocidad_kmh,
         "limite_kmh": limite_kmh,
-        "contexto": {
-            "fecha_hora": datetime.now().isoformat(timespec="seconds"),
-            "velocidad_kmh": velocidad_kmh,
-            "limite_kmh": limite_kmh,
-        },
+        "contexto": _contexto_notificacion_desde_resumen(resumen, adjuntos, config),
     }
     with _EMAIL_ASYNC_LOCK:
         _EMAIL_ASYNC_PENDIENTES.add(clave)
@@ -1060,7 +1128,7 @@ def _fusionar_emails_asincronos_monitoreo() -> bool:
 
 
 def _procesar_email_inmediato_eventos_reconocidos(config: dict, placa_controlada: str) -> bool:
-    """Encola un unico correo apenas una lectura viva queda confirmada."""
+    """Encola un correo al cerrar el evento con placa, velocidad y evidencia reales."""
     notif_cfg = config.get("notificaciones") or {}
     if not notif_cfg.get("envio_automatico", True):
         return _fusionar_emails_asincronos_monitoreo()
@@ -1083,8 +1151,12 @@ def _procesar_email_inmediato_eventos_reconocidos(config: dict, placa_controlada
             continue
         if not _entrada_ocr_tiene_texto_util(entry):
             continue
+        if not entry.get("evento_cerrado"):
+            continue
         resumen = _resumen_notificacion_desde_cache(int(evento_id), entry)
-        placa = _obtener_placa_para_evento(resumen, placa_controlada)
+        placa = _extraer_placa_desde_resumen(resumen)
+        if not placa:
+            continue
         if not _evento_confirmado_para_email(
             resumen,
             placa,
@@ -1546,6 +1618,10 @@ def _estado_correo_item(item: dict) -> str:
     if item.get("estado_ocr") == "error":
         return "Error OCR"
     res = item.get("resumen") or {}
+    if _obtener_velocidad_kmh_desde_resumen(res) is None:
+        return "Sin velocidad"
+    if not _mejor_frame_evento_desde_resumen(res):
+        return "Sin evidencia"
     if item.get("es_mejor_del_paso") and res.get("puede_enviar_notificacion"):
         return "Pendiente envio"
     if not res.get("puede_enviar_notificacion"):
@@ -1611,7 +1687,11 @@ def _procesar_envio_automatico_cola(
             continue
 
         candidatos_apto = [
-            i for i in items_listos if (i.get("resumen") or {}).get("puede_enviar_notificacion")
+            i
+            for i in items_listos
+            if (i.get("resumen") or {}).get("puede_enviar_notificacion")
+            and _obtener_velocidad_kmh_desde_resumen(i.get("resumen") or {}) is not None
+            and _extraer_placa_desde_resumen(i.get("resumen") or {})
         ]
         if not candidatos_apto:
             descartados.add(paso_id)
@@ -1620,7 +1700,7 @@ def _procesar_envio_automatico_cola(
 
         mejor = max(candidatos_apto, key=_puntaje_item_evento)
         resumen = dict(mejor.get("resumen") or {})
-        placa = _obtener_placa_para_evento(resumen, placa_controlada)
+        placa = _extraer_placa_desde_resumen(resumen)
         resumen = enviar_notificacion_evento_monitoreo(resumen, placa, correo, config)
         mejor["resumen"] = resumen
         notif = resumen.get("notificacion_correo") or {}
@@ -2745,6 +2825,7 @@ def _construir_resumen_evento_cerrado(evento: dict, fuente: str, config: dict | 
     resumen = {
         "evento_id": evento.get("evento_id"),
         "eventos_placa": evento.get("evento_id"),
+        "fecha_hora_evento": evento.get("fecha_hora_evento"),
         "frame_mejor_evento": evento.get("frame_mejor"),
         "frame_actual": evento.get("frame_fin"),
         "frames_procesados": evento.get("frame_fin"),
@@ -2758,6 +2839,7 @@ def _construir_resumen_evento_cerrado(evento: dict, fuente: str, config: dict | 
             "bbox": evento.get("mejor_bbox"),
         },
         "velocidad": evento.get("velocidad") or {},
+        "distancia_lineas_m": evento.get("distancia_lineas_m"),
         "limite_velocidad_kmh": evento.get("limite_velocidad_kmh"),
         "fuente": fuente,
         "estado_placa": "Cerrado",
@@ -2791,7 +2873,7 @@ def _registrar_evento_cerrado_monitoreo(
 
     estado_ocr_inicial = "pendiente"
     if cache_entry.get("estado") == "listo" and cache_entry.get("resumen_completo"):
-        resumen = dict(cache_entry["resumen_completo"])
+        resumen.update(cache_entry["resumen_completo"])
         estado_ocr_inicial = "listo"
     elif cache_entry.get("datos"):
         resumen.update({k: v for k, v in cache_entry["datos"].items() if v is not None})
@@ -4225,6 +4307,8 @@ def pestana_monitoreo(config: dict) -> None:
         frame_ref = int(estado_frame.get("frame_actual", numero_frame) or 0)
 
         if evento_cerrado:
+            evento_cerrado.setdefault("distancia_lineas_m", float(distancia_metros))
+            evento_cerrado.setdefault("limite_velocidad_kmh", float(limite_velocidad))
             _registrar_evento_cerrado_monitoreo(
                 evento_cerrado,
                 config,
@@ -4422,6 +4506,8 @@ def pestana_monitoreo(config: dict) -> None:
 
     estado_final = resumen.get("estado_persistencia") or {}
     for evento in estado_final.get("eventos_cerrados") or []:
+        evento.setdefault("distancia_lineas_m", float(distancia_metros))
+        evento.setdefault("limite_velocidad_kmh", float(limite_velocidad))
         _registrar_evento_cerrado_monitoreo(evento, config, placa_controlada, fuente_monitoreo)
     _procesar_ocr_cola_eventos(config, placa_controlada)
     _procesar_envio_automatico_cola(
