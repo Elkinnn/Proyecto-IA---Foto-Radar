@@ -4,8 +4,8 @@ Responsabilidades:
 - Validar el correo destino (incluye correos institucionales, p. ej. @uni.edu.ec).
 - Aplicar un "candado de calidad" que evita enviar notificaciones de placas
   incompletas (media placa) o lecturas poco confiables.
-- Construir el mensaje de la sancion usando la logica difusa (por ahora con una
-  velocidad/distancia "quemada" de demostracion).
+- Construir el mensaje de la sancion usando la velocidad medida y la logica
+  difusa; usa un valor de demostracion solo si el evento no tiene medicion.
 - Enviar el correo por SMTP real; si no hay credenciales configuradas, cae en un
   modo simulado que guarda el correo y los adjuntos en disco (no rompe la demo).
 """
@@ -24,8 +24,7 @@ import ssl
 from src.utils import cargar_variables_entorno
 
 cargar_variables_entorno()
-# Cuando se integre la velocidad real, basta con pasar otra velocidad a
-# construir_resultado_difuso_demo().
+# Compatibilidad para pruebas antiguas sin una medicion de velocidad.
 VELOCIDAD_DEMO_KMH = 47.0
 LIMITE_DEMO_KMH = 30.0
 

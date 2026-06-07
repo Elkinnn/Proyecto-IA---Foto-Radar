@@ -24,7 +24,14 @@ from src.camera_utils import (
     probar_indices_camara,
     resumen_camaras_sistema,
 )
-from src.fuzzy_system import clasificar_velocidad
+from src.fuzzy_system import (
+    CATEGORIAS,
+    ETIQUETAS_ENTRADA_ACADEMICA,
+    ETIQUETAS_SALIDA,
+    clasificar_velocidad,
+    obtener_datos_visualizacion,
+    obtener_reglas_difusas,
+)
 from src.notifier import evaluar_calidad_evento, notificar_evento_placa, validar_correo
 from src.plate_detector import PlateDetector
 from src.plate_reader import (
@@ -1704,7 +1711,29 @@ def _aplicar_multa_difusa_resumen(resumen: dict, config: dict | None) -> dict:
     salida["clasificacion_difusa"] = clasificar_velocidad(kmh, limite, config)
     salida["velocidad_kmh"] = kmh
     salida.setdefault("limite_velocidad_kmh", limite)
+    _guardar_resultado_difuso_evento(salida)
     return salida
+
+
+def _guardar_resultado_difuso_evento(resumen: dict) -> str | None:
+    """Persiste una evidencia compacta de inferencia para cada evento medido."""
+    resultado = resumen.get("clasificacion_difusa") or {}
+    evento_id = resumen.get("evento_id") or resumen.get("eventos_placa")
+    if not evento_id or resultado.get("velocidad_kmh") is None:
+        return None
+    directorio = Path("reports") / "evidencias" / "logica_difusa" / "eventos"
+    directorio.mkdir(parents=True, exist_ok=True)
+    ruta = directorio / f"evento_{int(evento_id):04d}_inferencia.json"
+    payload = {
+        "fecha_hora": datetime.now().isoformat(timespec="seconds"),
+        "evento_id": int(evento_id),
+        "placa": _extraer_placa_desde_resumen(resumen) or None,
+        "fuente": resumen.get("fuente"),
+        "resultado": resultado,
+    }
+    ruta.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    resumen["ruta_resultado_difuso"] = str(ruta)
+    return str(ruta)
 
 
 def _formatear_metrica_velocidad(velocidad: dict, estado_placa: str = "", difuso: dict | None = None) -> tuple[str, str | None]:
@@ -1926,6 +1955,7 @@ def _render_panel_deteccion_esencial(
             config,
         )
         resumen["clasificacion_difusa"] = difuso
+        _guardar_resultado_difuso_evento(resumen)
 
     texto_velocidad, detalle_velocidad = _formatear_metrica_velocidad(velocidad, estado_placa, difuso)
     texto_sancion = (
@@ -5162,6 +5192,199 @@ def pestana_pruebas(config: dict) -> None:
         mostrar_resultado_prueba(resultado)
 
 
+def pestana_logica_difusa(config: dict) -> None:
+    import matplotlib.pyplot as plt
+
+    st.header("Logica difusa")
+    st.caption("Sistema Mamdani: velocidad medida → nivel de sancion → multa y suspension.")
+
+    control_velocidad, control_limite = st.columns(2)
+    with control_velocidad:
+        velocidad = st.slider(
+            "Velocidad de entrada (km/h)",
+            min_value=0.0,
+            max_value=120.0,
+            value=40.0,
+            step=0.5,
+            key="fuzzy_velocidad_demo",
+        )
+    with control_limite:
+        limite = st.number_input(
+            "Limite configurado (km/h)",
+            min_value=5.0,
+            max_value=120.0,
+            value=float((config.get("speed") or {}).get("campus_speed_limit_kmh", 30.0)),
+            step=1.0,
+            key="fuzzy_limite_demo",
+        )
+
+    diagnostico = obtener_datos_visualizacion(float(velocidad), float(limite), config)
+    resultado = clasificar_velocidad(float(velocidad), float(limite), config)
+
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("Entrada", f"{velocidad:.1f} km/h")
+    r2.metric("Salida centroide", f"{resultado['nivel_sancion_defuzzificado']:.2f}/100")
+    r3.metric("Nivel", resultado["etiqueta_salida"])
+    r4.metric("Multa", f"${resultado['multa_usd']:.2f}")
+    r5.metric("Suspension", f"{resultado['horas_suspension']} h")
+    st.info(resultado["mensaje"])
+    st.caption(
+        "Los rangos y valores de sancion son parametros academicos configurables. "
+        "Antes de uso institucional deben calibrarse y validarse con la normativa aplicable."
+    )
+
+    with st.expander("Estructura y calibracion del sistema difuso", expanded=False):
+        cfg_difuso = diagnostico["configuracion"]
+        st.write(
+            "La velocidad se evalua respecto al limite activo. Los umbrales base de "
+            "`config.yaml` se desplazan cuando cambia ese limite."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Variable de entrada": ETIQUETAS_ENTRADA_ACADEMICA["seguro"], "Hasta km/h": cfg_difuso["seguro_hasta"]},
+                    {"Variable de entrada": ETIQUETAS_ENTRADA_ACADEMICA["permitido"], "Hasta km/h": cfg_difuso["permitido_hasta"]},
+                    {"Variable de entrada": ETIQUETAS_ENTRADA_ACADEMICA["precaucion"], "Hasta km/h": cfg_difuso["precaucion_hasta"]},
+                    {"Variable de entrada": ETIQUETAS_ENTRADA_ACADEMICA["exceso_leve"], "Hasta km/h": cfg_difuso["exceso_leve_hasta"]},
+                    {"Variable de entrada": ETIQUETAS_ENTRADA_ACADEMICA["exceso_medio"], "Hasta km/h": cfg_difuso["exceso_medio_hasta"]},
+                    {"Variable de entrada": ETIQUETAS_ENTRADA_ACADEMICA["exceso_alto"], "Hasta km/h": "Sin limite superior"},
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.write(
+            "Salida linguistica: Sin multa, Advertencia, Multa leve, Multa moderada y Multa grave. "
+            "Implicacion por minimo, agregacion por maximo y defuzzificacion por centroide."
+        )
+
+    colores_entrada = {
+        "seguro": "#2e8b57",
+        "permitido": "#39a96b",
+        "precaucion": "#e0a800",
+        "exceso_leve": "#e67e22",
+        "exceso_medio": "#d35400",
+        "exceso_alto": "#c0392b",
+    }
+    figura_entrada, eje_entrada = plt.subplots(figsize=(11, 4.2))
+    for categoria in CATEGORIAS:
+        eje_entrada.plot(
+            diagnostico["universo_entrada"],
+            diagnostico["curvas_entrada"][categoria],
+            linewidth=2,
+            color=colores_entrada[categoria],
+            label=ETIQUETAS_ENTRADA_ACADEMICA[categoria],
+        )
+    eje_entrada.axvline(float(velocidad), color="#111111", linestyle="--", linewidth=2, label=f"Entrada {velocidad:.1f}")
+    eje_entrada.axvline(float(limite), color="#2874a6", linestyle=":", linewidth=2, label=f"Limite {limite:.1f}")
+    eje_entrada.set_title("Funciones de membresia de la velocidad")
+    eje_entrada.set_xlabel("Velocidad (km/h)")
+    eje_entrada.set_ylabel("Grado de pertenencia")
+    eje_entrada.set_ylim(-0.03, 1.08)
+    eje_entrada.grid(alpha=0.22)
+    eje_entrada.legend(ncol=2, fontsize=8)
+    figura_entrada.tight_layout()
+    st.pyplot(figura_entrada, use_container_width=True)
+    plt.close(figura_entrada)
+
+    grados_df = pd.DataFrame(
+        [
+            {
+                "Variable linguistica": ETIQUETAS_ENTRADA_ACADEMICA[categoria],
+                "Categoria interna": categoria,
+                "Grado de pertenencia": float(diagnostico["grados_entrada"][categoria]),
+            }
+            for categoria in CATEGORIAS
+        ]
+    )
+    st.dataframe(grados_df, use_container_width=True, hide_index=True)
+
+    colores_salida = {
+        "sin_multa": "#2e8b57",
+        "advertencia": "#e0a800",
+        "multa_leve": "#e67e22",
+        "multa_moderada": "#d35400",
+        "multa_grave": "#c0392b",
+    }
+    figura_salida, eje_salida = plt.subplots(figsize=(11, 4.2))
+    for categoria, etiqueta in ETIQUETAS_SALIDA.items():
+        eje_salida.plot(
+            diagnostico["universo"],
+            diagnostico["curvas_salida"][categoria],
+            color=colores_salida[categoria],
+            linewidth=1.6,
+            alpha=0.75,
+            label=etiqueta,
+        )
+    eje_salida.fill_between(
+        diagnostico["universo"],
+        0,
+        diagnostico["agregada"],
+        color="#4c78a8",
+        alpha=0.32,
+        label="Salida agregada",
+    )
+    eje_salida.axvline(
+        float(resultado["nivel_sancion_defuzzificado"]),
+        color="#111111",
+        linestyle="--",
+        linewidth=2,
+        label=f"Centroide {resultado['nivel_sancion_defuzzificado']:.2f}",
+    )
+    eje_salida.set_title("Funciones de membresia de multa / sancion")
+    eje_salida.set_xlabel("Nivel de sancion (0-100)")
+    eje_salida.set_ylabel("Grado de pertenencia")
+    eje_salida.set_ylim(-0.03, 1.08)
+    eje_salida.grid(alpha=0.22)
+    eje_salida.legend(ncol=2, fontsize=8)
+    figura_salida.tight_layout()
+    st.pyplot(figura_salida, use_container_width=True)
+    plt.close(figura_salida)
+
+    st.subheader("Reglas difusas")
+    activaciones_reglas = {
+        (regla["antecedente"], regla["consecuente"]): float(regla["activacion"])
+        for regla in diagnostico["reglas"]
+    }
+    reglas_df = pd.DataFrame(
+        [
+            {
+                "Regla": regla["numero"],
+                "SI velocidad es": regla["si_velocidad_es"],
+                "ENTONCES sancion es": regla["entonces_sancion_es"],
+                "Activacion": activaciones_reglas.get((regla["antecedente"], regla["consecuente"]), 0.0),
+            }
+            for regla in obtener_reglas_difusas()
+        ]
+    )
+    st.dataframe(reglas_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Explicacion de inferencia")
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Fuzzificacion", f"{sum(g > 0 for g in diagnostico['grados_entrada'].values())} conjuntos activos")
+    e2.metric("Reglas activas", f"{sum(r['activacion'] > 0 for r in diagnostico['reglas'])}")
+    e3.metric("Agregacion", "Maximo")
+    e4.metric("Defuzzificacion", "Centroide")
+    for paso in resultado["explicacion_inferencia"]:
+        st.write(f"- {paso}")
+
+    with st.expander("Detalle tecnico de la inferencia", expanded=False):
+        st.json(
+            {
+                "entrada_velocidad_kmh": resultado["velocidad_kmh"],
+                "limite_kmh": resultado["limite_kmh"],
+                "grados_entrada": resultado["grados_entrada"],
+                "activaciones_salida": resultado["activaciones_salida"],
+                "reglas_activas": resultado["reglas_activas"],
+                "salida_defuzzificada": resultado["nivel_sancion_defuzzificado"],
+                "categoria_salida": resultado["categoria_salida"],
+                "multa_usd": resultado["multa_usd"],
+                "horas_suspension": resultado["horas_suspension"],
+                "operadores": resultado["operadores"],
+            }
+        )
+
+
 def pestana_evidencias(config: dict) -> None:
     st.header("Evidencias")
     reports_dir = Path(config["paths"]["reports_dir"])
@@ -5229,14 +5452,16 @@ def main() -> None:
     st.title("Fotorradar Ecuador IA")
     st.caption("Consola de monitoreo por video para placas ecuatorianas.")
 
-    tabs = st.tabs(["Monitoreo", "Pruebas", "Evidencias", "Configuracion"])
+    tabs = st.tabs(["Monitoreo", "Pruebas", "Logica difusa", "Evidencias", "Configuracion"])
     with tabs[0]:
         pestana_monitoreo(config)
     with tabs[1]:
         pestana_pruebas(config)
     with tabs[2]:
-        pestana_evidencias(config)
+        pestana_logica_difusa(config)
     with tabs[3]:
+        pestana_evidencias(config)
+    with tabs[4]:
         pestana_configuracion(config)
 
 

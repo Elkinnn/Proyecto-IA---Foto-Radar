@@ -13,7 +13,7 @@ Construir una base limpia, organizada y funcional para un fotorradar controlado 
 - `src/plate_detector.py`: detector de placas, preparado para cargar un modelo entrenado localmente.
 - `src/plate_reader.py`: lector de placa con segmentacion OpenCV y clasificacion de caracteres mediante CNN propia.
 - `src/speed_estimator.py`: calculo de velocidad en km/h.
-- `src/fuzzy_system.py`: clasificacion de velocidad y sancion segun rangos configurables.
+- `src/fuzzy_system.py`: inferencia difusa Mamdani completa para convertir velocidad en nivel de sancion.
 - `src/notifier.py`: envio de notificaciones por correo (SMTP) con control de calidad anti media-placa; cae en modo simulado si no hay credenciales.
 - `src/report_generator.py`: evidencia en JSON.
 - `scripts/`: utilidades conectadas al sistema final.
@@ -30,7 +30,9 @@ El proyecto trabaja con modelos locales. El detector de placas usa YOLO y el lec
 
 La pantalla principal es `Monitoreo`, con fuentes para `Video de prueba` o `Camara en vivo`. La entrada por imagen queda separada en la pestaña `Pruebas`, dentro de `Pruebas con imagen`.
 
-La pestaña de monitoreo dibuja dos lineas virtuales horizontales sobre el frame procesado y deja preparada la estructura para calcular el tiempo real de cruce entre ambas lineas cuando se integre tracking vehicular.
+La pestaña de monitoreo dibuja dos lineas virtuales horizontales y calcula velocidad con el metodo tic-toc. En video usa frames/FPS; en camara en vivo usa reloj monotonico real. La velocidad medida alimenta automaticamente la clasificacion difusa.
+
+La pestaña `Logica difusa` permite visualizar las funciones de membresia de entrada y salida, reglas activas, agregacion y resultado de la defuzzificacion por centroide.
 
 ## Reconocimiento de caracteres con CNN
 
@@ -53,4 +55,4 @@ streamlit run app.py
 
 ## Prueba del pipeline
 
-`scripts/test_pipeline.py` crea una imagen controlada, usa una placa ecuatoriana de prueba, calcula una velocidad simulada, consulta SQLite, clasifica la velocidad y guarda una evidencia JSON.
+`scripts/test_pipeline.py` crea una imagen controlada, usa una placa ecuatoriana de prueba, calcula una velocidad simulada, clasifica la velocidad y guarda una evidencia JSON.
