@@ -1,7 +1,6 @@
 from datetime import datetime
 from pathlib import Path
 import csv
-import hashlib
 import json
 import threading
 import time
@@ -31,6 +30,48 @@ from src.fuzzy_system import (
     obtener_datos_visualizacion,
     obtener_reglas_difusas,
 )
+from src.monitoring.event_summary import (
+    _adjuntos_evento_desde_resumen,
+    _aplicar_multa_difusa_resumen,
+    _contexto_notificacion_desde_resumen,
+    _es_codigo_error_lectura,
+    _extraer_placa_desde_resumen,
+    _extraer_placa_individual_desde_resumen,
+    _guardar_resultado_difuso_evento,
+    _mejor_frame_evento_desde_resumen,
+    _metricas_calidad_desde_resumen,
+    _obtener_limite_kmh_resumen,
+    _obtener_velocidad_kmh_desde_resumen,
+    _tiene_recorte_placa_valido,
+)
+from src.monitoring.event_queue import (
+    _agrupar_cola_por_paso_vehiculo,
+    _consolidar_marcas_paso_vehiculo,
+    _grupo_listo_para_envio,
+    _marcar_duplicados_placa_en_cola,
+    _puntaje_item_evento,
+)
+from src.monitoring.ocr_cache import (
+    _debe_usar_nuevo_consolidado,
+    _entrada_ocr_tiene_texto_util,
+    _lectura_existe_para_ruta,
+    _puntaje_consolidado_evento,
+    _resultado_ocr_necesita_reintento,
+)
+from src.monitoring.run_context import (
+    crear_snapshot_ocr_inmutable as _crear_snapshot_ocr_inmutable,
+    id_ejecucion_monitoreo_actual as _id_ejecucion_monitoreo_actual,
+    nuevo_id_ejecucion_monitoreo as _nuevo_id_ejecucion_monitoreo,
+)
+from src.monitoring.ui_config import (
+    config_modo_rendimiento as _config_modo_rendimiento,
+    config_rendimiento_monitoreo as _config_rendimiento_monitoreo,
+    opciones_camara_monitoreo as _opciones_camara_monitoreo,
+    preparar_imagen_streamlit as _preparar_imagen_streamlit,
+    redimensionar_frame_rgb as _redimensionar_frame_rgb,
+    snap_a_opcion_slider as _snap_a_opcion_slider,
+    texto_resolucion_captura_ui as _texto_resolucion_captura_ui,
+)
 from src.notifier import evaluar_calidad_evento, notificar_evento_placa, validar_correo
 from src.plate_detector import PlateDetector
 from src.plate_reader import (
@@ -44,7 +85,7 @@ from src.plate_reader import (
     registrar_reporte_ocr,
     segmentar_caracteres_v2,
 )
-from src.speed_estimator import SpeedTracker
+from components.speed_simulation import ejecutar_simulacion_velocidad
 from src.utils import cargar_config, cargar_variables_entorno, guardar_archivo_subido
 
 cargar_variables_entorno()
@@ -62,12 +103,6 @@ from scripts.generar_caracteres_desde_placas_ecuador import (
 )
 
 
-PERFORMANCE_MODE_LABELS = {
-    "Rapido": "rapido",
-    "Balanceado": "balanceado",
-    "Preciso": "preciso",
-}
-
 _OCR_ASYNC_LOCK = threading.Lock()
 _OCR_ASYNC_PENDIENTES: set[str] = set()
 _OCR_ASYNC_RESULTADOS: dict[str, dict] = {}
@@ -80,115 +115,6 @@ _EMAIL_ASYNC_RESULTADOS: dict[str, dict] = {}
 # -> error_cnn -> CNN 0% / formato invalido. Tambien evita llamadas
 # concurrentes a TensorFlow, que no es thread-safe.
 _OCR_EJECUCION_LOCK = threading.Lock()
-_OCR_ENTRADAS_INMUTABLES_DIR = (
-    Path("reports") / "evidencias" / "reconocimiento_caracteres" / "entradas_monitoreo"
-)
-
-
-def _nuevo_id_ejecucion_monitoreo() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-
-
-def _id_ejecucion_monitoreo_actual() -> str:
-    return str(st.session_state.get("monitoreo_run_id") or "sin_ejecucion")
-
-
-def _crear_snapshot_ocr_inmutable(
-    ruta_recorte: str,
-    *,
-    evento_id: int | None = None,
-    frame_actual: int | None = None,
-) -> str:
-    """Copia el recorte antes del hilo CNN para que nunca cambie bajo sus pies."""
-    origen = Path(str(ruta_recorte))
-    try:
-        datos = origen.read_bytes()
-    except OSError:
-        return str(origen)
-    if not datos:
-        return str(origen)
-
-    huella = hashlib.sha256(datos).hexdigest()[:16]
-    run_id = "".join(c for c in _id_ejecucion_monitoreo_actual() if c.isalnum() or c in "_-")
-    evento = max(int(evento_id or 0), 0)
-    frame = max(int(frame_actual or 0), 0)
-    sufijo = origen.suffix.lower() if origen.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"} else ".jpg"
-    carpeta = _OCR_ENTRADAS_INMUTABLES_DIR / run_id
-    carpeta.mkdir(parents=True, exist_ok=True)
-    destino = carpeta / f"evento_{evento:04d}_frame_{frame:06d}_{huella}{sufijo}"
-    if not destino.exists():
-        # El nombre ya es inmutable por contenido. Escribir directamente evita
-        # fallos de os.replace en Windows/OneDrive cuando el antivirus inspecciona
-        # el archivo temporal justo al crearlo.
-        destino.write_bytes(datos)
-    return str(destino)
-
-
-def _opciones_camara_monitoreo() -> list[dict]:
-    """Camara(s) registradas en Windows para el selector de monitoreo en vivo."""
-    resumen = resumen_camaras_sistema()
-    nombres = resumen.get("nombres") or []
-    indice_default = (resumen.get("indices_camo") or resumen.get("indices_iriun") or [0])[0]
-    if not nombres:
-        return [{"indice": i, "etiqueta": f"Camara {i}", "default": i == 0} for i in range(4)]
-    opciones = [{"indice": i, "nombre": nombre, "etiqueta": f"{i} — {nombre}"} for i, nombre in enumerate(nombres)]
-    for item in opciones:
-        item["default"] = item["indice"] == indice_default
-    return opciones
-
-
-def _config_modo_rendimiento(config: dict, modo: str) -> dict:
-    clave = PERFORMANCE_MODE_LABELS.get(modo, "balanceado")
-    defaults = {
-        "rapido": {"yolo_every_n_frames": 5, "inference_size": 416, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 0},
-        "balanceado": {"yolo_every_n_frames": 5, "inference_size": 512, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 0},
-        "preciso": {"yolo_every_n_frames": 3, "inference_size": 640, "render_every_n_frames": 1, "history_max": 10, "max_display_fps": 0},
-    }
-    salida = defaults[clave].copy()
-    salida.update((config.get("monitoring_performance") or {}).get(clave, {}))
-    return salida
-
-
-def _config_rendimiento_monitoreo(config: dict, modo: str, fuente_monitoreo: str) -> dict:
-    base = _config_modo_rendimiento(config, modo)
-    perf = config.get("monitoring_performance") or {}
-    clave_fuente = "video" if fuente_monitoreo == "Video de prueba" else "camara"
-    base.update(perf.get(clave_fuente, {}) or {})
-    return base
-
-
-def _snap_a_opcion_slider(valor: int, opciones: list[int], default: int | None = None) -> int:
-    if valor in opciones:
-        return valor
-    if not opciones:
-        return int(default or 0)
-    return min(opciones, key=lambda opt: abs(int(opt) - int(valor)))
-
-
-def _redimensionar_frame_rgb(frame_rgb, ancho_maximo: int = 800):
-    if frame_rgb is None or ancho_maximo <= 0:
-        return frame_rgb
-    alto, ancho = frame_rgb.shape[:2]
-    if ancho <= ancho_maximo:
-        return frame_rgb
-    escala = ancho_maximo / float(ancho)
-    nuevo_alto = max(1, int(alto * escala))
-    return cv2.resize(frame_rgb, (ancho_maximo, nuevo_alto), interpolation=cv2.INTER_AREA)
-
-
-def _preparar_imagen_streamlit(frame_rgb, ancho_maximo: int = 640):
-    return _redimensionar_frame_rgb(frame_rgb, ancho_maximo)
-
-
-def _texto_resolucion_captura_ui(estado_frame: dict) -> str:
-    res = estado_frame.get("resolucion_captura")
-    if res:
-        return str(res)
-    ancho = estado_frame.get("ancho")
-    alto = estado_frame.get("alto")
-    if ancho and alto:
-        return f"{int(ancho)}x{int(alto)}"
-    return ""
 
 
 st.set_page_config(
@@ -340,194 +266,10 @@ def _mostrar_diagnostico_monitoreo(resumen: dict, velocidad: dict, velocidad_kmh
         st.caption(f"Detector: {mensaje_detector}")
 
 
-def _centro_y_simulado(
-    numero_frame: int,
-    frame_inicial: int,
-    frame_linea_1: int,
-    frame_linea_2: int,
-    total_frames: int,
-    linea_1_y: int,
-    linea_2_y: int,
-    alto_frame: int,
-) -> float:
-    margen_superior = 90
-    margen_inferior = alto_frame - 90
-    inicio_y = max(20, linea_1_y - 180)
-    fin_y = min(margen_inferior, linea_2_y + 180)
-
-    if numero_frame <= frame_linea_1:
-        denom = max(frame_linea_1 - frame_inicial, 1)
-        avance = max(numero_frame - frame_inicial, 0) / denom
-        return inicio_y + avance * (linea_1_y - inicio_y)
-
-    if numero_frame <= frame_linea_2:
-        denom = max(frame_linea_2 - frame_linea_1, 1)
-        avance = (numero_frame - frame_linea_1) / denom
-        return linea_1_y + avance * (linea_2_y - linea_1_y)
-
-    denom = max(total_frames - frame_linea_2, 1)
-    avance = min((numero_frame - frame_linea_2) / denom, 1.0)
-    return linea_2_y + avance * (fin_y - linea_2_y)
 
 
-def _crear_frame_simulacion_velocidad(
-    numero_frame: int,
-    bbox: list[int],
-    linea_1_y: int,
-    linea_2_y: int,
-    distancia_metros: float,
-    velocidad: dict,
-) -> np.ndarray:
-    ancho_frame = 640
-    alto_frame = 900
-    frame = np.full((alto_frame, ancho_frame, 3), 38, dtype=np.uint8)
-
-    cv2.line(frame, (0, linea_1_y), (ancho_frame, linea_1_y), (255, 170, 0), 3)
-    cv2.line(frame, (0, linea_2_y), (ancho_frame, linea_2_y), (0, 80, 255), 3)
-    cv2.putText(frame, "Linea 1", (20, linea_1_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 170, 0), 2)
-    cv2.putText(frame, "Linea 2", (20, linea_2_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 80, 255), 2)
-
-    x1, y1, x2, y2 = bbox
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 0), 3)
-    centro_x = int((x1 + x2) / 2)
-    centro_y = int((y1 + y2) / 2)
-    cv2.circle(frame, (centro_x, centro_y), 7, (255, 255, 255), -1)
-    cv2.circle(frame, (centro_x, centro_y), 9, (0, 0, 0), 1)
-
-    velocidad_kmh = velocidad.get("velocidad_kmh")
-    texto_velocidad = "Pendiente" if velocidad_kmh is None else f"{velocidad_kmh:.2f} km/h"
-    cv2.putText(frame, f"Frame: {numero_frame}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
-    cv2.putText(frame, f"Estado: {velocidad.get('estado')}", (20, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
-    cv2.putText(frame, f"Distancia: {distancia_metros:.1f} m", (20, 119), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
-    cv2.putText(frame, f"Velocidad: {texto_velocidad}", (20, 156), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2)
-    return frame
 
 
-def ejecutar_simulacion_velocidad(
-    fps: float,
-    distancia_metros: float,
-    limite_kmh: float,
-    placa_manual: str,
-    posicion_linea_1: float,
-    posicion_linea_2: float,
-    frame_inicial: int,
-    frame_linea_1: int,
-    frame_linea_2: int,
-    total_frames: int,
-) -> dict:
-    ancho_frame = 640
-    alto_frame = 900
-    linea_1_y = int(alto_frame * posicion_linea_1)
-    linea_2_y = int(alto_frame * posicion_linea_2)
-    tracker = SpeedTracker(linea_1_y, linea_2_y, distancia_metros, fps)
-
-    evidencia_dir = Path("reports") / "evidencias" / "simulacion_velocidad"
-    evidencia_dir.mkdir(parents=True, exist_ok=True)
-    rutas = {
-        "linea_1": evidencia_dir / "frame_cruce_linea_1.jpg",
-        "linea_2": evidencia_dir / "frame_cruce_linea_2.jpg",
-        "calculada": evidencia_dir / "frame_velocidad_calculada.jpg",
-        "json": evidencia_dir / "simulacion_velocidad.json",
-    }
-
-    for ruta in rutas.values():
-        if ruta.exists():
-            try:
-                ruta.unlink()
-            except PermissionError:
-                pass
-
-    ultimo_frame = None
-    resumen = tracker.resumen()
-    guardo_linea_1 = False
-    guardo_linea_2 = False
-    guardo_calculada = False
-
-    for numero_frame in range(max(frame_inicial, 0), total_frames + 1):
-        centro_y = _centro_y_simulado(
-            numero_frame,
-            frame_inicial,
-            frame_linea_1,
-            frame_linea_2,
-            total_frames,
-            linea_1_y,
-            linea_2_y,
-            alto_frame,
-        )
-        centro_x = ancho_frame // 2
-        bbox = [
-            int(centro_x - 95),
-            int(centro_y - 28),
-            int(centro_x + 95),
-            int(centro_y + 28),
-        ]
-        resumen = tracker.actualizar(bbox, numero_frame)
-        frame = _crear_frame_simulacion_velocidad(numero_frame, bbox, linea_1_y, linea_2_y, distancia_metros, resumen)
-
-        if resumen.get("frame_cruce_linea_1") == numero_frame and not guardo_linea_1:
-            cv2.imwrite(str(rutas["linea_1"]), frame)
-            guardo_linea_1 = True
-        if resumen.get("frame_cruce_linea_2") == numero_frame and not guardo_linea_2:
-            cv2.imwrite(str(rutas["linea_2"]), frame)
-            guardo_linea_2 = True
-        if resumen.get("velocidad_kmh") is not None and not guardo_calculada:
-            cv2.imwrite(str(rutas["calculada"]), frame)
-            guardo_calculada = True
-
-        ultimo_frame = frame
-
-    datos = {
-        "placa": placa_manual,
-        "fps": fps,
-        "distancia_metros": distancia_metros,
-        "limite_kmh": limite_kmh,
-        "posicion_linea_1": posicion_linea_1,
-        "posicion_linea_2": posicion_linea_2,
-        "frame_cruce_linea_1": resumen.get("frame_cruce_linea_1"),
-        "frame_cruce_linea_2": resumen.get("frame_cruce_linea_2"),
-        "frame_cruce_linea_1_exacto": resumen.get("frame_cruce_linea_1_exacto"),
-        "frame_cruce_linea_2_exacto": resumen.get("frame_cruce_linea_2_exacto"),
-        "tiempo_cruce_linea_1": resumen.get("tiempo_cruce_linea_1"),
-        "tiempo_cruce_linea_2": resumen.get("tiempo_cruce_linea_2"),
-        "tiempo_segundos": resumen.get("tiempo_entre_lineas"),
-        "velocidad_kmh": resumen.get("velocidad_kmh"),
-        "estado": resumen.get("estado"),
-        "metodo_medicion": resumen.get("metodo_medicion"),
-        "formula_medicion": resumen.get("formula_medicion"),
-        "ruta_frame_cruce_linea_1": str(rutas["linea_1"]) if guardo_linea_1 else None,
-        "ruta_frame_cruce_linea_2": str(rutas["linea_2"]) if guardo_linea_2 else None,
-        "ruta_frame_velocidad_calculada": str(rutas["calculada"]) if guardo_calculada else None,
-    }
-    if resumen.get("velocidad_kmh") is not None:
-        difuso = clasificar_velocidad(resumen["velocidad_kmh"], limite_kmh)
-        datos.update(
-            {
-                "velocidad": resumen["velocidad_kmh"],
-                "resultado_difuso": difuso,
-                "estado_difuso": difuso["estado"],
-                "nivel_infraccion": difuso["nivel_infraccion"],
-                "sancion": difuso["sancion"],
-                "horas_suspension": difuso["horas_suspension"],
-                "multa_usd": difuso.get("multa_usd"),
-                "multa_texto": difuso.get("multa_texto"),
-                "mensaje_difuso": difuso["mensaje"],
-                "grados_pertenencia": difuso["grados"],
-                "metodo_difuso": difuso.get("metodo"),
-            }
-        )
-    else:
-        difuso = None
-
-    with open(rutas["json"], "w", encoding="utf-8") as archivo:
-        json.dump(datos, archivo, ensure_ascii=False, indent=2)
-
-    return {
-        "resumen": resumen,
-        "difuso": difuso,
-        "datos": datos,
-        "frame_final_rgb": asegurar_rgb(ultimo_frame) if ultimo_frame is not None else None,
-        "ruta_json": str(rutas["json"]),
-    }
 
 
 def _buscar_recortes_ocr() -> tuple[list[Path], str]:
@@ -739,99 +481,14 @@ def mostrar_resumen_monitoreo(resumen: dict) -> None:
             ev2.image(ultimo_frame, use_container_width=True)
 
 
-def _metricas_calidad_desde_resumen(resumen: dict, placa: str) -> dict:
-    mejor_info = resumen.get("mejor_recorte_placa_info") or {}
-    cantidad = resumen.get("cantidad_caracteres_segmentados_ocr")
-    return {
-        "placa": placa,
-        "formato_valido": bool(resumen.get("formato_consolidado_valido") or resumen.get("formato_ocr_valido")),
-        "confianza_final": resumen.get("confianza_final_evento") or resumen.get("confianza_ocr"),
-        "aspect_ratio": mejor_info.get("aspect_ratio"),
-        "nitidez": mejor_info.get("nitidez"),
-        "cerca_borde": mejor_info.get("cerca_borde"),
-        "cantidad_caracteres": cantidad if cantidad else len(placa or ""),
-    }
 
 
-def _adjuntos_evento_desde_resumen(resumen: dict) -> list[str]:
-    candidatos_frame = [
-        resumen.get("ruta_mejor_frame_evento"),
-        resumen.get("ruta_snapshot_frame_evento"),
-        resumen.get("mejor_frame_bbox_placa"),
-        resumen.get("ruta_frame_evento_en_vivo"),
-        resumen.get("mejor_frame_recorte_placa"),
-        resumen.get("ultimo_frame_deteccion"),
-    ]
-    candidatos_recorte = [
-        resumen.get("ruta_mejor_recorte_evento"),
-        resumen.get("mejor_recorte_placa"),
-        resumen.get("ruta_recorte_evento_en_vivo"),
-        resumen.get("ultimo_recorte_placa"),
-    ]
-
-    def _primera_ruta_valida(rutas: list) -> str | None:
-        for ruta in rutas:
-            if not ruta:
-                continue
-            ruta_str = str(ruta)
-            if Path(ruta_str).exists():
-                return ruta_str
-        return None
-
-    frame = _primera_ruta_valida(candidatos_frame)
-    recorte = _primera_ruta_valida(candidatos_recorte)
-
-    adjuntos: list[str] = []
-    if frame:
-        adjuntos.append(frame)
-    if recorte and recorte not in adjuntos:
-        adjuntos.append(recorte)
-    return adjuntos
 
 
-def _mejor_frame_evento_desde_resumen(resumen: dict) -> str | None:
-    """Devuelve la evidencia completa seleccionada para el evento."""
-    for clave in (
-        "ruta_mejor_frame_evento",
-        "ruta_snapshot_frame_evento",
-        "mejor_frame_bbox_placa",
-        "ruta_frame_evento_en_vivo",
-    ):
-        ruta = resumen.get(clave)
-        if ruta and Path(str(ruta)).exists():
-            return str(ruta)
-    return None
 
 
-def _contexto_notificacion_desde_resumen(resumen: dict, adjuntos: list[str], config: dict | None = None) -> dict:
-    """Extrae solo datos medidos y evidencias pertenecientes al mismo evento."""
-    velocidad = resumen.get("velocidad") or {}
-    ultima_deteccion = resumen.get("ultima_deteccion") or {}
-    mejor_frame = _mejor_frame_evento_desde_resumen(resumen)
-    return {
-        "evento_id": resumen.get("evento_id") or resumen.get("eventos_placa"),
-        "fecha_hora": resumen.get("fecha_hora_evento") or resumen.get("fecha_hora"),
-        "fuente": resumen.get("fuente"),
-        "velocidad_kmh": _obtener_velocidad_kmh_desde_resumen(resumen),
-        "limite_kmh": _obtener_limite_kmh_resumen(resumen, config),
-        "distancia_metros": velocidad.get("distancia_metros") or resumen.get("distancia_lineas_m"),
-        "tiempo_entre_lineas": velocidad.get("tiempo_entre_lineas"),
-        "frame_linea_1": velocidad.get("frame_cruce_linea_1"),
-        "frame_linea_2": velocidad.get("frame_cruce_linea_2"),
-        "metodo_medicion": velocidad.get("metodo_medicion"),
-        "confianza_ocr": resumen.get("confianza_final_evento") or resumen.get("confianza_ocr"),
-        "confianza_yolo": resumen.get("mejor_confianza_evento") or ultima_deteccion.get("confianza"),
-        "evidencia_principal": mejor_frame,
-    }
 
 
-def _tiene_recorte_placa_valido(resumen: dict) -> bool:
-    ruta = (
-        resumen.get("mejor_recorte_placa")
-        or resumen.get("ruta_mejor_recorte_evento")
-        or resumen.get("ultimo_recorte_placa")
-    )
-    return bool(ruta and Path(str(ruta)).exists())
 
 
 def preparar_estado_notificacion_evento(resumen: dict, placa_evento: str, config: dict) -> dict:
@@ -1199,69 +856,12 @@ def _procesar_email_inmediato_eventos_reconocidos(config: dict, placa_controlada
     return hubo_cambio
 
 
-_ERRORES_LECTURA_OCR_UI = frozenset(
-    {
-        "PENDIENTE",
-        "ANALIZANDOPLACA...",
-        "SINLECTURA",
-        "SINPLACA",
-        "FORMATO_INVALIDO",
-        "SEGMENTACION_INCOMPLETA",
-        "SIN_CARACTERES",
-        "ERROR_CNN",
-        "NO_RECONOCIDO",
-        "FORMATODUDOSO",
-    }
-)
 
 
-def _es_codigo_error_lectura(texto: str) -> bool:
-    normalizado = str(texto or "").strip().upper().replace("-", "").replace(" ", "").replace("_", "")
-    return normalizado in _ERRORES_LECTURA_OCR_UI or normalizado.startswith("SINLECTURA")
 
 
-def _extraer_placa_desde_resumen(resumen: dict) -> str:
-    """Mejor lectura OCR disponible (consolidada o individual)."""
-    candidatos = (
-        resumen.get("placa_consolidada_evento"),
-        resumen.get("placa_individual"),
-        resumen.get("texto_ocr_corregido"),
-        resumen.get("texto_ocr_crudo"),
-    )
-    for candidato in candidatos:
-        if not candidato:
-            continue
-        texto = str(candidato).strip()
-        for prefijo in ("Lectura parcial: ", "Formato dudoso: ", "Sin lectura: "):
-            if texto.startswith(prefijo):
-                texto = texto[len(prefijo) :].strip()
-        if _es_codigo_error_lectura(texto):
-            continue
-        normalizado = texto.upper().replace("-", "").replace(" ", "")
-        if normalizado and normalizado not in _ERRORES_LECTURA_OCR_UI:
-            return normalizado
-    return ""
 
 
-def _extraer_placa_individual_desde_resumen(resumen: dict) -> str:
-    """Lectura que corresponde al recorte y predicciones CNN mostrados."""
-    predicciones = resumen.get("predicciones_caracteres_ocr") or []
-    texto_predicciones = "".join(
-        str(pred.get("caracter_predicho") or "").strip()
-        for pred in predicciones
-    )
-    candidatos = (
-        texto_predicciones,
-        resumen.get("placa_individual_ultimo_frame"),
-        resumen.get("placa_individual"),
-    )
-    for candidato in candidatos:
-        texto = str(candidato or "").strip().upper().replace("-", "").replace(" ", "")
-        if _es_codigo_error_lectura(texto):
-            continue
-        if len(texto) in (6, 7) and texto.isalnum():
-            return texto
-    return ""
 
 
 def _entrada_cache_ocr_evento(evento_id: int | None) -> dict:
@@ -1495,108 +1095,14 @@ def _cargar_recorte_ui_rgb(ruta: str):
     return rgb
 
 
-def _marcar_duplicados_placa_en_cola(cola: list) -> None:
-    """Marca duplicados del mismo paso de vehiculo (ventana de frames)."""
-    _consolidar_marcas_paso_vehiculo(cola, None)
 
 
-def _puntaje_item_evento(item: dict) -> float:
-    """Mayor puntaje = mejor candidato para enviar correo de ese paso."""
-    res = item.get("resumen") or {}
-    puntaje = 0.0
-    if (res.get("evaluacion_calidad_evento") or {}).get("apto"):
-        puntaje += 10.0
-    if res.get("formato_consolidado_valido") or res.get("formato_ocr_valido"):
-        puntaje += 5.0
-    conf_ocr = res.get("confianza_final_evento") or res.get("confianza_ocr")
-    if conf_ocr is not None:
-        puntaje += float(conf_ocr) * 3.0
-    conf_yolo = (res.get("ultima_deteccion") or {}).get("confianza") or res.get("mejor_confianza_evento")
-    if conf_yolo is not None:
-        puntaje += float(conf_yolo) * 1.0
-    placa = _extraer_placa_desde_resumen(res)
-    if placa and len(placa) == 7:
-        puntaje += 1.5
-    elif placa and len(placa) == 6:
-        puntaje += 0.5
-    if res.get("estado_ocr") == "error":
-        puntaje -= 5.0
-    return puntaje
 
 
-def _agrupar_cola_por_paso_vehiculo(cola: list, ventana_frames: int) -> list[dict]:
-    ordenados = sorted(
-        [item for item in cola if item.get("frame_mejor") is not None or (item.get("resumen") or {}).get("frame_mejor_evento")],
-        key=lambda item: int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0),
-    )
-    grupos: list[dict] = []
-    for item in ordenados:
-        frame = int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0)
-        evento_id = int(item.get("evento_id") or 0)
-        placa = _extraer_placa_desde_resumen(item.get("resumen") or {})
-        ubicado = False
-        for grupo in grupos:
-            mismo_evento = bool(evento_id and evento_id in grupo["eventos"])
-            misma_placa = bool(placa and placa in grupo["placas"])
-            if (mismo_evento or misma_placa) and abs(frame - int(grupo["frame_fin"])) <= ventana_frames:
-                grupo["items"].append(item)
-                grupo["frame_fin"] = max(int(grupo["frame_fin"]), frame)
-                grupo["frame_inicio"] = min(int(grupo["frame_inicio"]), frame)
-                if evento_id:
-                    grupo["eventos"].add(evento_id)
-                if placa:
-                    grupo["placas"].add(placa)
-                ubicado = True
-                break
-        if not ubicado:
-            grupos.append(
-                {
-                    "frame_inicio": frame,
-                    "frame_fin": frame,
-                    "items": [item],
-                    "eventos": {evento_id} if evento_id else set(),
-                    "placas": {placa} if placa else set(),
-                }
-            )
-    return grupos
 
 
-def _grupo_listo_para_envio(grupo: dict, frame_actual: int, cooldown_frames: int) -> bool:
-    items = grupo.get("items") or []
-    if not items:
-        return False
-    if any(item.get("estado_ocr") == "pendiente" for item in items):
-        return False
-    if int(cooldown_frames) <= 0:
-        return True
-    ultimo_frame = max(
-        int(item.get("frame_mejor") or (item.get("resumen") or {}).get("frame_mejor_evento") or 0)
-        for item in items
-    )
-    return int(frame_actual or 0) - ultimo_frame >= int(cooldown_frames)
 
 
-def _consolidar_marcas_paso_vehiculo(cola: list, config: dict | None) -> None:
-    ventana = 150
-    if config:
-        ventana = int((config.get("notificaciones") or {}).get("ventana_frames_mismo_paso", ventana))
-    for item in cola:
-        item.pop("es_mejor_del_paso", None)
-        item.pop("suprimido_duplicado", None)
-    for grupo in _agrupar_cola_por_paso_vehiculo(cola, ventana):
-        paso_id = f"paso_{grupo['frame_inicio']}"
-        items_listos = [i for i in grupo["items"] if i.get("estado_ocr") == "listo"]
-        if not items_listos:
-            for item in grupo["items"]:
-                item["paso_grupo_id"] = paso_id
-            continue
-        mejor = max(items_listos, key=_puntaje_item_evento)
-        for item in grupo["items"]:
-            item["paso_grupo_id"] = paso_id
-            if item is mejor:
-                item["es_mejor_del_paso"] = True
-            else:
-                item["suprimido_duplicado"] = True
 
 
 def _estado_correo_item(item: dict) -> str:
@@ -1764,55 +1270,12 @@ def _render_tabla_vehiculos_detectados(cola: list, config: dict | None = None, m
         st.caption(f"{enviados} correo(s) enviado(s) automaticamente en esta sesion.")
 
 
-def _obtener_velocidad_kmh_desde_resumen(resumen: dict) -> float | None:
-    if resumen.get("velocidad_kmh") is not None:
-        return float(resumen["velocidad_kmh"])
-    velocidad = resumen.get("velocidad") or {}
-    if velocidad.get("velocidad_kmh") is not None:
-        return float(velocidad["velocidad_kmh"])
-    return None
 
 
-def _obtener_limite_kmh_resumen(resumen: dict, config: dict | None) -> float:
-    if resumen.get("limite_velocidad_kmh") is not None:
-        return float(resumen["limite_velocidad_kmh"])
-    if config:
-        return float((config.get("speed") or {}).get("campus_speed_limit_kmh", 30.0))
-    return 30.0
 
 
-def _aplicar_multa_difusa_resumen(resumen: dict, config: dict | None) -> dict:
-    kmh = _obtener_velocidad_kmh_desde_resumen(resumen)
-    if kmh is None:
-        return resumen
-    salida = dict(resumen)
-    limite = _obtener_limite_kmh_resumen(salida, config)
-    salida["clasificacion_difusa"] = clasificar_velocidad(kmh, limite, config)
-    salida["velocidad_kmh"] = kmh
-    salida.setdefault("limite_velocidad_kmh", limite)
-    _guardar_resultado_difuso_evento(salida)
-    return salida
 
 
-def _guardar_resultado_difuso_evento(resumen: dict) -> str | None:
-    """Persiste una evidencia compacta de inferencia para cada evento medido."""
-    resultado = resumen.get("clasificacion_difusa") or {}
-    evento_id = resumen.get("evento_id") or resumen.get("eventos_placa")
-    if not evento_id or resultado.get("velocidad_kmh") is None:
-        return None
-    directorio = Path("reports") / "evidencias" / "logica_difusa" / "eventos"
-    directorio.mkdir(parents=True, exist_ok=True)
-    ruta = directorio / f"evento_{int(evento_id):04d}_inferencia.json"
-    payload = {
-        "fecha_hora": datetime.now().isoformat(timespec="seconds"),
-        "evento_id": int(evento_id),
-        "placa": _extraer_placa_desde_resumen(resumen) or None,
-        "fuente": resumen.get("fuente"),
-        "resultado": resultado,
-    }
-    ruta.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    resumen["ruta_resultado_difuso"] = str(ruta)
-    return str(ruta)
 
 
 def _formatear_metrica_velocidad(velocidad: dict, estado_placa: str = "", difuso: dict | None = None) -> tuple[str, str | None]:
@@ -2343,60 +1806,14 @@ def _obtener_entrada_cache_ocr(evento_id: int) -> dict:
     return entry
 
 
-def _entrada_ocr_tiene_texto_util(entry: dict) -> bool:
-    return bool(_extraer_placa_desde_resumen(entry.get("datos") or {}))
 
 
-def _resultado_ocr_necesita_reintento(resultado: dict) -> bool:
-    texto = (
-        resultado.get("texto_postprocesado")
-        or resultado.get("texto_corregido_formato")
-        or resultado.get("texto_detectado_crudo")
-        or resultado.get("texto_crudo")
-        or ""
-    )
-    cantidad = int(resultado.get("cantidad_caracteres_segmentados", 0) or 0)
-    predicciones = resultado.get("predicciones_caracteres") or []
-    return not str(texto).strip() and cantidad >= 6 and not predicciones
 
 
-def _puntaje_consolidado_evento(consolidado: dict | None) -> float:
-    if not consolidado:
-        return -1.0
-    texto = str(consolidado.get("texto_final") or "")
-    puntaje = float(consolidado.get("confianza_final") or 0.0) * 100.0
-    if consolidado.get("formato_valido"):
-        puntaje += 25.0
-    if len(texto) == 7:
-        puntaje += 10.0
-    elif len(texto) == 6:
-        puntaje += 5.0
-    usadas = int(consolidado.get("cantidad_lecturas_usadas") or 0)
-    puntaje += min(usadas, 5) * 4.0
-    return puntaje
 
 
-def _debe_usar_nuevo_consolidado(nuevo: dict | None, previo: dict | None) -> bool:
-    """Evita conservar una placa vieja cuando la votacion actual ya es valida."""
-    if not nuevo:
-        return False
-    texto_nuevo = str(nuevo.get("texto_final") or "").strip()
-    if not texto_nuevo:
-        return False
-    if not previo or not str(previo.get("texto_final") or "").strip():
-        return True
-    if nuevo.get("formato_valido"):
-        return True
-    if previo.get("formato_valido"):
-        return False
-    return _puntaje_consolidado_evento(nuevo) >= _puntaje_consolidado_evento(previo)
 
 
-def _lectura_existe_para_ruta(lecturas: list, ruta_recorte: str) -> bool:
-    destino = str(ruta_recorte or "")
-    if not destino:
-        return False
-    return any(str(item.get("ruta_recorte") or "") == destino for item in (lecturas or []))
 
 
 def _evento_ocr_cerrado_y_listo(evento_id: int | None) -> bool:

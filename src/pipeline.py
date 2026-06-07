@@ -12,25 +12,40 @@ from src.camera_utils import (
     abrir_captura_camara,
     esperar_frame_util_camara,
     frame_es_util_camara,
-    leer_frame_reciente_camara,
     probar_indices_camara,
     resolucion_real_captura,
     _configurar_captura,
     mensaje_error_apertura_camara,
     liberar_captura_camara_activa,
 )
+from src.detection.crop_quality import (
+    calcular_puntaje_recorte_placa,
+    config_recorte_placa as _config_recorte_placa,
+)
+from src.detection import PlateDetector, dibujar_deteccion
+from src.detection.geometry import iou_xyxy as _iou_xyxy
+from src.monitoring.video_runtime import (
+    _calcular_delay_reproduccion,
+    _calcular_segundos_procesados,
+    _esperar_reproduccion_frame,
+    _factor_velocidad_reproduccion,
+    _frames_retrasados_reproduccion,
+    _leer_frame_camara_vivo,
+    _leer_metadata_video,
+    _obtener_modo_procesamiento,
+    _puede_saltar_frames_video,
+    _reducir_frame_monitoreo,
+    aplicar_rotacion,
+)
 from src.fuzzy_system import clasificar_velocidad
-from src.plate_detector import PlateDetector, dibujar_deteccion
 from src.plate_reader import (
     PlateReader,
-    _imread_seguro,
-    asegurar_grayscale,
-    asegurar_rgb,
     consolidar_lecturas_evento_placa,
     guardar_debug_votacion_evento,
     leer_placa_cnn_seguro_desde_monitoreo,
     leer_placa_desde_recorte,
 )
+from src.recognition.image_utils import _imread_seguro, asegurar_grayscale, asegurar_rgb
 from src.report_generator import guardar_reporte
 from src.speed_estimator import METODO_MEDICION, SpeedTracker, estimar_velocidad
 
@@ -57,20 +72,6 @@ TRACK_IOU_MIN = 0.08
 TRACK_DISTANCIA_CENTRO_MAX_REL = 0.16
 TRACK_APARIENCIA_MIN = 0.22
 TRACK_TIMEOUT_MIN_SEGUNDOS = 0.60
-DEFAULT_PLATE_CROP_SELECTION = {
-    "enabled": True,
-    "buffer_frames": 25,  # FIX-BUFFER: mas frames = mejor chance de recorte nitido
-    "min_aspect_ratio": 1.5,
-    "max_aspect_ratio": 6.5,
-    "min_area_relative": 0.0003,
-    "max_area_relative": 0.08,
-    "border_margin_px": 5,
-    "min_sharpness": 30.0,
-    "cooldown_frames": 30,  # FIX-BUFFER: cooldown menor para no perder placas reales
-    "min_score_improvement": 0.03,
-}
-
-
 @lru_cache(maxsize=4)
 def _obtener_detector_cache(model_path: str | None) -> PlateDetector:
     return PlateDetector(model_path) if model_path else PlateDetector()
@@ -1433,103 +1434,6 @@ def _resumen_evento_video_anotado(evento: dict) -> dict:
     return fila
 
 
-def _iou_xyxy(a: list[int], b: list[int]) -> float:
-    ax1, ay1, ax2, ay2 = [float(v) for v in a]
-    bx1, by1, bx2, by2 = [float(v) for v in b]
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-    inter_w = max(0.0, inter_x2 - inter_x1)
-    inter_h = max(0.0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - inter_area
-    return inter_area / union if union > 0 else 0.0
-
-
-def _config_recorte_placa(config: dict | None) -> dict:
-    salida = DEFAULT_PLATE_CROP_SELECTION.copy()
-    if config:
-        salida.update({k: v for k, v in config.items() if v is not None})
-    salida["buffer_frames"] = max(int(salida.get("buffer_frames", 15)), 1)
-    return salida
-
-
-def calcular_puntaje_recorte_placa(frame, bbox: list[int], recorte, conf_yolo: float, config: dict | None = None) -> dict:
-    cfg = _config_recorte_placa(config)
-    alto_frame, ancho_frame = frame.shape[:2]
-    x1, y1, x2, y2 = [int(v) for v in bbox]
-    ancho_bbox = max(x2 - x1, 1)
-    alto_bbox = max(y2 - y1, 1)
-    area_relativa = (ancho_bbox * alto_bbox) / max(ancho_frame * alto_frame, 1)
-    aspect_ratio = ancho_bbox / alto_bbox
-    cerca_borde = (
-        x1 <= int(cfg["border_margin_px"])
-        or y1 <= int(cfg["border_margin_px"])
-        or x2 >= ancho_frame - int(cfg["border_margin_px"])
-        or y2 >= alto_frame - int(cfg["border_margin_px"])
-    )
-
-    if recorte is None or recorte.size == 0:
-        nitidez = 0.0
-        contraste = 0.0
-        alto_recorte = 0
-        ancho_recorte = 0
-    else:
-        gris = asegurar_grayscale(recorte)
-        nitidez = float(cv2.Laplacian(gris, cv2.CV_64F).var())
-        contraste = float(gris.std())
-        alto_recorte, ancho_recorte = recorte.shape[:2]
-
-    centro_aspect = (float(cfg["min_aspect_ratio"]) + float(cfg["max_aspect_ratio"])) / 2
-    rango_aspect = max((float(cfg["max_aspect_ratio"]) - float(cfg["min_aspect_ratio"])) / 2, 0.1)
-    score_aspect = max(0.0, 1.0 - abs(aspect_ratio - centro_aspect) / rango_aspect)
-
-    min_area = float(cfg["min_area_relative"])
-    max_area = float(cfg["max_area_relative"])
-    centro_area = (min_area + max_area) / 2
-    rango_area = max((max_area - min_area) / 2, 0.0001)
-    score_area = max(0.0, 1.0 - abs(area_relativa - centro_area) / rango_area)
-
-    score_nitidez = min(nitidez / max(float(cfg["min_sharpness"]) * 4, 1.0), 1.0)
-    score_contraste = min(contraste / 80.0, 1.0)
-    score_tamano = min((ancho_recorte * alto_recorte) / (120 * 35), 1.0)
-    penalizacion = 0.0
-    if cerca_borde:
-        penalizacion += 0.25
-    if aspect_ratio < float(cfg["min_aspect_ratio"]) or aspect_ratio > float(cfg["max_aspect_ratio"]):
-        penalizacion += 0.35
-    if area_relativa < min_area or area_relativa > max_area:
-        penalizacion += 0.30
-    if nitidez < float(cfg["min_sharpness"]):
-        penalizacion += 0.25
-    if ancho_recorte < 50 or alto_recorte < 18:
-        penalizacion += 0.25
-
-    # FIX-SCORE: aumentar peso de nitidez para priorizar recortes frontales y nitidos.
-    puntaje = (
-        0.25 * float(conf_yolo)
-        + 0.40 * score_nitidez
-        + 0.15 * score_aspect
-        + 0.10 * score_area
-        + 0.05 * score_tamano
-        + 0.05 * score_contraste
-        - penalizacion
-    )
-    return {
-        "puntaje_total": round(max(puntaje, 0.0), 4),
-        "area_relativa": round(area_relativa, 6),
-        "aspect_ratio": round(aspect_ratio, 4),
-        "nitidez": round(nitidez, 4),
-        "contraste": round(contraste, 4),
-        "cerca_borde": bool(cerca_borde),
-        "ancho_recorte": int(ancho_recorte),
-        "alto_recorte": int(alto_recorte),
-    }
-
-
 def _registrar_candidato_recorte(
     estado: dict,
     frame_limpio,
@@ -1667,121 +1571,26 @@ def _seleccionar_mejor_recorte_buffer(estado: dict) -> None:
     estado["buffer_recortes_placa"] = []
 
 
-def _leer_metadata_video(captura) -> tuple[float, int, int, int, float]:
-    fps = float(captura.get(cv2.CAP_PROP_FPS) or 0.0)
-    ancho = int(captura.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    alto = int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    total_frames = int(captura.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duracion = total_frames / fps if fps > 0 and total_frames > 0 else 0.0
-    return fps, ancho, alto, total_frames, duracion
 
 
-def _calcular_segundos_procesados(frames_procesados: int, fps: float) -> float:
-    return frames_procesados / fps if fps > 0 else 0.0
 
 
-def _obtener_modo_procesamiento(max_frames: int) -> str:
-    return "video completo" if max_frames == 0 else "limitado por max_frames"
 
 
-def _calcular_delay_reproduccion(fps: float, velocidad_reproduccion: str) -> float:
-    if fps <= 0:
-        return 0.0
-
-    delay_base = 1 / fps
-    factores = {
-        "Lenta (0.25x)": 4,
-        "Media (0.5x)": 2,
-        "Normal (1x)": 1,
-        "Normal": 1,
-        "Rapida (sin espera)": 0,
-        "Rapida": 0,
-    }
-    return delay_base * factores.get(velocidad_reproduccion, 1)
 
 
-def _factor_velocidad_reproduccion(velocidad_reproduccion: str) -> float:
-    factores = {
-        "Lenta (0.25x)": 4.0,
-        "Media (0.5x)": 2.0,
-        "Normal (1x)": 1.0,
-        "Normal": 1.0,
-        "Rapida (sin espera)": 0.0,
-        "Rapida": 0.0,
-    }
-    return float(factores.get(velocidad_reproduccion, 1.0))
 
 
-def _reducir_frame_monitoreo(frame, max_ancho: int):
-    if max_ancho <= 0 or frame is None:
-        return frame
-    alto, ancho = frame.shape[:2]
-    if ancho <= max_ancho:
-        return frame
-    nuevo_alto = max(1, int(alto * max_ancho / ancho))
-    return cv2.resize(frame, (max_ancho, nuevo_alto), interpolation=cv2.INTER_AREA)
 
 
-def _frames_retrasados_reproduccion(
-    fps: float,
-    frames_procesados: int,
-    inicio_reproduccion: float,
-    velocidad_reproduccion: str,
-) -> int:
-    factor = _factor_velocidad_reproduccion(velocidad_reproduccion)
-    if factor <= 0 or fps <= 0 or frames_procesados <= 0:
-        return 0
-    tiempo_objetivo = (frames_procesados / float(fps)) * factor
-    tiempo_actual = time.perf_counter() - inicio_reproduccion
-    return max(0, int((tiempo_actual - tiempo_objetivo) * float(fps)))
 
 
-def _puede_saltar_frames_video(estado_persistencia: dict) -> bool:
-    if estado_persistencia.get("evento_activo"):
-        return False
-    if estado_persistencia.get("bbox_persistente_activa"):
-        return False
-    tracker = estado_persistencia.get("speed_tracker")
-    if tracker is not None and getattr(tracker, "estado", "") in ("esperando_linea_1", "esperando_linea_2"):
-        return False
-    return True
 
 
-def _leer_frame_camara_vivo(captura, *, max_grabs: int = 1) -> tuple[bool, object | None]:
-    """Descarta frames viejos con grab (barato) y decodifica solo el ultimo."""
-    return leer_frame_reciente_camara(captura, max_grabs=max_grabs)
 
 
-def _esperar_reproduccion_frame(
-    fps: float,
-    frames_procesados: int,
-    inicio_reproduccion: float,
-    velocidad_reproduccion: str,
-    max_display_fps: int = 0,
-) -> None:
-    """Mantiene la reproduccion al ritmo del video (no suma sleep fijo encima del procesamiento)."""
-    factor = _factor_velocidad_reproduccion(velocidad_reproduccion)
-    if factor <= 0 or fps <= 0 or frames_procesados <= 0:
-        return
-    fps_objetivo = float(fps)
-    if max_display_fps and max_display_fps > 0:
-        fps_objetivo = min(fps_objetivo, float(max_display_fps))
-    tiempo_objetivo = (frames_procesados / fps_objetivo) * factor
-    tiempo_actual = time.perf_counter() - inicio_reproduccion
-    espera = tiempo_objetivo - tiempo_actual
-    if espera > 0:
-        time.sleep(espera)
 
 
-def aplicar_rotacion(frame, rotacion: str):
-    opcion = (rotacion or "Sin rotación").strip().lower()
-    if "90" in opcion and "derecha" in opcion:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if "90" in opcion and "izquierda" in opcion:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    if "180" in opcion:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    return frame
 
 
 def _procesar_frame_monitoreo(
