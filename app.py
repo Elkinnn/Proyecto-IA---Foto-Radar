@@ -3316,102 +3316,6 @@ def pestana_monitoreo(config: dict) -> None:
             )
             posicion_linea_1 = st.slider("Posicion Linea 1", 0.05, 0.95, posicion_linea_1, 0.01, key="monitoreo_linea_1")
             posicion_linea_2 = st.slider("Posicion Linea 2", 0.05, 0.95, posicion_linea_2, 0.01, key="monitoreo_linea_2")
-            frecuencia_deteccion = st.slider(
-                "Detectar cada N frames",
-                1,
-                30,
-                frecuencia_deteccion,
-                1,
-                help="YOLO se ejecuta solo cada N frames. En los frames intermedios se mantiene la ultima bbox visible.",
-                key="monitoreo_frecuencia_deteccion",
-            )
-            inference_size = st.select_slider(
-                "Resolucion inferencia YOLO",
-                options=[320, 416, 512, 640, 768],
-                value=inference_size,
-                key="monitoreo_inference_size",
-            )
-            render_every_n_frames = st.slider(
-                "Actualizar video cada N frames", 1, 10, render_every_n_frames, 1, key="monitoreo_render_every"
-            )
-            max_display_fps = st.slider(
-                "FPS maximo visual (0 = sin limite)", 0, 30, max_display_fps, 1, key="monitoreo_max_display_fps"
-            )
-            if st.session_state.get("monitoreo_ancho_visual") not in (None, *_opciones_ancho_visual):
-                st.session_state["monitoreo_ancho_visual"] = _snap_a_opcion_slider(
-                    int(st.session_state["monitoreo_ancho_visual"]),
-                    _opciones_ancho_visual,
-                    640,
-                )
-            ancho_visual_max = st.select_slider(
-                "Ancho maximo visual",
-                options=_opciones_ancho_visual,
-                value=ancho_visual_max,
-                key="monitoreo_ancho_visual",
-            )
-            if fuente_monitoreo == "Video de prueba":
-                max_frame_width = st.select_slider(
-                    "Ancho maximo procesamiento video",
-                    options=[0, 720, 960, 1280],
-                    value=max_frame_width if max_frame_width in {0, 720, 960, 1280} else 960,
-                    help="Reduce la resolucion interna del video para acelerar YOLO y la visualizacion. 0 = resolucion original.",
-                    key="monitoreo_max_frame_width",
-                )
-            conf_min = st.slider("Confianza minima YOLO", 0.10, 0.90, conf_min, 0.05, key="monitoreo_conf_min")
-            persistencia_frames = st.slider(
-                "Persistencia de bbox",
-                0,
-                30,
-                persistencia_frames,
-                1,
-                help="Mantiene la ultima caja visible aunque YOLO no se ejecute o falle temporalmente.",
-                key="monitoreo_persistencia_bbox",
-            )
-            cooldown_cnn_frames = st.slider(
-                "Cooldown lector CNN (frames)",
-                5,
-                90,
-                cooldown_cnn_frames,
-                5,
-                help="Evita repetir la lectura CNN continuamente sobre la misma placa.",
-                key="monitoreo_cooldown_cnn",
-            )
-            st.session_state.historial_maximo_monitoreo = st.slider(
-                "Maximo historial reciente", 5, 30, 10, 1, key="monitoreo_historial_max"
-            )
-            guardar_debug_monitoreo = st.checkbox("Guardar debug pesado", value=False, key="monitoreo_guardar_debug")
-            max_frames = st.number_input(
-                "Frames maximos a procesar (0 = completo)",
-                min_value=0,
-                max_value=10000,
-                value=max_frames,
-                step=100,
-                key="monitoreo_max_frames",
-            )
-            placa_controlada = st.text_input(
-                "Placa de respaldo",
-                value=placa_controlada,
-                help="Solo si el lector CNN no entrega una placa valida.",
-                key="monitoreo_placa_respaldo",
-            )
-            if fuente_monitoreo == "Camara en vivo":
-                resolucion_camara = st.selectbox(
-                    "Resolucion de camara",
-                    ["1280x720", "1920x1080", "640x480"],
-                    index=0,
-                    help="Debe coincidir con la resolucion en Camo (ajustes del dispositivo virtual). 1280x720 suele ser el mejor equilibrio.",
-                    key="monitoreo_resolucion_camara",
-                )
-                fps_camara_objetivo = st.selectbox(
-                    "FPS objetivo camara",
-                    [15, 24, 30],
-                    index=2,
-                    key="monitoreo_fps_camara",
-                )
-                st.caption(
-                    "Calidad: la camara se procesa a resolucion completa. "
-                    "Use 'Ancho maximo visual' solo para la pantalla, no afecta el recorte OCR."
-                )
 
         rotacion = {
             "Sin rotacion": "Sin rotacion",
@@ -4954,17 +4858,11 @@ def main() -> None:
     st.title("Fotorradar Ecuador IA")
     st.caption("Consola de monitoreo por video para placas ecuatorianas.")
 
-    tabs = st.tabs(["Monitoreo", "Pruebas", "Logica difusa", "Evidencias", "Configuracion"])
+    tabs = st.tabs(["Monitoreo", "Logica difusa"])
     with tabs[0]:
         pestana_monitoreo(config)
     with tabs[1]:
-        pestana_pruebas(config)
-    with tabs[2]:
         pestana_logica_difusa(config)
-    with tabs[3]:
-        pestana_evidencias(config)
-    with tabs[4]:
-        pestana_configuracion(config)
 
 
 if __name__ == "__main__":
