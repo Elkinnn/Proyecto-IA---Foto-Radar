@@ -24,7 +24,7 @@ class PlateDetector:
             return
 
         try:
-            from ultralytics import YOLO
+            from ultralytics import YOLO # type: ignore
 
             self.model = YOLO(str(self.model_path))
             self.estado = "modelo_cargado"
